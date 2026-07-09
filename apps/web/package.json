@@ -1,0 +1,10 @@
+{
+  "name": "@resource-service/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Next.js 前端（阶段9实现）",
+  "scripts": {
+    "typecheck": "echo 'not implemented'",
+    "lint": "echo 'not implemented'"
+  }
+}

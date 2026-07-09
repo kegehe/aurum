@@ -1,0 +1,32 @@
+{
+  "name": "resource-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多类型资源管理平台 - TypeScript 全栈模块化单体",
+  "scripts": {
+    "dev:api": "pnpm --filter @resource-service/api start:dev",
+    "build:api": "pnpm --filter @resource-service/api build",
+    "start:api": "pnpm --filter @resource-service/api start:prod",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,json,md,yml,yaml}\"",
+    "typecheck": "pnpm -r typecheck",
+    "db:migrate": "pnpm --filter @resource-service/api prisma migrate dev",
+    "db:seed": "pnpm --filter @resource-service/api prisma db seed",
+    "db:studio": "pnpm --filter @resource-service/api prisma studio",
+    "db:generate": "pnpm --filter @resource-service/api prisma generate"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@11.10.0"
+}

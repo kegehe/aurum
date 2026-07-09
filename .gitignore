@@ -1,0 +1,52 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+.next/
+*.tsbuildinfo
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 数据库
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+prisma/dev.db
+prisma/dev.db-journal
+
+# 文件存储（本地存储内容不入库）
+storage/**
+# 保留目录结构
+!storage/**/.gitkeep
+
+# 日志
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 缓存
+.cache/
+.turbo/
+.eslintcache
+
+# 覆盖率
+coverage/

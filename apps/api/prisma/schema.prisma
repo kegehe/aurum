@@ -1,0 +1,189 @@
+// Prisma Schema for 资源管理平台
+//
+// 数据源：开发阶段使用 SQLite。SQLite connector 不支持 enum，因此枚举字段
+// 暂用 String 存储，值由应用层（shared-types 中的常量）约束。
+//
+// 切换 PostgreSQL 时：
+//   1. 将 provider 改为 "postgresql"
+//   2. 将下方 String 类型的枚举字段改为对应的 enum 类型（ResourceType 等）
+//   3. 删除旧迁移历史，重新 prisma migrate dev
+//   4. 补充 @db.Text / @db.Decimal 等原生类型标注
+//   5. 通过 raw migration 将 searchVector 列改为 tsvector 并建 GIN 索引
+//
+// 枚举值定义见 packages/shared-types/src/enums.ts
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== 模型 ====================
+
+model Resource {
+  id               String   @id @default(uuid())
+  title            String
+  description      String?
+  originalFilename String
+  // ResourceType 枚举值，见 shared-types。SQLite 阶段用 String。
+  resourceType     String
+  mimeType         String
+  extension        String
+  sizeBytes        BigInt
+  sha256           String?
+  categoryId       String?
+  source           String?
+  author           String?
+  licenseNote      String?
+  isFavorite       Boolean  @default(false)
+  // ProcessingStatus 枚举值（pending/processing/completed/failed）
+  processingStatus String   @default("pending")
+  duplicateOfId    String?
+  width            Int?
+  height           Int?
+  durationSeconds  Decimal?
+  // searchVector: PostgreSQL tsvector，SQLite 阶段用 String 占位，不写入
+  // 切换 PG 后通过 raw migration 改为 tsvector 类型并建 GIN 索引
+  searchVector     String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  deletedAt        DateTime?
+
+  // 关系
+  category        Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  duplicateOf     Resource?            @relation("ResourceDuplicates", fields: [duplicateOfId], references: [id], onDelete: SetNull)
+  duplicates      Resource[]           @relation("ResourceDuplicates")
+  files           ResourceFile[]
+  tags            ResourceTag[]
+  collectionItems CollectionResource[]
+  processingJobs  ProcessingJob[]
+  covers          Collection[]         @relation("CollectionCover")
+
+  @@index([sha256])
+  @@index([isFavorite])
+  @@index([processingStatus])
+  @@index([resourceType])
+  @@index([categoryId])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([deletedAt])
+  @@map("resources")
+}
+
+model ResourceFile {
+  id         String   @id @default(uuid())
+  resourceId String
+  // FileRole 枚举值（original/thumbnail/preview/extracted_text/transcode）
+  fileRole   String
+  variant    String   @default("")
+  storagePath String
+  mimeType   String
+  extension  String
+  sizeBytes  BigInt
+  width      Int?
+  height     Int?
+  durationSeconds Decimal?
+  createdAt  DateTime @default(now())
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@unique([resourceId, fileRole, variant])
+  @@index([resourceId])
+  @@index([fileRole])
+  @@map("resource_files")
+}
+
+model Tag {
+  id        String        @id @default(uuid())
+  name      String        @unique
+  color     String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  resources ResourceTag[]
+
+  @@map("tags")
+}
+
+model ResourceTag {
+  resourceId String
+  tagId      String
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([resourceId, tagId])
+  @@index([tagId])
+  @@map("resource_tags")
+}
+
+model Category {
+  id        String       @id @default(uuid())
+  name      String
+  parentId  String?
+  sortOrder Int          @default(0)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  parent    Category?    @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children  Category[]   @relation("CategoryTree")
+  resources Resource[]
+
+  @@unique([name, parentId])
+  @@map("categories")
+}
+
+model Collection {
+  id              String               @id @default(uuid())
+  name            String
+  description     String?
+  coverResourceId String?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  deletedAt       DateTime?
+
+  coverResource Resource?             @relation("CollectionCover", fields: [coverResourceId], references: [id], onDelete: SetNull)
+  resources     CollectionResource[]
+
+  @@map("collections")
+}
+
+model CollectionResource {
+  collectionId String
+  resourceId   String
+  sortOrder    Int      @default(0)
+  addedAt      DateTime @default(now())
+
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  resource   Resource   @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@id([collectionId, resourceId])
+  @@index([collectionId])
+  @@map("collection_resources")
+}
+
+model ProcessingJob {
+  id           String    @id @default(uuid())
+  resourceId   String
+  // JobType 枚举值（detect_metadata/generate_thumbnail/...）
+  jobType      String
+  // JobStatus 枚举值（pending/processing/completed/failed/canceled）
+  status       String    @default("pending")
+  errorMessage String?
+  retryCount   Int       @default(0)
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@index([resourceId])
+  @@index([jobType])
+  @@index([status])
+  @@index([createdAt])
+  @@map("processing_jobs")
+}

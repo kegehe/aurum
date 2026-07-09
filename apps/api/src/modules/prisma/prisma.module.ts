@@ -1,0 +1,13 @@
+import { Global, Module } from '@nestjs/common';
+import { PrismaService } from './prisma.service';
+
+/**
+ * 全局 Prisma 模块
+ * 所有模块可直接注入 PrismaService，无需在每个模块重复 import。
+ */
+@Global()
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class PrismaModule {}
