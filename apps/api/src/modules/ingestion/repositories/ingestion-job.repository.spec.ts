@@ -5,7 +5,7 @@ import { IngestionJobRepository } from './ingestion-job.repository';
 function createRepository(updateCount = 1) {
   const ingestionJob = {
     updateMany: vi.fn().mockResolvedValue({ count: updateCount }),
-    findUnique: vi.fn().mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.pending }),
+    findUnique: vi.fn().mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.failed, retryCount: 0 }),
   };
   return {
     repository: new IngestionJobRepository({ ingestionJob } as never),
@@ -30,15 +30,36 @@ describe('IngestionJobRepository state transitions', () => {
     const { repository, ingestionJob } = createRepository(0);
 
     await expect(repository.retryIfRetryable('job-1')).resolves.toBeNull();
+    // findUnique was called to check status/retryCount, but updateMany returns 0 (already transitioned)
+    expect(ingestionJob.findUnique).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      select: { retryCount: true, status: true },
+    });
     expect(ingestionJob.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
           id: 'job-1',
           status: { in: [IngestionJobStatus.failed, IngestionJobStatus.canceled] },
+          retryCount: { lt: 3 },
         },
       }),
     );
-    expect(ingestionJob.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('does not retry a job that has exceeded maxRetry', async () => {
+    const { repository, ingestionJob } = createRepository();
+    ingestionJob.findUnique.mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.failed, retryCount: 3 });
+
+    await expect(repository.retryIfRetryable('job-1', 3)).resolves.toBeNull();
+    expect(ingestionJob.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('does not retry a job that is not in a terminal state', async () => {
+    const { repository, ingestionJob } = createRepository();
+    ingestionJob.findUnique.mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.pending, retryCount: 0 });
+
+    await expect(repository.retryIfRetryable('job-1')).resolves.toBeNull();
+    expect(ingestionJob.updateMany).not.toHaveBeenCalled();
   });
 
   it('only recovers jobs with a missing or expired lease', async () => {

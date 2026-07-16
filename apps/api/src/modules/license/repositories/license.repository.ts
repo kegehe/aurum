@@ -57,9 +57,9 @@ export class LicenseRepository {
     name?: string;
     url?: string | null;
     text?: string | null;
-    allowsCommercialUse?: boolean;
-    allowsRedistribution?: boolean;
-    allowsDerivatives?: boolean;
+    allowsCommercialUse?: boolean | null;
+    allowsRedistribution?: boolean | null;
+    allowsDerivatives?: boolean | null;
     requiresAttribution?: boolean;
     shareAlike?: boolean;
   }) {

@@ -145,10 +145,10 @@ export default function ResourceDetailPage() {
     try {
       await updateResource(id, {
         title: editTitle || undefined,
-        description: editDescription || undefined,
-        source: editSource || undefined,
-        author: editAuthor || undefined,
-        categoryId: editCategoryId === NO_FOLDER_VALUE ? '' : editCategoryId,
+        description: editDescription || null,
+        source: editSource || null,
+        author: editAuthor || null,
+        categoryId: editCategoryId === NO_FOLDER_VALUE ? null : editCategoryId || undefined,
       });
       toast.success('已更新');
       setEditOpen(false);
@@ -457,13 +457,13 @@ export default function ResourceDetailPage() {
             <CardContent className="space-y-3 text-sm">
               {resource.sourceRecord && (
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">来源</span>
+                  <span className="text-muted-foreground">来源配置</span>
                   <span>{resource.sourceRecord.name}</span>
                 </div>
               )}
               {resource.source && (
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">来源</span>
+                  <span className="text-muted-foreground">来源说明</span>
                   <span>{resource.source}</span>
                 </div>
               )}
@@ -495,7 +495,7 @@ export default function ResourceDetailPage() {
               )}
               {resource.licenseNote && (
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">许可证</span>
+                  <span className="text-muted-foreground">许可证备注</span>
                   <span>{resource.licenseNote}</span>
                 </div>
               )}

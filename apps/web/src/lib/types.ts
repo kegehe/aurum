@@ -113,11 +113,11 @@ export interface ResourceProvenance {
 
 export interface UpdateResourceData {
   title?: string;
-  description?: string;
-  categoryId?: string;
-  source?: string;
-  author?: string;
-  licenseNote?: string;
+  description?: string | null;
+  categoryId?: string | null;
+  source?: string | null;
+  author?: string | null;
+  licenseNote?: string | null;
 }
 
 export interface SearchResourcesParams {
@@ -384,6 +384,7 @@ export interface LicenseItem {
   spdxId: string | null;
   name: string;
   url: string | null;
+  text: string | null;
   allowsCommercialUse: boolean | null;
   allowsRedistribution: boolean | null;
   allowsDerivatives: boolean | null;
@@ -393,7 +394,7 @@ export interface LicenseItem {
   updatedAt: string;
 }
 
-export type LicenseDetail = LicenseItem & { text: string | null };
+export type LicenseDetail = LicenseItem;
 
 export interface CreateLicenseData {
   spdxId?: string;
@@ -412,9 +413,9 @@ export interface UpdateLicenseData {
   name?: string;
   url?: string | null;
   text?: string | null;
-  allowsCommercialUse?: boolean;
-  allowsRedistribution?: boolean;
-  allowsDerivatives?: boolean;
+  allowsCommercialUse?: boolean | null;
+  allowsRedistribution?: boolean | null;
+  allowsDerivatives?: boolean | null;
   requiresAttribution?: boolean;
   shareAlike?: boolean;
 }

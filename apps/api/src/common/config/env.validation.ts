@@ -18,6 +18,8 @@ export const envValidationSchema = Joi.object({
   WORKER_CONCURRENCY: Joi.number().integer().min(1).max(10).default(2),
   INGESTION_POLL_INTERVAL_MS: Joi.number().integer().min(100).default(3000),
   INGESTION_STALE_JOB_TIMEOUT_MS: Joi.number().integer().min(20000).default(60000),
+  INGESTION_HEALTH_CHECK_INTERVAL_MS: Joi.number().integer().min(60000).default(21600000),
+  INGESTION_HEALTH_CHECK_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
   THUMBNAIL_MAX_WIDTH: Joi.number().integer().min(1).default(400),
   THUMBNAIL_MAX_HEIGHT: Joi.number().integer().min(1).default(400),
 });

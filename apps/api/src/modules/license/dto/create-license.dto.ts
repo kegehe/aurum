@@ -8,11 +8,11 @@ import {
   MaxLength,
 } from 'class-validator';
 
-/** 将字符串 "true"/"false" 和数字 1/0 转换为布尔值 */
+/** 将字符串 "true"/"false"/"1"/"0" 和数字 1/0 转换为布尔值 */
 const ToBoolean = () =>
   Transform(({ value }) => {
-    if (value === 'true' || value === 1) return true;
-    if (value === 'false' || value === 0) return false;
+    if (value === 'true' || value === 1 || value === '1') return true;
+    if (value === 'false' || value === 0 || value === '0') return false;
     return value;
   });
 

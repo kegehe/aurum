@@ -30,7 +30,8 @@ import { SOURCE_TYPE_LABELS, ACQUISITION_MODE_LABELS } from '@/lib/constants';
 import type { SourceItem, LicenseItem } from '@/lib/types';
 
 const SOURCE_TYPES = Object.entries(SOURCE_TYPE_LABELS);
-const ACQUISITION_MODES = Object.entries(ACQUISITION_MODE_LABELS);
+/** 外部来源可选的导入模式（排除 local_upload，它仅用于本地上传） */
+const ACQUISITION_MODES = Object.entries(ACQUISITION_MODE_LABELS).filter(([key]) => key !== 'local_upload');
 
 export default function SourcesPage() {
   const [sources, setSources] = useState<SourceItem[]>([]);
@@ -114,23 +115,35 @@ export default function SourcesPage() {
   const handleSave = async () => {
     if (!formName.trim() || !formSlug.trim()) return;
     try {
-      const data = {
-        name: formName.trim(),
-        slug: formSlug.trim(),
-        sourceType: formSourceType,
-        baseUrl: formBaseUrl.trim() || undefined,
-        enabled: formEnabled,
-        allowedModes: formAllowedModes.join(','),
-        defaultLicenseId: formDefaultLicenseId || undefined,
-        rateLimitPerMinute: parseInt(formRateLimit) || 30,
-        maxConcurrency: parseInt(formMaxConcurrency) || 1,
-        requiresReview: formRequiresReview,
-      };
       if (editingSource) {
-        await updateSource(editingSource.id, data);
+        // 更新：null 表示清除字段，undefined 表示不更新
+        await updateSource(editingSource.id, {
+          name: formName.trim(),
+          slug: formSlug.trim(),
+          sourceType: formSourceType,
+          baseUrl: formBaseUrl.trim() || null,
+          enabled: formEnabled,
+          allowedModes: formAllowedModes.join(','),
+          defaultLicenseId: formDefaultLicenseId || null,
+          rateLimitPerMinute: parseInt(formRateLimit) || 30,
+          maxConcurrency: parseInt(formMaxConcurrency) || 1,
+          requiresReview: formRequiresReview,
+        });
         toast.success('来源已更新');
       } else {
-        await createSource(data);
+        // 创建：undefined 表示省略字段
+        await createSource({
+          name: formName.trim(),
+          slug: formSlug.trim(),
+          sourceType: formSourceType,
+          baseUrl: formBaseUrl.trim() || undefined,
+          enabled: formEnabled,
+          allowedModes: formAllowedModes.join(','),
+          defaultLicenseId: formDefaultLicenseId || undefined,
+          rateLimitPerMinute: parseInt(formRateLimit) || 30,
+          maxConcurrency: parseInt(formMaxConcurrency) || 1,
+          requiresReview: formRequiresReview,
+        });
         toast.success('来源已创建');
       }
       setDialogOpen(false);

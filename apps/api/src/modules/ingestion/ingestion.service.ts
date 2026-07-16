@@ -165,27 +165,39 @@ export class IngestionService {
   /**
    * 调度过期 locator 的健康检查任务
    *
-   * 根据指数退避策略计算阈值：
+   * 退避策略（基于上次检查结果，不含连续失败次数，因 ResourceLocator 无此字段）：
    * - 从未检查 → 立即
-   * - 上次成功 (httpStatus 2xx) → 7 天后重查
-   * - 上次失败 1 次 → 1 天后
-   * - 上次失败 2 次 → 3 天后
-   * - 上次失败 3+ 次 → 7 天后
+   * - 上次失败 (httpStatus 4xx+ 或 lastError 非空) → 1 天后重查
+   * - 上次成功 → 7 天后重查
    */
   async scheduleLocatorHealthChecks(batchSize = 10): Promise<number> {
-    const staleBefore = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 默认 7 天
-    const locators = await this.jobRepo.findLocatorsNeedingCheck(staleBefore, batchSize);
+    const MS_DAY = 24 * 60 * 60 * 1000;
+    const isFailure = (l: { httpStatus: number | null; lastError: string | null }) =>
+      (l.httpStatus ?? 0) >= 400 || l.lastError !== null;
+    const isNeverChecked = (l: { lastCheckedAt: Date | null }) => l.lastCheckedAt === null;
+
+    // 按优先级从高到低查询
+    const tiers: Array<{
+      staleBefore: Date;
+      filter: (l: { httpStatus: number | null; lastError: string | null; lastCheckedAt: Date | null }) => boolean;
+    }> = [
+      // 从未检查 → 立即；失败 → 1 天
+      { staleBefore: new Date(Date.now() - 1 * MS_DAY), filter: (l) => isNeverChecked(l) || isFailure(l) },
+      // 成功 → 7 天
+      { staleBefore: new Date(Date.now() - 7 * MS_DAY), filter: () => true },
+    ];
+
     let created = 0;
-    for (const locator of locators) {
-      // 根据上次检查结果调整阈值
-      if (locator.lastCheckedAt) {
-        const isFailure = (locator.httpStatus ?? 0) >= 400 || locator.lastError !== null;
-        if (!isFailure) continue; // 成功的 7 天阈值已由 staleBefore 覆盖
-        // 失败的应该更频繁检查，但 findLocatorsNeedingCheck 已经按 7 天阈值选出来了
-        // 这里不额外过滤，让所有 stale 的都被检查
+    for (const tier of tiers) {
+      if (created >= batchSize) break;
+      const remaining = batchSize - created;
+      const locators = await this.jobRepo.findLocatorsNeedingCheck(tier.staleBefore, remaining);
+      for (const locator of locators) {
+        if (!tier.filter(locator)) continue;
+        const job = await this.enqueueLocatorCheck(locator.id, locator.url, locator.sourceId ?? undefined);
+        if (job) created++;
+        if (created >= batchSize) break;
       }
-      const job = await this.enqueueLocatorCheck(locator.id, locator.url, locator.sourceId ?? undefined);
-      if (job) created++;
     }
     return created;
   }
@@ -276,11 +288,16 @@ export class IngestionService {
     await this.prisma.resourceLocator.update({
       where: { id: request.locatorId },
       data: {
-        httpStatus: result.httpStatus || null,
-        contentType: result.contentType,
-        contentLength: result.contentLength,
-        etag: result.etag,
-        lastModified: result.lastModified,
+        httpStatus: result.httpStatus > 0 ? result.httpStatus : null,
+        // 仅在检查成功时更新元数据，避免错误页面的头信息覆盖原有数据
+        ...(result.error === null
+          ? {
+              contentType: result.contentType,
+              contentLength: result.contentLength,
+              etag: result.etag,
+              lastModified: result.lastModified,
+            }
+          : {}),
         lastCheckedAt: now,
         lastError: result.error,
       },

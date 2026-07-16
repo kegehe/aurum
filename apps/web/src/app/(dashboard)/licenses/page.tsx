@@ -21,11 +21,16 @@ import { Textarea } from '@/components/ui/textarea';
 import { listLicenses, createLicense, updateLicense, deleteLicense } from '@/lib/api/licenses';
 import type { LicenseItem } from '@/lib/types';
 
-/** 三态布尔标记组件 */
+/** 三态布尔标记组件（null=未设置, true=✓, false=✗） */
 function TriBool({ value }: { value: boolean | null }) {
   if (value === true) return <Check className="h-4 w-4 text-green-600" />;
   if (value === false) return <X className="h-4 w-4 text-red-500" />;
   return <HelpCircle className="h-4 w-4 text-muted-foreground" />;
+}
+
+/** 二态布尔标记组件（true=✓, false=✗） */
+function BoolMark({ value }: { value: boolean }) {
+  return value ? <Check className="h-4 w-4 text-green-600" /> : <X className="h-4 w-4 text-muted-foreground" />;
 }
 
 export default function LicensesPage() {
@@ -87,7 +92,7 @@ export default function LicensesPage() {
     setFormSpdxId(license.spdxId ?? '');
     setFormName(license.name);
     setFormUrl(license.url ?? '');
-    setFormText('');
+    setFormText(license.text ?? '');
     setFormCommercialUse(license.allowsCommercialUse);
     setFormRedistribution(license.allowsRedistribution);
     setFormDerivatives(license.allowsDerivatives);
@@ -99,22 +104,31 @@ export default function LicensesPage() {
   const handleSave = async () => {
     if (!formName.trim()) return;
     try {
-      const data = {
-        spdxId: formSpdxId.trim() || undefined,
-        name: formName.trim(),
-        url: formUrl.trim() || undefined,
-        text: formText.trim() || undefined,
-        allowsCommercialUse: formCommercialUse ?? undefined,
-        allowsRedistribution: formRedistribution ?? undefined,
-        allowsDerivatives: formDerivatives ?? undefined,
-        requiresAttribution: formAttribution,
-        shareAlike: formShareAlike,
-      };
       if (editingLicense) {
-        await updateLicense(editingLicense.id, data);
+        await updateLicense(editingLicense.id, {
+          spdxId: formSpdxId.trim() || null,
+          name: formName.trim(),
+          url: formUrl.trim() || null,
+          text: formText.trim() || null,
+          allowsCommercialUse: formCommercialUse,
+          allowsRedistribution: formRedistribution,
+          allowsDerivatives: formDerivatives,
+          requiresAttribution: formAttribution,
+          shareAlike: formShareAlike,
+        });
         toast.success('许可证已更新');
       } else {
-        await createLicense(data);
+        await createLicense({
+          spdxId: formSpdxId.trim() || undefined,
+          name: formName.trim(),
+          url: formUrl.trim() || undefined,
+          text: formText.trim() || undefined,
+          allowsCommercialUse: formCommercialUse ?? undefined,
+          allowsRedistribution: formRedistribution ?? undefined,
+          allowsDerivatives: formDerivatives ?? undefined,
+          requiresAttribution: formAttribution,
+          shareAlike: formShareAlike,
+        });
         toast.success('许可证已创建');
       }
       setDialogOpen(false);
@@ -190,13 +204,13 @@ export default function LicensesPage() {
       key: 'requiresAttribution',
       header: '署名',
       className: 'w-16 text-center',
-      render: (l) => <TriBool value={l.requiresAttribution} />,
+      render: (l) => <BoolMark value={l.requiresAttribution} />,
     },
     {
       key: 'shareAlike',
       header: '相同方式',
       className: 'w-16 text-center',
-      render: (l) => <TriBool value={l.shareAlike} />,
+      render: (l) => <BoolMark value={l.shareAlike} />,
     },
     {
       key: 'actions',
@@ -303,7 +317,7 @@ export default function LicensesPage() {
                   className="flex items-center justify-between rounded-md border px-3 py-2 text-sm hover:bg-accent"
                 >
                   <span>需要署名</span>
-                  <TriBool value={formAttribution} />
+                  <BoolMark value={formAttribution} />
                 </button>
                 <button
                   type="button"
@@ -311,7 +325,7 @@ export default function LicensesPage() {
                   className="flex items-center justify-between rounded-md border px-3 py-2 text-sm hover:bg-accent"
                 >
                   <span>相同方式共享</span>
-                  <TriBool value={formShareAlike} />
+                  <BoolMark value={formShareAlike} />
                 </button>
               </div>
             </div>

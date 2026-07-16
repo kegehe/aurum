@@ -10,10 +10,13 @@ export class UpdateResourceDto {
   @MaxLength(255)
   title?: string;
 
+  /** 传 null 清除描述，传新值更新；不允许空字符串 */
   @IsOptional()
+  @ValidateIf((o) => o.description !== null)
+  @IsNotEmpty()
   @IsString()
   @MaxLength(2000)
-  description?: string;
+  description?: string | null;
 
   /** 传 null 显式断开分类关联，传 UUID 设置新分类 */
   @IsOptional()
@@ -22,18 +25,27 @@ export class UpdateResourceDto {
   @IsUUID()
   categoryId?: string | null;
 
+  /** 传 null 清除来源，传新值更新；不允许空字符串 */
   @IsOptional()
+  @ValidateIf((o) => o.source !== null)
+  @IsNotEmpty()
   @IsString()
   @MaxLength(255)
-  source?: string;
+  source?: string | null;
 
+  /** 传 null 清除作者，传新值更新；不允许空字符串 */
   @IsOptional()
+  @ValidateIf((o) => o.author !== null)
+  @IsNotEmpty()
   @IsString()
   @MaxLength(255)
-  author?: string;
+  author?: string | null;
 
+  /** 传 null 清除许可证备注，传新值更新；不允许空字符串 */
   @IsOptional()
+  @ValidateIf((o) => o.licenseNote !== null)
+  @IsNotEmpty()
   @IsString()
   @MaxLength(2000)
-  licenseNote?: string;
+  licenseNote?: string | null;
 }

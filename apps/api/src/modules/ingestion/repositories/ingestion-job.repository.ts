@@ -97,9 +97,17 @@ export class IngestionJobRepository {
     return update.count === 1;
   }
 
-  async retryIfRetryable(id: string) {
+  async retryIfRetryable(id: string, maxRetry = 3) {
+    const job = await this.prisma.ingestionJob.findUnique({ where: { id }, select: { retryCount: true, status: true } });
+    if (!job) return null;
+    if (job.status !== IngestionJobStatus.failed && job.status !== IngestionJobStatus.canceled) return null;
+    if (job.retryCount >= maxRetry) return null;
     const update = await this.prisma.ingestionJob.updateMany({
-      where: { id, status: { in: [IngestionJobStatus.failed, IngestionJobStatus.canceled] } },
+      where: {
+        id,
+        status: { in: [IngestionJobStatus.failed, IngestionJobStatus.canceled] },
+        retryCount: { lt: maxRetry },
+      },
       data: {
         status: IngestionJobStatus.pending,
         leaseToken: null,
@@ -163,9 +171,14 @@ export class IngestionJobRepository {
     });
     const activeLocatorIds = new Set(
       activeCheckJobs.map((j) => {
-        // 从 idempotencyKey "check_locator:{locatorId}" 提取 locatorId
+        // 从 idempotencyKey 提取 locatorId
+        // 格式：check_locator:{locatorId}（自动调度）或 check_locator:{locatorId}:{timestamp}（手动触发）
         const prefix = 'check_locator:';
-        return j.idempotencyKey.startsWith(prefix) ? j.idempotencyKey.slice(prefix.length) : null;
+        if (!j.idempotencyKey.startsWith(prefix)) return null;
+        const remainder = j.idempotencyKey.slice(prefix.length);
+        // 取第一个冒号之前的部分作为 locatorId（手动触发的 key 含时间戳后缀）
+        const colonIdx = remainder.indexOf(':');
+        return colonIdx >= 0 ? remainder.slice(0, colonIdx) : remainder;
       }).filter(Boolean),
     );
 

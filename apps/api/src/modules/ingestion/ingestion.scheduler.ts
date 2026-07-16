@@ -22,8 +22,8 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit() {
-    this.staleJobTimeoutMs = this.config.get<number>('ingestion.staleJobTimeoutMs')!;
-    const interval = this.config.get<number>('ingestion.pollIntervalMs')!;
+    this.staleJobTimeoutMs = this.config.get<number>('ingestion.staleJobTimeoutMs') ?? this.staleJobTimeoutMs;
+    const interval = this.config.get<number>('ingestion.pollIntervalMs') ?? 3000;
     this.staleRecoveryIntervalMs = Math.max(interval, Math.min(this.staleJobTimeoutMs / 2, 60_000));
     this.healthCheckIntervalMs = this.config.get<number>('ingestion.healthCheckIntervalMs') ?? this.healthCheckIntervalMs;
     this.healthCheckBatchSize = this.config.get<number>('ingestion.healthCheckBatchSize') ?? this.healthCheckBatchSize;

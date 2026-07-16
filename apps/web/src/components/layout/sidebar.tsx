@@ -68,7 +68,7 @@ export function Sidebar() {
 
       {/* Footer */}
       <div className="border-t border-sidebar-border p-3">
-        <p className="text-xs text-muted-foreground">资源管理平台 v0.1</p>
+        <p className="text-xs text-muted-foreground">资源管理平台 v0.2.0</p>
       </div>
     </aside>
   );

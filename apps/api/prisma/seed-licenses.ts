@@ -1,7 +1,7 @@
 /**
  * 许可证种子数据
  *
- * 使用 upsert 按 spdxId 插入，幂等，不覆盖已有数据。
+ * 使用 findUnique + create 按 spdxId 插入，幂等，不覆盖已有数据。
  * 运行方式：npx ts-node prisma/seed-licenses.ts
  * 或通过 Prisma seed 命令调用。
  */
@@ -120,25 +120,27 @@ const LICENSES = [
   },
 ];
 
-export async function seedLicenses(prisma: PrismaClient): Promise<number> {
+export async function seedLicenses(prisma: PrismaClient): Promise<{ created: number; skipped: number }> {
   let created = 0;
+  let skipped = 0;
   for (const license of LICENSES) {
-    const result = await prisma.license.upsert({
-      where: { spdxId: license.spdxId },
-      update: {}, // 不覆盖已有数据
-      create: license,
-    });
-    if (result) created++;
+    const existing = await prisma.license.findUnique({ where: { spdxId: license.spdxId } });
+    if (existing) {
+      skipped++;
+      continue;
+    }
+    await prisma.license.create({ data: license });
+    created++;
   }
-  return created;
+  return { created, skipped };
 }
 
 // 直接运行时执行 seed
 async function main() {
   const prisma = new PrismaClient();
   try {
-    const count = await seedLicenses(prisma);
-    console.log(`Seeded ${count} licenses (upsert)`);
+    const { created, skipped } = await seedLicenses(prisma);
+    console.log(`Seeded ${created} new licenses, ${skipped} already existed`);
   } finally {
     await prisma.$disconnect();
   }

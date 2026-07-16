@@ -32,7 +32,7 @@ export default function ImportLinkPage() {
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
   const [tags, setTags] = useState<TagWithUsage[]>([]);
   const [sources, setSources] = useState<SourceItem[]>([]);
-  const [sourceId, setSourceId] = useState('');
+  const [sourceId, setSourceId] = useState('__none__');
   const [submitting, setSubmitting] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -222,14 +222,18 @@ export default function ImportLinkPage() {
                 <CheckCircle2 className="mt-0.5 h-4 w-4 text-success" />
               ) : job.status === 'failed' ? (
                 <AlertCircle className="mt-0.5 h-4 w-4 text-destructive" />
+              ) : job.status === 'canceled' ? (
+                <AlertCircle className="mt-0.5 h-4 w-4 text-muted-foreground" />
               ) : (
                 <Loader2 className="mt-0.5 h-4 w-4 animate-spin text-muted-foreground" />
               )}
               <div>
-                <p className="font-medium">{job.status === 'failed' ? '导入失败' : job.status === 'completed' ? '导入完成' : '正在导入'}</p>
+                <p className="font-medium">
+                  {job.status === 'failed' ? '导入失败' : job.status === 'completed' ? '导入完成' : job.status === 'canceled' ? '导入已取消' : '正在导入'}
+                </p>
                 {job.errorMessage && <p className="mt-1 text-destructive">{job.errorMessage}</p>}
                 {pollError && !job.errorMessage && <p className="mt-1 text-destructive">网络错误：{pollError}</p>}
-                {job.status === 'failed' && (
+                {(job.status === 'failed' || job.status === 'canceled') && (
                   <Button variant="outline" size="sm" className="mt-2" onClick={retry} disabled={retrying}>
                     重试
                   </Button>

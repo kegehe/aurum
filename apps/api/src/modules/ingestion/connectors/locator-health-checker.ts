@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { fetch } from 'undici';
 import { SafeUrlService } from '../../../common/security/safe-url.service';
 
-const HEAD_TIMEOUT_MS = 15_000;
+const CHECK_TIMEOUT_MS = 15_000;
 const MAX_REDIRECTS = 5;
 const MAX_SQLITE_BIGINT = 9_223_372_036_854_775_807n;
 
@@ -25,6 +25,9 @@ export interface LocatorCheckOptions {
  * 使用 HEAD 请求探测 URL 可用性，获取 HTTP 状态、内容类型、ETag 等信息。
  * 当服务器不支持 HEAD（返回 405）时，fallback 到 GET + Range: bytes=0-0。
  * 所有请求经过 SafeUrlService 的 SSRF 防护和 DNS pinning。
+ *
+ * 重定向计数器在 HEAD→GET fallback 之间累积，确保总重定向不超过 MAX_REDIRECTS。
+ * 超时信号覆盖整个检查流程（HEAD + GET fallback），而非单个请求。
  */
 @Injectable()
 export class LocatorHealthChecker {
@@ -33,16 +36,16 @@ export class LocatorHealthChecker {
   async check(rawUrl: string, options: LocatorCheckOptions = {}): Promise<LocatorCheckResult> {
     try {
       let current = this.safeUrl.normalize(rawUrl);
-      const signal = AbortSignal.timeout(HEAD_TIMEOUT_MS);
+      const signal = AbortSignal.timeout(CHECK_TIMEOUT_MS);
       const dispatcher = this.safeUrl.createSafeDispatcher({
         headersTimeout: 10_000,
         bodyTimeout: 10_000,
       });
 
       try {
-        for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+        let redirectsUsed = 0;
+        for (let step = 0; step <= MAX_REDIRECTS; step++) {
           await options.validateUrl?.(current.toString());
-          await this.safeUrl.normalize(current.toString()); // re-validate after redirect
 
           // 先尝试 HEAD
           const headResponse = await fetch(current, {
@@ -63,13 +66,17 @@ export class LocatorHealthChecker {
               return makeErrorResult(headResponse.status, 'Redirect response has no location');
             }
             current = this.safeUrl.normalize(new URL(location, current).toString());
+            redirectsUsed++;
+            if (redirectsUsed > MAX_REDIRECTS) {
+              return makeErrorResult(0, `Too many redirects (maximum ${MAX_REDIRECTS})`);
+            }
             continue;
           }
 
           // HEAD 不被支持，fallback 到 GET + Range
           if (headResponse.status === 405) {
             await headResponse.body?.cancel();
-            return await this.fallbackGetCheck(current, dispatcher, signal);
+            return await this.fallbackGetCheck(current, dispatcher, signal, options, redirectsUsed);
           }
 
           // 其他非 2xx — 仍然记录状态码
@@ -114,40 +121,59 @@ export class LocatorHealthChecker {
   /**
    * GET + Range: bytes=0-0 fallback
    * 当服务器不支持 HEAD 时使用，只读取极少量数据以获取响应头
+   * 支持重定向跟随（与 HEAD 循环一致）
+   *
+   * @param redirectsUsed HEAD 阶段已使用的重定向次数，GET 阶段继续累积
    */
   private async fallbackGetCheck(
     url: URL,
     dispatcher: ReturnType<SafeUrlService['createSafeDispatcher']>,
     signal: AbortSignal,
+    options: LocatorCheckOptions = {},
+    redirectsUsed = 0,
   ): Promise<LocatorCheckResult> {
-    const response = await fetch(url, {
-      dispatcher,
-      redirect: 'manual',
-      signal,
-      method: 'GET',
-      headers: {
-        'user-agent': 'resource-service-health-checker/0.1',
-        range: 'bytes=0-0',
-      },
-    });
+    let current = url;
+    for (let step = 0; step <= MAX_REDIRECTS; step++) {
+      await options.validateUrl?.(current.toString());
+      const response = await fetch(current, {
+        dispatcher,
+        redirect: 'manual',
+        signal,
+        method: 'GET',
+        headers: {
+          'user-agent': 'resource-service-health-checker/0.1',
+          range: 'bytes=0-0',
+        },
+      });
 
-    // 处理重定向（GET 的重定向）
-    if (response.status >= 300 && response.status < 400) {
+      // 处理重定向
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        await response.body?.cancel();
+        if (!location) {
+          return makeErrorResult(response.status, 'Redirect response has no location');
+        }
+        current = this.safeUrl.normalize(new URL(location, current).toString());
+        redirectsUsed++;
+        if (redirectsUsed > MAX_REDIRECTS) {
+          return makeErrorResult(0, `Too many redirects in GET fallback (maximum ${MAX_REDIRECTS})`);
+        }
+        continue;
+      }
+
       await response.body?.cancel();
-      return makeErrorResult(response.status, 'Redirect during GET fallback');
+
+      const status = response.status === 206 ? 200 : response.status;
+      return {
+        httpStatus: status,
+        contentType: response.headers.get('content-type'),
+        contentLength: parseContentLength(response.headers.get('content-length')),
+        etag: response.headers.get('etag'),
+        lastModified: parseLastModified(response.headers.get('last-modified')),
+        error: status >= 400 ? `HTTP ${status}` : null,
+      };
     }
-
-    await response.body?.cancel();
-
-    const status = response.status === 206 ? 200 : response.status;
-    return {
-      httpStatus: status,
-      contentType: response.headers.get('content-type'),
-      contentLength: parseContentLength(response.headers.get('content-length')),
-      etag: response.headers.get('etag'),
-      lastModified: parseLastModified(response.headers.get('last-modified')),
-      error: status >= 400 ? `HTTP ${status}` : null,
-    };
+    return makeErrorResult(0, `Too many redirects in GET fallback (maximum ${MAX_REDIRECTS})`);
   }
 }
 
