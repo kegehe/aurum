@@ -53,21 +53,15 @@ import {
   removeTagFromResource,
   getResourceDownloadUrl,
   getResourcePreviewUrl,
+  checkResourceLocators,
 } from '@/lib/api/resources';
 import { listTags } from '@/lib/api/tags';
 import { listCategories } from '@/lib/api/categories';
 import { formatByteString, formatDateTime } from '@/lib/format';
-import { PROCESSING_STATUS_LABELS } from '@/lib/constants';
+import { PROCESSING_STATUS_LABELS, LICENSE_STATUS_LABELS, LOCATOR_TYPE_LABELS } from '@/lib/constants';
 import type { ResourceDetail, TagWithUsage, CategoryTreeNode } from '@/lib/types';
 
 const NO_FOLDER_VALUE = '__no_folder__';
-
-const LICENSE_STATUS_LABELS: Record<string, string> = {
-  unknown: '许可未知',
-  verified: '许可已核验',
-  restricted: '许可受限',
-  rejected: '许可不允许',
-};
 
 function flattenCategories(categories: CategoryTreeNode[]): CategoryTreeNode[] {
   return categories.flatMap((category) => [category, ...flattenCategories(category.children)]);
@@ -215,6 +209,19 @@ export default function ResourceDetailPage() {
       toast.error(e instanceof Error ? e.message : '移除标签失败');
     }
   };
+
+  const handleCheckLocators = async () => {
+    try {
+      const result = await checkResourceLocators(id);
+      toast.success(result.message);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '检查失败');
+    }
+  };
+
+  const hasBrokenLinks = resource?.locators?.some(
+    (l) => (l.httpStatus ?? 0) >= 400 || l.lastError !== null,
+  );
 
   const primaryLocator = resource?.locators?.find((locator) => locator.isPrimary);
   const previewLocator = resource?.locators?.find((locator) => locator.locatorType === 'preview');
@@ -519,6 +526,117 @@ export default function ResourceDetailPage() {
               )}
             </CardContent>
           </Card>
+
+          {/* 链接健康（仅外部资源显示） */}
+          {isExternalResource && resource.locators && resource.locators.length > 0 && (
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle className="text-base">链接健康</CardTitle>
+                <Button variant="outline" size="sm" className="gap-1" onClick={handleCheckLocators}>
+                  <RefreshCw className="h-3.5 w-3.5" />重新检查
+                </Button>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {hasBrokenLinks && (
+                  <div className="rounded-md bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 p-2 text-xs text-amber-800 dark:text-amber-200">
+                    ⚠ 此资源存在失效链接
+                  </div>
+                )}
+                {resource.locators.map((locator) => (
+                  <div key={locator.id} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+                    <Badge variant="outline" className="text-xs shrink-0">
+                      {LOCATOR_TYPE_LABELS[locator.locatorType] ?? locator.locatorType}
+                    </Badge>
+                    {locator.httpStatus !== null ? (
+                      <Badge
+                        variant={
+                          locator.httpStatus >= 200 && locator.httpStatus < 300
+                            ? 'default'
+                            : locator.httpStatus >= 300 && locator.httpStatus < 400
+                              ? 'secondary'
+                              : 'destructive'
+                        }
+                        className="text-xs shrink-0"
+                      >
+                        {locator.httpStatus}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="text-xs shrink-0 text-muted-foreground">未检查</Badge>
+                    )}
+                    <a
+                      href={locator.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="truncate text-primary hover:underline flex-1 min-w-0"
+                    >
+                      {locator.url}
+                    </a>
+                    {locator.lastError && (
+                      <span className="text-xs text-destructive shrink-0">{locator.lastError}</span>
+                    )}
+                    {locator.lastCheckedAt && (
+                      <span className="text-xs text-muted-foreground shrink-0">
+                        {formatDateTime(locator.lastCheckedAt)}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 来源追溯（仅外部资源显示） */}
+          {isExternalResource && resource.provenance && resource.provenance.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">来源追溯</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                {resource.provenance.map((p) => (
+                  <div key={p.id} className="space-y-1.5 rounded-md border px-3 py-2">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">连接器</span>
+                      <span>{p.connectorType} v{p.connectorVersion}</span>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <span className="shrink-0 text-muted-foreground">原始 URL</span>
+                      <a href={p.originalUrl} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">
+                        {p.originalUrl}
+                      </a>
+                    </div>
+                    {p.publisher && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">发布者</span>
+                        <span>{p.publisher}</span>
+                      </div>
+                    )}
+                    {p.authorName && (
+                      <div className="flex justify-between gap-3">
+                        <span className="shrink-0 text-muted-foreground">作者</span>
+                        {p.authorUrl ? (
+                          <a href={p.authorUrl} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">{p.authorName}</a>
+                        ) : (
+                          <span>{p.authorName}</span>
+                        )}
+                      </div>
+                    )}
+                    {p.licenseText && (
+                      <div>
+                        <span className="text-muted-foreground">许可文本：</span>
+                        <p className="mt-1 text-xs text-muted-foreground line-clamp-3">{p.licenseText}</p>
+                      </div>
+                    )}
+                    {p.attributionText && (
+                      <div>
+                        <span className="text-muted-foreground">署名要求：</span>
+                        <p className="mt-1 text-xs">{p.attributionText}</p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
         </div>
       </div>
 

@@ -9,6 +9,8 @@ import {
   Layers,
   Cpu,
   Trash2,
+  Globe,
+  Scale,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
@@ -24,6 +26,8 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Layers,
   Cpu,
   Trash2,
+  Globe,
+  Scale,
 };
 
 export function Sidebar() {

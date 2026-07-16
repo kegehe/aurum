@@ -24,6 +24,8 @@ export default () => ({
   ingestion: {
     pollIntervalMs: parseInt(process.env.INGESTION_POLL_INTERVAL_MS || '3000', 10),
     staleJobTimeoutMs: parseInt(process.env.INGESTION_STALE_JOB_TIMEOUT_MS || '60000', 10),
+    healthCheckIntervalMs: parseInt(process.env.INGESTION_HEALTH_CHECK_INTERVAL_MS || '21600000', 10),
+    healthCheckBatchSize: parseInt(process.env.INGESTION_HEALTH_CHECK_BATCH_SIZE || '10', 10),
   },
   thumbnail: {
     maxWidth: parseInt(process.env.THUMBNAIL_MAX_WIDTH || '400', 10),

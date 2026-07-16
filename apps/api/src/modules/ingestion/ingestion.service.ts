@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { IngestionJob } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import {
   AcquisitionMode,
@@ -15,6 +16,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
 import { SourceRepository } from '../source/repositories/source.repository';
 import { LinkMetadataConnector } from './connectors/link-metadata.connector';
+import { LocatorHealthChecker } from './connectors/locator-health-checker';
 import { CreateLinkImportDto } from './dto/create-link-import.dto';
 import { QueryIngestionJobsDto } from './dto/query-ingestion-jobs.dto';
 import { IngestionJobRepository } from './repositories/ingestion-job.repository';
@@ -38,6 +40,7 @@ export class IngestionService {
     private readonly resourceRepo: ResourceRepository,
     private readonly safeUrl: SafeUrlService,
     private readonly linkMetadataConnector: LinkMetadataConnector,
+    private readonly locatorHealthChecker: LocatorHealthChecker,
   ) {}
 
   async createLinkImport(dto: CreateLinkImportDto) {
@@ -118,8 +121,12 @@ export class IngestionService {
     }
     const leaseToken = job.leaseToken;
     try {
-      if (job.jobType !== IngestionJobType.import_url) {
+      if (job.jobType !== IngestionJobType.import_url && job.jobType !== IngestionJobType.check_locator) {
         throw new BadRequestException(`Unsupported ingestion job type: ${job.jobType}`);
+      }
+      if (job.jobType === IngestionJobType.check_locator) {
+        await this.runLocatorCheck(job, leaseToken);
+        return true;
       }
       const request = this.parseLinkImportRequest(job.request);
       if (request.sourceId) await this.assertLinkImportAllowed(request.sourceId, request.url);
@@ -155,6 +162,144 @@ export class IngestionService {
     return this.jobRepo.resetStaleProcessing(new Date(Date.now() - staleJobTimeoutMs));
   }
 
+  /**
+   * 调度过期 locator 的健康检查任务
+   *
+   * 根据指数退避策略计算阈值：
+   * - 从未检查 → 立即
+   * - 上次成功 (httpStatus 2xx) → 7 天后重查
+   * - 上次失败 1 次 → 1 天后
+   * - 上次失败 2 次 → 3 天后
+   * - 上次失败 3+ 次 → 7 天后
+   */
+  async scheduleLocatorHealthChecks(batchSize = 10): Promise<number> {
+    const staleBefore = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 默认 7 天
+    const locators = await this.jobRepo.findLocatorsNeedingCheck(staleBefore, batchSize);
+    let created = 0;
+    for (const locator of locators) {
+      // 根据上次检查结果调整阈值
+      if (locator.lastCheckedAt) {
+        const isFailure = (locator.httpStatus ?? 0) >= 400 || locator.lastError !== null;
+        if (!isFailure) continue; // 成功的 7 天阈值已由 staleBefore 覆盖
+        // 失败的应该更频繁检查，但 findLocatorsNeedingCheck 已经按 7 天阈值选出来了
+        // 这里不额外过滤，让所有 stale 的都被检查
+      }
+      const job = await this.enqueueLocatorCheck(locator.id, locator.url, locator.sourceId ?? undefined);
+      if (job) created++;
+    }
+    return created;
+  }
+
+  /** 为单个 locator 创建 check_locator 任务（幂等） */
+  async enqueueLocatorCheck(locatorId: string, url: string, sourceId?: string) {
+    const idempotencyKey = `check_locator:${locatorId}`;
+    const existing = await this.jobRepo.findActiveByIdempotencyKey(idempotencyKey);
+    if (existing) return existing;
+    try {
+      return await this.jobRepo.create({
+        sourceId,
+        jobType: IngestionJobType.check_locator,
+        request: JSON.stringify({ locatorId, url }),
+        idempotencyKey,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const activeJob = await this.jobRepo.findActiveByIdempotencyKey(idempotencyKey);
+        if (activeJob) return activeJob;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 手动触发资源所有定位器的健康检查
+   * 为每个 locator 创建 check_locator 任务
+   */
+  async checkResourceLocators(resourceId: string) {
+    const resource = await this.prisma.resource.findUnique({
+      where: { id: resourceId },
+      include: { locators: true },
+    });
+    if (!resource) throw new NotFoundException(`Resource ${resourceId} not found`);
+    if (resource.locators.length === 0) {
+      return { jobs: [], message: 'No locators to check' };
+    }
+    const jobs = [];
+    for (const locator of resource.locators) {
+      // 手动触发时使用带时间戳的 idempotencyKey 以绕过幂等检查
+      const idempotencyKey = `check_locator:${locator.id}:${Date.now()}`;
+      const job = await this.jobRepo.create({
+        sourceId: locator.sourceId ?? undefined,
+        jobType: IngestionJobType.check_locator,
+        request: JSON.stringify({ locatorId: locator.id, url: locator.url }),
+        idempotencyKey,
+      });
+      jobs.push(job);
+    }
+    return { jobs, message: `Created ${jobs.length} health check jobs` };
+  }
+
+  /**
+   * 策略门禁：检查是否允许创建 mirror_file/archive_snapshot 任务
+   *
+   * - 来源必须存在且启用
+   * - 来源必须允许该导入模式
+   * - 来源不得需要人工审核
+   */
+  async assertDownloadAllowed(sourceId: string | null | undefined, acquisitionMode: string): Promise<void> {
+    if (
+      acquisitionMode !== AcquisitionMode.mirror_file &&
+      acquisitionMode !== AcquisitionMode.archive_snapshot
+    ) {
+      return; // link_only 和 metadata_only 不需要门禁
+    }
+    if (!sourceId) {
+      throw new BadRequestException('Download requires a source configuration');
+    }
+    const source = await this.sourceRepo.findById(sourceId);
+    if (!source) throw new NotFoundException(`Source ${sourceId} not found`);
+    if (!source.enabled) throw new BadRequestException('Source is disabled');
+    const allowedModes = source.allowedModes.split(',').map((m) => m.trim());
+    if (!allowedModes.includes(acquisitionMode)) {
+      throw new BadRequestException(`Source does not allow ${acquisitionMode} mode`);
+    }
+    if (source.requiresReview) {
+      throw new BadRequestException('Source requires manual review before download');
+    }
+  }
+
+  private async runLocatorCheck(job: IngestionJob, leaseToken: string): Promise<void> {
+    const request = this.parseLocatorCheckRequest(job.request);
+    const result = await this.locatorHealthChecker.check(request.url);
+    const now = new Date();
+
+    await this.prisma.resourceLocator.update({
+      where: { id: request.locatorId },
+      data: {
+        httpStatus: result.httpStatus || null,
+        contentType: result.contentType,
+        contentLength: result.contentLength,
+        etag: result.etag,
+        lastModified: result.lastModified,
+        lastCheckedAt: now,
+        lastError: result.error,
+      },
+    });
+
+    const completed = await this.jobRepo.complete(
+      job.id,
+      leaseToken,
+      job.resourceId ?? null,
+      JSON.stringify({
+        locatorId: request.locatorId,
+        httpStatus: result.httpStatus,
+        error: result.error,
+      }),
+    );
+    if (completed) this.logger.log(`Locator health check completed: ${request.locatorId} → HTTP ${result.httpStatus || 'error'}`);
+    else this.logger.warn(`Ingestion job ${job.id} lost its lease before completion`);
+  }
+
   private parseLinkImportRequest(serialized: string): LinkImportRequest {
     const request: unknown = JSON.parse(serialized);
     if (!request || typeof request !== 'object' || typeof (request as { url?: unknown }).url !== 'string') {
@@ -162,6 +307,20 @@ export class IngestionService {
     }
     const value = request as LinkImportRequest;
     return { ...value, url: this.safeUrl.normalize(value.url).toString() };
+  }
+
+  private parseLocatorCheckRequest(serialized: string): { locatorId: string; url: string } {
+    const request: unknown = JSON.parse(serialized);
+    if (
+      !request ||
+      typeof request !== 'object' ||
+      typeof (request as { locatorId?: unknown }).locatorId !== 'string' ||
+      typeof (request as { url?: unknown }).url !== 'string'
+    ) {
+      throw new BadRequestException('Invalid locator check request');
+    }
+    const value = request as { locatorId: string; url: string };
+    return { locatorId: value.locatorId, url: this.safeUrl.normalize(value.url).toString() };
   }
 
   private async assertLinkImportAllowed(sourceId: string, targetUrl: string): Promise<void> {

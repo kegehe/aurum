@@ -26,4 +26,10 @@ export class IngestionController {
   retryJob(@Param('id') id: string) {
     return this.ingestionService.retryJob(id);
   }
+
+  /** 手动触发资源所有定位器的健康检查 */
+  @Post('resources/:id/locators/check')
+  checkResourceLocators(@Param('id') id: string) {
+    return this.ingestionService.checkResourceLocators(id);
+  }
 }

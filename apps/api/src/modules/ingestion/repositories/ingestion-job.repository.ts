@@ -69,13 +69,13 @@ export class IngestionJobRepository {
     });
   }
 
-  async complete(id: string, leaseToken: string, resourceId: string, result: string): Promise<boolean> {
+  async complete(id: string, leaseToken: string, resourceId: string | null, result: string): Promise<boolean> {
     const update = await this.prisma.ingestionJob.updateMany({
       where: { id, status: IngestionJobStatus.processing, leaseToken },
       data: {
         status: IngestionJobStatus.completed,
         leaseToken: null,
-        resourceId,
+        resourceId: resourceId ?? undefined,
         result,
         finishedAt: new Date(),
       },
@@ -142,5 +142,51 @@ export class IngestionJobRepository {
       this.prisma.ingestionJob.count({ where }),
     ]);
     return { items, total, page, pageSize };
+  }
+
+  /**
+   * 查询需要健康检查的 ResourceLocator
+   *
+   * 条件：lastCheckedAt IS NULL（从未检查）或 lastCheckedAt 早于阈值
+   * 排除：已有活跃 check_locator 任务的 locator（通过 idempotencyKey 判断）
+   * 按优先级排序：从未检查的优先，然后按 lastCheckedAt 升序
+   */
+  async findLocatorsNeedingCheck(staleBefore: Date, limit: number) {
+    // 先找出所有活跃的 check_locator 任务的 idempotencyKey
+    // idempotencyKey 格式：check_locator:{locatorId}
+    const activeCheckJobs = await this.prisma.ingestionJob.findMany({
+      where: {
+        jobType: IngestionJobType.check_locator,
+        status: { in: [IngestionJobStatus.pending, IngestionJobStatus.processing] },
+      },
+      select: { idempotencyKey: true },
+    });
+    const activeLocatorIds = new Set(
+      activeCheckJobs.map((j) => {
+        // 从 idempotencyKey "check_locator:{locatorId}" 提取 locatorId
+        const prefix = 'check_locator:';
+        return j.idempotencyKey.startsWith(prefix) ? j.idempotencyKey.slice(prefix.length) : null;
+      }).filter(Boolean),
+    );
+
+    const candidates = await this.prisma.resourceLocator.findMany({
+      where: {
+        OR: [{ lastCheckedAt: null }, { lastCheckedAt: { lt: staleBefore } }],
+      },
+      orderBy: [{ lastCheckedAt: 'asc' }, { createdAt: 'asc' }],
+      take: limit * 2, // 多取一些，过滤掉已有活跃任务的
+      select: {
+        id: true,
+        url: true,
+        sourceId: true,
+        resourceId: true,
+        lastCheckedAt: true,
+        httpStatus: true,
+        lastError: true,
+      },
+    });
+
+    // 过滤掉已有活跃 check_locator 任务的
+    return candidates.filter((l) => !activeLocatorIds.has(l.id)).slice(0, limit);
   }
 }

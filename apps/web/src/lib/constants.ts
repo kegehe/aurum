@@ -62,6 +62,32 @@ export const ACQUISITION_MODE_LABELS: Record<string, string> = {
   mirror_file: '文件镜像',
 };
 
+/** 来源类型中文标签 */
+export const SOURCE_TYPE_LABELS: Record<string, string> = {
+  link_metadata: '链接元数据',
+  github: 'GitHub',
+  rss: 'RSS',
+  custom: '自定义',
+};
+
+/** 许可状态中文标签 */
+export const LICENSE_STATUS_LABELS: Record<string, string> = {
+  unknown: '许可未知',
+  verified: '许可已核验',
+  restricted: '许可受限',
+  rejected: '许可不允许',
+};
+
+/** 定位器类型中文标签 */
+export const LOCATOR_TYPE_LABELS: Record<string, string> = {
+  page: '页面',
+  download: '下载',
+  api: 'API',
+  mirror: '镜像',
+  preview: '预览',
+  favicon: '图标',
+};
+
 /** 导航菜单项 */
 export const NAV_ITEMS = [
   {
@@ -83,6 +109,8 @@ export const NAV_ITEMS = [
     items: [
       { href: '/tags', label: '标签管理', icon: 'Tags' },
       { href: '/collections', label: '集合管理', icon: 'Layers' },
+      { href: '/sources', label: '来源管理', icon: 'Globe' },
+      { href: '/licenses', label: '许可证管理', icon: 'Scale' },
     ],
   },
   {

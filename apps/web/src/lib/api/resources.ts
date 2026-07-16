@@ -129,3 +129,8 @@ export function getResourcePreviewUrl(id: string): string {
 export function getResourceThumbnailUrl(id: string): string {
   return `${BASE_URL}/resources/${encodeURIComponent(id)}/thumbnail`;
 }
+
+/** 手动触发资源定位器健康检查 */
+export function checkResourceLocators(id: string): Promise<{ jobs: unknown[]; message: string }> {
+  return post(`/resources/${id}/locators/check`);
+}

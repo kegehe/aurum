@@ -45,20 +45,7 @@ export class SafeUrlService {
   ): Promise<SafeFetchResult> {
     let current = this.normalize(rawUrl);
     const signal = AbortSignal.timeout(FETCH_TOTAL_TIMEOUT_MS);
-    const dispatcher = new Agent({
-      connect: {
-        lookup: (hostname, _options, callback) => {
-          void this.resolvePublicHost(hostname)
-            .then(({ address, family }) => callback(null, address, family))
-            .catch((error: unknown) => {
-              callback(error instanceof Error ? error : new Error(String(error)), '', 4);
-            });
-        },
-      },
-      headersTimeout: 10_000,
-      bodyTimeout: 15_000,
-      maxRedirections: 0,
-    });
+    const dispatcher = this.createSafeDispatcher();
 
     try {
       for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
@@ -137,13 +124,34 @@ export class SafeUrlService {
     return new TextDecoder().decode(output);
   }
 
-  private async resolvePublicHost(hostname: string): Promise<{ address: string; family: 4 | 6 }> {
+  protected async resolvePublicHost(hostname: string): Promise<{ address: string; family: 4 | 6 }> {
     const addresses = await lookup(hostname, { all: true, verbatim: true });
     if (addresses.length === 0 || addresses.some(({ address }) => !this.isPublicAddress(address))) {
       throw new BadRequestException('URL resolves to a blocked network address');
     }
     const selected = addresses[0];
     return { address: selected.address, family: selected.family as 4 | 6 };
+  }
+
+  /**
+   * 创建一个 DNS-pinned undici Agent，确保所有连接解析到公网地址。
+   * 调用方负责在使用后调用 dispatcher.close()。
+   */
+  createSafeDispatcher(options?: { headersTimeout?: number; bodyTimeout?: number }): Agent {
+    return new Agent({
+      connect: {
+        lookup: (hostname, _options, callback) => {
+          void this.resolvePublicHost(hostname)
+            .then(({ address, family }) => callback(null, address, family))
+            .catch((error: unknown) => {
+              callback(error instanceof Error ? error : new Error(String(error)), '', 4);
+            });
+        },
+      },
+      headersTimeout: options?.headersTimeout ?? 10_000,
+      bodyTimeout: options?.bodyTimeout ?? 15_000,
+      maxRedirections: 0,
+    });
   }
 
   private isPublicAddress(address: string): boolean {

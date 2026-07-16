@@ -7,9 +7,15 @@ describe('IngestionScheduler', () => {
     const ingestionService = {
       resetStaleJobs: vi.fn().mockResolvedValue(undefined),
       runNextJob: vi.fn().mockResolvedValue(false),
+      scheduleLocatorHealthChecks: vi.fn().mockResolvedValue(0),
     };
     const config = {
-      get: vi.fn((key: string) => (key === 'ingestion.staleJobTimeoutMs' ? 60_000 : 3_000)),
+      get: vi.fn((key: string) => {
+        if (key === 'ingestion.staleJobTimeoutMs') return 60_000;
+        if (key === 'ingestion.healthCheckIntervalMs') return 21_600_000;
+        if (key === 'ingestion.healthCheckBatchSize') return 10;
+        return 3_000;
+      }),
     };
     const scheduler = new IngestionScheduler(ingestionService as never, config as never);
 

@@ -104,6 +104,7 @@ export interface ResourceProvenance {
   originalUrl: string;
   publisher: string | null;
   authorName: string | null;
+  authorUrl: string | null;
   licenseText: string | null;
   licenseUrl: string | null;
   attributionText: string | null;
@@ -318,4 +319,102 @@ export interface DashboardOverview {
       originalFilename: string;
     };
   }>;
+}
+
+// ==================== 来源 ====================
+
+export interface SourceItem {
+  id: string;
+  name: string;
+  slug: string;
+  baseUrl: string | null;
+  sourceType: string;
+  enabled: boolean;
+  allowedModes: string;
+  termsUrl: string | null;
+  robotsUrl: string | null;
+  defaultLicenseId: string | null;
+  defaultLicense: { id: string; spdxId: string | null; name: string } | null;
+  rateLimitPerMinute: number;
+  maxConcurrency: number;
+  requiresReview: boolean;
+  lastSyncedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type SourceDetail = SourceItem;
+
+export interface CreateSourceData {
+  name: string;
+  slug: string;
+  baseUrl?: string;
+  sourceType: string;
+  enabled?: boolean;
+  allowedModes?: string;
+  termsUrl?: string;
+  robotsUrl?: string;
+  defaultLicenseId?: string;
+  rateLimitPerMinute?: number;
+  maxConcurrency?: number;
+  requiresReview?: boolean;
+  config?: string;
+}
+
+export interface UpdateSourceData {
+  name?: string;
+  slug?: string;
+  baseUrl?: string | null;
+  sourceType?: string;
+  enabled?: boolean;
+  allowedModes?: string;
+  termsUrl?: string | null;
+  robotsUrl?: string | null;
+  defaultLicenseId?: string | null;
+  rateLimitPerMinute?: number;
+  maxConcurrency?: number;
+  requiresReview?: boolean;
+  config?: string | null;
+}
+
+// ==================== 许可证 ====================
+
+export interface LicenseItem {
+  id: string;
+  spdxId: string | null;
+  name: string;
+  url: string | null;
+  allowsCommercialUse: boolean | null;
+  allowsRedistribution: boolean | null;
+  allowsDerivatives: boolean | null;
+  requiresAttribution: boolean;
+  shareAlike: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type LicenseDetail = LicenseItem & { text: string | null };
+
+export interface CreateLicenseData {
+  spdxId?: string;
+  name: string;
+  url?: string;
+  text?: string;
+  allowsCommercialUse?: boolean;
+  allowsRedistribution?: boolean;
+  allowsDerivatives?: boolean;
+  requiresAttribution?: boolean;
+  shareAlike?: boolean;
+}
+
+export interface UpdateLicenseData {
+  spdxId?: string | null;
+  name?: string;
+  url?: string | null;
+  text?: string | null;
+  allowsCommercialUse?: boolean;
+  allowsRedistribution?: boolean;
+  allowsDerivatives?: boolean;
+  requiresAttribution?: boolean;
+  shareAlike?: boolean;
 }

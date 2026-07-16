@@ -13,7 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { createLinkImport, getIngestionJob, retryIngestionJob } from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
 import { listTags } from '@/lib/api/tags';
-import type { CategoryTreeNode, IngestionJobItem, TagWithUsage } from '@/lib/types';
+import { listSources } from '@/lib/api/sources';
+import type { CategoryTreeNode, IngestionJobItem, TagWithUsage, SourceItem } from '@/lib/types';
 
 const NO_CATEGORY_VALUE = '__no_category__';
 
@@ -30,6 +31,8 @@ export default function ImportLinkPage() {
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
   const [tags, setTags] = useState<TagWithUsage[]>([]);
+  const [sources, setSources] = useState<SourceItem[]>([]);
+  const [sourceId, setSourceId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -43,6 +46,7 @@ export default function ImportLinkPage() {
   useEffect(() => {
     void listCategories().then((result) => setCategories(result.items)).catch(() => undefined);
     void listTags().then((result) => setTags(result.items)).catch(() => undefined);
+    void listSources({ enabled: true, pageSize: 100 }).then((result) => setSources(result.items)).catch(() => undefined);
   }, []);
 
   const stopPolling = () => {
@@ -80,6 +84,7 @@ export default function ImportLinkPage() {
     try {
       const created = await createLinkImport({
         url: url.trim(),
+        sourceId: sourceId && sourceId !== '__none__' ? sourceId : undefined,
         title: title.trim() || undefined,
         categoryId: categoryId === NO_CATEGORY_VALUE ? undefined : categoryId,
         tagIds: tagIds.length ? tagIds : undefined,
@@ -122,6 +127,30 @@ export default function ImportLinkPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={submit} className="space-y-4">
+            {sources.length > 0 && (
+              <div className="space-y-1.5">
+                <Label htmlFor="resource-source">来源</Label>
+                <Select value={sourceId} onValueChange={setSourceId} disabled={isRunning}>
+                  <SelectTrigger id="resource-source">
+                    <SelectValue placeholder="不指定来源" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">不指定来源</SelectItem>
+                    {sources.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name} ({s.slug})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {sourceId && sourceId !== '__none__' && (() => {
+                  const selected = sources.find((s) => s.id === sourceId);
+                  return selected?.baseUrl ? (
+                    <p className="text-xs text-muted-foreground">Base URL: {selected.baseUrl}</p>
+                  ) : null;
+                })()}
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="resource-url">网页地址</Label>
               <Input
