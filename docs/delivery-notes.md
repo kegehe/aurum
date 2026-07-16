@@ -7,6 +7,7 @@
 - API 与 Web 可本地启动。
 - SQLite 数据库可迁移、seed。
 - 支持上传、资源库、搜索筛选、标签、分类、集合、批量操作、回收站、处理任务、统计和一致性检查。
+- 外部资源接入 P1-P3：来源配置管理、许可证管理、链接导入、SSRF 防护、元数据提取。
 - 已补充测试与验收文档。
 
 ## 启动步骤
@@ -38,7 +39,7 @@ pnpm build:web
 
 最近一次验收结果：
 
-- `pnpm test`: 7 个测试文件，36 条测试通过。
+- `pnpm test`: 13 个测试文件，75 条测试通过。
 - `pnpm typecheck`: 通过。
 - `pnpm lint`: 通过。
 - `pnpm build:api`: 通过。
@@ -76,8 +77,9 @@ pnpm build:web
 
 ## 后续建议
 
-1. 迁移 Web lint 到 ESLint CLI，消除 Next 16 兼容风险。
-2. 用 Playwright 覆盖核心前端流程：上传、筛选、批量操作、回收站。
-3. 增加上传 multipart 集成测试。
-4. 增加真实媒体处理夹具和 Worker 处理测试。
-5. 补齐 Docker Compose、备份、生产环境变量和部署说明。
+1. P4：来源策略执行、许可证目录、链接健康检查（外部资源接入执行路径下一步）。
+2. 迁移 Web lint 到 ESLint CLI，消除 Next 16 兼容风险。
+3. 用 Playwright 覆盖核心前端流程：上传、筛选、批量操作、回收站。
+4. 增加上传 multipart 集成测试。
+5. 增加真实媒体处理夹具和 Worker 处理测试。
+6. 补齐 Docker Compose、备份、生产环境变量和部署说明。

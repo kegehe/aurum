@@ -19,6 +19,7 @@
 | 回收站         | 软删除、恢复、彻底删除、清空回收站                                                  |
 | 处理任务       | 进程内轮询调度、任务列表、统计、失败重试、临时文件清理                              |
 | 统计与一致性   | 概览统计、资源类型统计、存储文件一致性检查                                          |
+| 外部资源接入   | 来源配置、许可证管理、链接导入、SSRF 防护、幂等任务、元数据提取（P1-P3 已完成）      |
 | 前端           | Next.js 15 管理界面：上传、资源库、详情、分类、标签、集合、回收站、处理任务、仪表盘 |
 | 测试验收       | API 单元测试、类型检查、lint、API/Web 生产构建                                      |
 
@@ -133,6 +134,8 @@ pnpm build:web
 | `WORKER_POLL_INTERVAL_MS`  | 任务轮询间隔      | `5000`                      |
 | `WORKER_MAX_RETRY`         | 任务最大重试次数  | `3`                         |
 | `WORKER_CONCURRENCY`       | 任务并发数        | `2`                         |
+| `INGESTION_POLL_INTERVAL_MS` | 导入任务轮询间隔 | `3000`                    |
+| `INGESTION_STALE_JOB_TIMEOUT_MS` | 导入任务超时 | `60000`                |
 | `THUMBNAIL_MAX_WIDTH`      | 缩略图最大宽度    | `400`                       |
 | `THUMBNAIL_MAX_HEIGHT`     | 缩略图最大高度    | `400`                       |
 | `NEXT_PUBLIC_API_URL`      | Web 调用 API 地址 | `http://localhost:3000/api` |
@@ -200,6 +203,30 @@ pnpm build:web
 | `GET`  | `/api/stats/overview`               | 统计概览       |
 | `GET`  | `/api/stats/resource-types`         | 资源类型统计   |
 | `GET`  | `/api/consistency/check`            | 存储一致性检查 |
+
+### 来源与许可证
+
+| 方法     | 路径                      | 说明                   |
+| -------- | ------------------------- | ---------------------- |
+| `GET`    | `/api/sources`            | 来源配置列表           |
+| `GET`    | `/api/sources/:id`        | 来源详情               |
+| `POST`   | `/api/sources`            | 创建来源配置           |
+| `PATCH`  | `/api/sources/:id`        | 更新来源配置           |
+| `DELETE` | `/api/sources/:id`        | 删除来源（无关联时）   |
+| `GET`    | `/api/licenses`           | 许可证列表             |
+| `GET`    | `/api/licenses/:id`       | 许可证详情             |
+| `POST`   | `/api/licenses`           | 创建许可证             |
+| `PATCH`  | `/api/licenses/:id`       | 更新许可证             |
+| `DELETE` | `/api/licenses/:id`       | 删除许可证（无关联时） |
+
+### 外部资源导入
+
+| 方法   | 路径                              | 说明               |
+| ------ | --------------------------------- | ------------------ |
+| `POST` | `/api/imports/link`               | 创建链接导入任务   |
+| `GET`  | `/api/ingestion/jobs`             | 导入任务列表       |
+| `GET`  | `/api/ingestion/jobs/:id`         | 导入任务详情       |
+| `POST` | `/api/ingestion/jobs/:id/retry`   | 重试导入任务       |
 
 ## 项目结构
 
