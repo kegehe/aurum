@@ -7,6 +7,7 @@ import {
   IngestionJobType,
   LicenseStatus,
   LocatorType,
+  ProcessingStatus,
   ResourceType,
 } from '../../common/constants/enums';
 import { SafeUrlService } from '../../common/security/safe-url.service';
@@ -211,7 +212,7 @@ export class IngestionService {
         acquisitionMode: AcquisitionMode.link_only,
         sourceRecord: source ? { connect: { id: source.id } } : undefined,
         licenseStatus: LicenseStatus.unknown,
-        processingStatus: 'completed',
+        processingStatus: ProcessingStatus.completed,
         locators: {
           create: [
             {
@@ -280,6 +281,8 @@ export class IngestionService {
         where: { id: resourceId },
         data: {
           deletedAt: deletedAt ? null : undefined,
+          // 恢复已删除资源时，同时重置处理状态
+          processingStatus: deletedAt ? ProcessingStatus.completed : undefined,
           title: request.title,
           category: request.categoryId ? { connect: { id: request.categoryId } } : undefined,
         },

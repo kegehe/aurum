@@ -239,12 +239,13 @@ export class UploadService {
     const stream = createReadStream(tempPath);
     try {
       await this.storage.put(storageKey, stream);
+      // put 成功后才删除临时文件
+      await this.cleanupTemp(tempPath);
     } catch (err) {
       // put 失败时确保 stream 被销毁，释放文件句柄
+      // 不删除临时文件，保留数据以支持重试
       stream.destroy();
       throw err;
-    } finally {
-      await this.cleanupTemp(tempPath);
     }
   }
 

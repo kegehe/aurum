@@ -80,10 +80,11 @@ export class PollingJobScheduler
       status: JobStatus.pending,
     });
 
-    // 更新资源处理状态
+    // 更新资源处理状态为 pending（而非 processing）
+    // processing 状态在 job 被 claimNext 时设置
     await this.resourceRepo.updateProcessingStatus(
       resourceId,
-      ProcessingStatus.processing,
+      ProcessingStatus.pending,
     );
 
     this.logger.log(`Enqueued job ${jobType} for resource ${resourceId}`);
@@ -154,6 +155,12 @@ export class PollingJobScheduler
       );
       return true;
     }
+
+    // 任务已认领，设置资源状态为 processing
+    await this.resourceRepo.updateProcessingStatus(
+      job.resourceId,
+      ProcessingStatus.processing,
+    );
 
     this.activeJobCount++;
 

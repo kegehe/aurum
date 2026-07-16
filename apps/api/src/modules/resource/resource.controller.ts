@@ -190,16 +190,16 @@ export class ResourceController {
     stream.pipe(res);
   }
 
+  /** 清空回收站（必须在 @Delete(':id') 之前声明，否则 :id 会先匹配 "trash"） */
+  @Delete('trash/empty')
+  emptyTrash() {
+    return this.resourceService.emptyTrash();
+  }
+
   /** 软删除（进入回收站） */
   @Delete(':id')
   softDelete(@Param('id') id: string) {
     return this.resourceService.softDelete(id);
-  }
-
-  /** 清空回收站 */
-  @Delete('trash/empty')
-  emptyTrash() {
-    return this.resourceService.emptyTrash();
   }
 
   /** 彻底删除（仅限回收站内资源） */

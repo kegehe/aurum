@@ -1,5 +1,7 @@
+import { Transform } from 'class-transformer';
 import {
   IsBoolean,
+  IsNotEmpty,
   IsOptional,
   IsString,
   IsUrl,
@@ -7,10 +9,19 @@ import {
   ValidateIf,
 } from 'class-validator';
 
+/** 将字符串 "true"/"false" 和数字 1/0 转换为布尔值 */
+const ToBoolean = () =>
+  Transform(({ value }) => {
+    if (value === 'true' || value === 1) return true;
+    if (value === 'false' || value === 0) return false;
+    return value;
+  });
+
 export class UpdateLicenseDto {
-  /** 传 null 清除 spdxId，传新值更新 */
+  /** 传 null 清除 spdxId，传新值更新；不允许空字符串 */
   @IsOptional()
   @ValidateIf((o) => o.spdxId !== null)
+  @IsNotEmpty()
   @IsString()
   @MaxLength(50)
   spdxId?: string | null;
@@ -34,22 +45,27 @@ export class UpdateLicenseDto {
   text?: string | null;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   allowsCommercialUse?: boolean;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   allowsRedistribution?: boolean;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   allowsDerivatives?: boolean;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   requiresAttribution?: boolean;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   shareAlike?: boolean;
 }
