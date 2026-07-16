@@ -1,299 +1,271 @@
 # 资源管理平台
 
-面向个人、工作室或小团队的多类型资源管理平台。统一采集、展示、管理、搜索和复用图片、视频、音频、文本、PDF、压缩包、游戏素材等各类资源。
+面向个人、工作室或小团队的多类型资源管理平台。系统支持上传、管理、预览、搜索、批量操作、回收站、处理任务和统计看板，当前以本地 SQLite + 本地磁盘存储为开发运行方式。
 
-## 功能概览
+## 当前状态
 
-### 已实现（阶段 1-5）✅
+已实现的主要能力：
 
-| 功能 | 说明 |
-|------|------|
-| 文件上传 | 单文件 / 批量上传，支持任意类型文件 |
-| 资源 CRUD | 列表（分页 + 筛选 + 排序）、详情、更新元数据 |
-| 文件下载 | 流式下载，RFC 5987 文件名编码支持中文 |
-| 软删除 / 恢复 | deletedAt 时间戳标记，回收站机制 |
-| 去重检测 | SHA-256 哈希比对，上传时自动识别重复文件 |
-| MIME 识别 | 基于 file-type（magic bytes）识别真实类型，不信任客户端声明 |
-| 资源分类 | 9 个默认分类（图片/视频/音频/文档/游戏素材/设计素材/代码配置/压缩包/其他） |
-| 资源标签 | 6 个测试标签，支持按标签筛选 |
-| 存储安全 | 路径穿越 5 层防护，hash 分片目录结构 |
-
-### 后续阶段规划
-
-| 阶段 | 内容 |
-|------|------|
-| 阶段 6 | Worker 异步处理（元数据解析、缩略图生成） |
-| 阶段 7 | 标签 / 分类 / 集合完整 CRUD |
-| 阶段 8 | 全文搜索 |
-| 阶段 9 | Next.js 前端 |
-| 阶段 10-16 | 预览、回收站、统计、一致性检查、Docker 部署等 |
+| 模块           | 能力                                                                                |
+| -------------- | ----------------------------------------------------------------------------------- |
+| 后端 API       | NestJS API、全局配置校验、统一错误响应、请求日志                                    |
+| 数据模型       | Prisma + SQLite，资源、文件、标签、分类、集合、处理任务等核心表                     |
+| 存储           | 本地磁盘存储、hash 分片路径、路径穿越防护                                           |
+| 上传           | 单文件/批量上传、MIME 识别、SHA-256 去重、上传限制                                  |
+| 资源管理       | 列表、详情、元数据更新、下载、预览、缩略图入口、重新处理                            |
+| 搜索筛选       | 关键词、类型、分类、标签 AND/OR、收藏、处理状态、时间/大小范围、排序                |
+| 标签/分类/集合 | CRUD、树形分类、集合详情、资源加入/移除集合                                         |
+| 批量操作       | 批量移动分类、收藏/取消收藏、软删除、标签添加/移除、加入集合、ZIP 下载              |
+| 回收站         | 软删除、恢复、彻底删除、清空回收站                                                  |
+| 处理任务       | 进程内轮询调度、任务列表、统计、失败重试、临时文件清理                              |
+| 统计与一致性   | 概览统计、资源类型统计、存储文件一致性检查                                          |
+| 外部资源接入   | 来源配置、许可证管理、链接导入、SSRF 防护、幂等任务、元数据提取（P1-P3 已完成）      |
+| 前端           | Next.js 15 管理界面：上传、资源库、详情、分类、标签、集合、回收站、处理任务、仪表盘 |
+| 测试验收       | API 单元测试、类型检查、lint、API/Web 生产构建                                      |
 
 ## 技术栈
 
-| 层面 | 技术 |
-|------|------|
-| 运行时 | Node.js >= 20 |
-| 后端框架 | NestJS 10 |
-| ORM | Prisma 5 |
-| 开发数据库 | SQLite（后续切 PostgreSQL） |
-| 包管理 | pnpm workspace |
-| 语言 | TypeScript 5.6（严格模式） |
-| 文件存储 | 本地磁盘（后续支撑 MinIO / S3） |
+| 层面     | 技术                                           |
+| -------- | ---------------------------------------------- |
+| 运行时   | Node.js >= 20                                  |
+| 包管理   | pnpm workspace                                 |
+| 后端     | NestJS 10, Prisma 5, SQLite                    |
+| 前端     | Next.js 15, React 19, Tailwind CSS 4, Radix UI |
+| 文件处理 | sharp, fluent-ffmpeg, pdf-parse, file-type     |
+| 测试     | Vitest                                         |
+| 存储     | 本地磁盘，后续可扩展 S3/MinIO                  |
 
 ## 快速开始
 
-### 前置条件
+### 1. 安装依赖
 
 ```bash
-# 需要 Node.js >= 20 和 pnpm >= 9
-node -v   # >= 20
-npm install -g pnpm
+pnpm install
 ```
 
-### 安装与启动
+### 2. 配置环境变量
+
+API 使用 `apps/api/.env`：
 
 ```bash
-# 克隆仓库
-git clone <repo-url>
-cd resource_service
-
-# 安装依赖
-pnpm install
-
-# 配置环境变量
 cp .env.example apps/api/.env
+```
 
-# 初始化数据库
+Web 使用 `apps/web/.env.local`：
+
+```bash
+cp apps/web/.env.example apps/web/.env.local
+```
+
+默认配置下：
+
+- API: `http://localhost:3000/api`
+- Web: `http://localhost:3001`
+- SQLite: `apps/api/prisma/dev.db`
+- 本地文件: `storage/`
+
+### 3. 初始化数据库
+
+```bash
 pnpm db:migrate
 pnpm db:seed
-
-# 启动开发服务
-pnpm dev:api
 ```
 
-服务启动后访问 http://localhost:3000/api/health 返回：
+### 4. 启动开发环境
 
-```json
-{ "status": "ok", "timestamp": "2026-07-08T..." }
-```
-
-## API 接口
-
-所有接口前缀 `/api`。
-
-### 健康检查
-
-```
-GET /api/health
-```
-
-### 上传
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/upload` | 单文件上传（字段名 `file`） |
-| POST | `/api/upload/batch` | 批量上传（字段名 `files`） |
-
-上传时可附带元数据字段（multipart form-data）：`title`、`description`、`categoryId`、`source`、`author`、`licenseNote`。
-
-### 资源
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/resources` | 分页列表（支持筛选、排序） |
-| GET | `/api/resources/:id` | 详情（含文件、标签、去重信息） |
-| PATCH | `/api/resources/:id` | 更新元数据 |
-| GET | `/api/resources/:id/download` | 下载原文件 |
-| DELETE | `/api/resources/:id` | 软删除（进入回收站） |
-| POST | `/api/resources/:id/restore` | 从回收站恢复 |
-
-#### 列表查询参数
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| page | number | 页码（默认 1，最大 10000） |
-| pageSize | number | 每页条数（默认 20，最大 100） |
-| resourceType | string | 资源类型筛选（image/video/audio/text/document/archive） |
-| categoryId | string | 分类 ID 筛选 |
-| tagId | string | 标签 ID 筛选 |
-| isFavorite | boolean | 是否收藏 |
-| processingStatus | string | 处理状态筛选 |
-| keyword | string | 关键词搜索（匹配标题、文件名、描述） |
-| sortBy | string | 排序字段（createdAt/updatedAt/sizeBytes/title） |
-| sortOrder | string | 排序方向（asc/desc，默认 desc） |
-| includeDeleted | boolean | 是否包含已删除资源 |
-
-### Curl 示例
+同时启动 API 和 Web：
 
 ```bash
-# 上传文件
-curl -X POST http://localhost:3000/api/upload \
-  -F "file=@test.png" \
-  -F "title=测试图片"
-
-# 批量上传
-curl -X POST http://localhost:3000/api/upload/batch \
-  -F "files=@a.png" \
-  -F "files=@b.png"
-
-# 资源列表
-curl http://localhost:3000/api/resources?page=1&pageSize=10
-
-# 资源列表（按类型筛选）
-curl "http://localhost:3000/api/resources?resourceType=image"
-
-# 资源详情
-curl http://localhost:3000/api/resources/<id>
-
-# 更新资源
-curl -X PATCH http://localhost:3000/api/resources/<id> \
-  -H "Content-Type: application/json" \
-  -d '{"title":"新标题","description":"新描述"}'
-
-# 下载文件
-curl -OJ http://localhost:3000/api/resources/<id>/download
-
-# 软删除
-curl -X DELETE http://localhost:3000/api/resources/<id>
-
-# 恢复
-curl -X POST http://localhost:3000/api/resources/<id>/restore
+pnpm dev
 ```
+
+也可以单独启动：
+
+```bash
+pnpm dev:api
+pnpm dev:web
+```
+
+打开 `http://localhost:3001` 使用前端界面。健康检查地址为 `http://localhost:3000/api/health`。
+
+## 常用命令
+
+| 命令               | 说明                   |
+| ------------------ | ---------------------- |
+| `pnpm dev`         | 同时启动 API 与 Web    |
+| `pnpm dev:api`     | 启动 API 开发服务      |
+| `pnpm dev:web`     | 启动 Web 开发服务      |
+| `pnpm test`        | 运行 API 单元测试      |
+| `pnpm typecheck`   | 全 workspace 类型检查  |
+| `pnpm lint`        | 全 workspace lint      |
+| `pnpm build:api`   | 构建 API               |
+| `pnpm build:web`   | 构建 Web               |
+| `pnpm db:migrate`  | 执行 Prisma 迁移       |
+| `pnpm db:seed`     | 写入默认分类和标签     |
+| `pnpm db:studio`   | 打开 Prisma Studio     |
+| `pnpm db:generate` | 重新生成 Prisma Client |
+
+## 验收命令
+
+交付前建议运行：
+
+```bash
+pnpm test
+pnpm typecheck
+pnpm lint
+pnpm build:api
+pnpm build:web
+```
+
+当前自动化测试覆盖见 [docs/acceptance-checklist.md](docs/acceptance-checklist.md)。
 
 ## 环境变量
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| NODE_ENV | 运行环境 | development |
-| PORT | 服务端口 | 3000 |
-| DATABASE_URL | 数据库连接 | file:./prisma/dev.db |
-| STORAGE_DRIVER | 存储驱动 | local |
-| STORAGE_ROOT | 存储根目录（相对 apps/api） | ../../storage |
-| MAX_UPLOAD_SIZE_MB | 单文件上传上限（MB） | 1024 |
-| MAX_UPLOAD_TOTAL_SIZE_MB | 批量上传总上限（MB） | 5120 |
-| TEMP_FILE_TTL_SECONDS | 临时文件保留时间（秒） | 3600 |
-| CORS_ORIGIN | 生产环境允许的跨域来源（逗号分隔） | - |
+| 变量                       | 说明              | 默认值                      |
+| -------------------------- | ----------------- | --------------------------- |
+| `NODE_ENV`                 | 运行环境          | `development`               |
+| `PORT`                     | API 端口          | `3000`                      |
+| `DATABASE_URL`             | Prisma 数据库连接 | `file:./prisma/dev.db`      |
+| `STORAGE_DRIVER`           | 存储驱动          | `local`                     |
+| `STORAGE_ROOT`             | 本地存储根目录    | `../../storage`             |
+| `MAX_UPLOAD_SIZE_MB`       | 单文件上传上限    | `1024`                      |
+| `MAX_UPLOAD_TOTAL_SIZE_MB` | 批量上传总上限    | `5120`                      |
+| `TEMP_FILE_TTL_SECONDS`    | 临时文件保留时间  | `3600`                      |
+| `WORKER_POLL_INTERVAL_MS`  | 任务轮询间隔      | `5000`                      |
+| `WORKER_MAX_RETRY`         | 任务最大重试次数  | `3`                         |
+| `WORKER_CONCURRENCY`       | 任务并发数        | `2`                         |
+| `INGESTION_POLL_INTERVAL_MS` | 导入任务轮询间隔 | `3000`                    |
+| `INGESTION_STALE_JOB_TIMEOUT_MS` | 导入任务超时 | `60000`                |
+| `THUMBNAIL_MAX_WIDTH`      | 缩略图最大宽度    | `400`                       |
+| `THUMBNAIL_MAX_HEIGHT`     | 缩略图最大高度    | `400`                       |
+| `NEXT_PUBLIC_API_URL`      | Web 调用 API 地址 | `http://localhost:3000/api` |
+
+## API 概览
+
+所有 API 路径都有 `/api` 前缀。
+
+### 上传
+
+| 方法   | 路径                | 说明                      |
+| ------ | ------------------- | ------------------------- |
+| `POST` | `/api/upload`       | 单文件上传，字段名 `file` |
+| `POST` | `/api/upload/batch` | 批量上传，字段名 `files`  |
+
+上传可附带 `title`、`description`、`categoryId`、`source`、`author`、`licenseNote`。
+
+### 资源
+
+| 方法     | 路径                             | 说明           |
+| -------- | -------------------------------- | -------------- |
+| `GET`    | `/api/resources`                 | 资源列表       |
+| `GET`    | `/api/resources/:id`             | 资源详情       |
+| `PATCH`  | `/api/resources/:id`             | 更新元数据     |
+| `GET`    | `/api/resources/:id/download`    | 下载原文件     |
+| `GET`    | `/api/resources/:id/preview`     | 原文件内联预览 |
+| `GET`    | `/api/resources/:id/thumbnail`   | 缩略图         |
+| `DELETE` | `/api/resources/:id`             | 软删除         |
+| `POST`   | `/api/resources/:id/restore`     | 恢复           |
+| `DELETE` | `/api/resources/:id/permanent`   | 彻底删除       |
+| `POST`   | `/api/resources/:id/reprocess`   | 重新处理       |
+| `POST`   | `/api/resources/:id/tags/:tagId` | 添加标签       |
+| `DELETE` | `/api/resources/:id/tags/:tagId` | 移除标签       |
+| `DELETE` | `/api/resources/trash/empty`     | 清空回收站     |
+
+资源列表支持 `page`、`pageSize`、`keyword`、`resourceType`、`resourceTypes`、`categoryId`、`categoryIds`、`tagId`、`tagIds`、`tagMode`、`source`、`author`、`isFavorite`、`processingStatus`、`includeDeleted`、`sortBy`、`sortOrder` 等查询参数。
+
+### 批量资源操作
+
+| 方法   | 路径                               | 说明              |
+| ------ | ---------------------------------- | ----------------- |
+| `POST` | `/api/resources/batch/download`    | 批量 ZIP 下载     |
+| `POST` | `/api/resources/batch/category`    | 批量移动分类      |
+| `POST` | `/api/resources/batch/favorite`    | 批量收藏/取消收藏 |
+| `POST` | `/api/resources/batch/delete`      | 批量软删除        |
+| `POST` | `/api/resources/batch/tags/add`    | 批量添加标签      |
+| `POST` | `/api/resources/batch/tags/remove` | 批量移除标签      |
+
+### 标签、分类、集合
+
+| 模块     | 路径                             |
+| -------- | -------------------------------- |
+| 标签     | `/api/tags`                      |
+| 分类     | `/api/categories`                |
+| 集合     | `/api/collections`               |
+| 集合资源 | `/api/collections/:id/resources` |
+
+### 处理任务、统计、一致性
+
+| 方法   | 路径                                | 说明           |
+| ------ | ----------------------------------- | -------------- |
+| `GET`  | `/api/processing/jobs`              | 处理任务列表   |
+| `GET`  | `/api/processing/stats`             | 任务状态统计   |
+| `POST` | `/api/processing/jobs/:jobId/retry` | 重试任务       |
+| `GET`  | `/api/stats/overview`               | 统计概览       |
+| `GET`  | `/api/stats/resource-types`         | 资源类型统计   |
+| `GET`  | `/api/consistency/check`            | 存储一致性检查 |
+
+### 来源与许可证
+
+| 方法     | 路径                      | 说明                   |
+| -------- | ------------------------- | ---------------------- |
+| `GET`    | `/api/sources`            | 来源配置列表           |
+| `GET`    | `/api/sources/:id`        | 来源详情               |
+| `POST`   | `/api/sources`            | 创建来源配置           |
+| `PATCH`  | `/api/sources/:id`        | 更新来源配置           |
+| `DELETE` | `/api/sources/:id`        | 删除来源（无关联时）   |
+| `GET`    | `/api/licenses`           | 许可证列表             |
+| `GET`    | `/api/licenses/:id`       | 许可证详情             |
+| `POST`   | `/api/licenses`           | 创建许可证             |
+| `PATCH`  | `/api/licenses/:id`       | 更新许可证             |
+| `DELETE` | `/api/licenses/:id`       | 删除许可证（无关联时） |
+
+### 外部资源导入
+
+| 方法   | 路径                              | 说明               |
+| ------ | --------------------------------- | ------------------ |
+| `POST` | `/api/imports/link`               | 创建链接导入任务   |
+| `GET`  | `/api/ingestion/jobs`             | 导入任务列表       |
+| `GET`  | `/api/ingestion/jobs/:id`         | 导入任务详情       |
+| `POST` | `/api/ingestion/jobs/:id/retry`   | 重试导入任务       |
 
 ## 项目结构
 
-```
+```text
 resource_service/
 ├── apps/
-│   ├── api/                    # NestJS 后端 API
-│   │   ├── prisma/             # 数据模型、迁移、种子数据
-│   │   ├── src/
-│   │   │   ├── main.ts         # 应用入口
-│   │   │   ├── app.module.ts   # 根模块
-│   │   │   ├── common/         # 公共设施
-│   │   │   │   ├── config/     # 环境变量配置与校验
-│   │   │   │   ├── constants/  # 枚举常量
-│   │   │   │   ├── dto/        # 通用 DTO（分页）
-│   │   │   │   ├── filters/    # 全局异常过滤器
-│   │   │   │   └── interceptors/ # 全局日志拦截器
-│   │   │   └── modules/
-│   │   │       ├── prisma/     # 全局 PrismaService
-│   │   │       ├── storage/    # 存储驱动（接口 + 本地实现）
-│   │   │       ├── upload/     # 上传闭环
-│   │   │       ├── resource/   # 资源 CRUD
-│   │   │       ├── file/       # 资源文件仓储
-│   │   │       ├── processing/ # 处理任务仓储
-│   │   │       ├── tag/        # 标签模块（骨架）
-│   │   │       ├── category/   # 分类模块（骨架）
-│   │   │       ├── collection/ # 集合模块（骨架）
-│   │   │       └── ...         # 其他骨架模块
-│   │   └── .env
-│   ├── worker/                 # Worker 进程（占位）
-│   └── web/                    # Next.js 前端（占位）
+│   ├── api/                 # NestJS API
+│   │   ├── prisma/          # Prisma schema、迁移、seed
+│   │   └── src/modules/     # 业务模块
+│   ├── web/                 # Next.js 前端
+│   └── worker/              # 独立 Worker workspace 预留
 ├── packages/
-│   └── shared-types/           # 前后端共享枚举与类型
-├── storage/                    # 本地文件存储（gitignore）
-│   ├── originals/
-│   ├── thumbnails/
-│   ├── previews/
-│   ├── extracted-text/
-│   └── temp/
-├── docs/                       # 产品方案与实施文档
-├── deploy/                     # 部署配置（占位）
-├── .env.example                # 环境变量模板
-├── pnpm-workspace.yaml
-└── tsconfig.base.json
+│   └── shared-types/        # 前后端共享类型/枚举
+├── docs/                    # 方案、任务、验收和交付文档
+├── scripts/                 # 开发辅助脚本
+├── storage/                 # 本地存储目录
+├── package.json
+└── pnpm-workspace.yaml
 ```
 
-## 开发命令
+## 开发说明
 
-| 命令 | 说明 |
-|------|------|
-| `pnpm install` | 安装所有依赖 |
-| `pnpm dev:api` | 启动 API 开发服务（热重载） |
-| `pnpm build:api` | 构建 API |
-| `pnpm start:api` | 启动生产构建 |
-| `pnpm typecheck` | 全项目类型检查 |
-| `pnpm lint` | 全项目 ESLint 检查 |
-| `pnpm format` | 格式化所有代码 |
-| `pnpm db:migrate` | 运行数据库迁移 |
-| `pnpm db:seed` | 填充种子数据 |
-| `pnpm db:studio` | 打开 Prisma Studio |
-| `pnpm db:generate` | 重新生成 Prisma Client |
+- 当前 Worker 使用 API 进程内的 `PollingJobScheduler` 轮询 `processing_jobs`，不是独立进程。
+- 当前数据库为 SQLite。schema 中枚举以 `String` 存储，由应用层常量约束。
+- `sizeBytes` 在数据库中是 `BigInt`，API 返回前会转为字符串。
+- 本地存储 key 会经过路径穿越校验，禁止绝对路径、反斜杠、冒号、空字节和 `.`/`..` 段。
+- 永久删除和清空回收站会先删除存储文件，再删除数据库记录；文件删除失败时记录保留，可重试。
+- `pnpm lint` 会运行 API ESLint `--fix`，可能产生格式化改动。
 
-## 架构设计
+## 已知限制
 
-### 请求处理流程（上传为例）
+- 前端 E2E、真实 multipart 集成测试、真实媒体处理链路测试尚未自动化。
+- Web lint 当前使用 `next lint`，Next.js 15 会提示该命令将在 Next 16 移除。
+- Web lint/build 会提示未检测到 Next ESLint plugin；目前不阻断构建。
+- Docker Compose、生产备份和独立 Worker 部署仍需要后续整理。
+- PostgreSQL、Redis/BullMQ、S3/MinIO 属于后续演进方向，当前默认运行不依赖它们。
 
-```
-Client                    NestJS                         Storage
-  │                          │                              │
-  ├─ POST /api/upload ──────►│                              │
-  │  (multipart form-data)   │                              │
-  │                          ├─ multer diskStorage ──► temp/
-  │                          │  (写临时文件)                 │
-  │                          │                              │
-  │                          ├─ SHA-256 流式计算             │
-  │                          ├─ file-type MIME 识别          │
-  │                          ├─ inferResourceType()         │
-  │                          │                              │
-  │                          ├─ generateKey() ────────────► │
-  │                          ├─ put(stream) ──────────────► originals/ab/cd/...
-  │                          │                              │
-  │                          ├─ prisma.$transaction         │
-  │                          │  ├─ findDuplicate (sha256)   │
-  │                          │  ├─ create Resource          │
-  │                          │  ├─ create ResourceFile      │
-  │                          │  └─ create ProcessingJob     │
-  │                          │                              │
-  │◄─ { resource, isDuplicate }                             │
-```
+## 相关文档
 
-### 分层架构
-
-```
-Controller  ──►  Service  ──►  Repository  ──►  Prisma
-   (路由)         (业务)         (数据访问)        (ORM)
-```
-
-- **Controller**：处理 HTTP 请求，参数校验和转换
-- **Service**：业务逻辑编排，事务管理
-- **Repository**：封装 Prisma 查询，支持事务客户端注入
-- **Prisma**：数据库 ORM，类型安全的查询构建
-
-### 存储安全
-
-文件存储 key 采用 SHA-256 前 4 位分片，避免单目录文件过多：
-
-```
-生成规则: {role-dir}/{hash[0:2]}/{hash[2:4]}/{hash}.{suffix}.{variant}.{ext}
-示例:     originals/ab/cd/abcdef1234567890.original.png
-```
-
-路径穿越防护（`resolvePath`）5 层校验：
-1. 禁止空 key
-2. 禁止绝对路径（`/` 和 `C:\` 等）
-3. 禁止包含 `..` 和 `.` 路径段
-4. 禁止 Windows 危险字符 `\`、`\0`、`:`
-5. 解析后路径必须在 `STORAGE_ROOT` 范围内
-
-## 注意事项
-
-- **SQLite 开发限制**：SQLite 不支持 Prisma 原生 enum，枚举字段以 String 存储，应用层通过 `common/constants/enums.ts` 约束值。切换 PostgreSQL 时需改为 native enum。
-- **BigInt 序列化**：`sizeBytes` 在数据库存储为 BigInt，所有 API 返回前统一转为字符串。
-- **Multipart 请求**：上传接口的元数据不能通过 `@Body()` 装饰器获取（NestJS 在 multer 填充 body 前读取），改用 `@Req().body` 手动提取。
-- **文件路径**：`STORAGE_ROOT` 是相对路径，从 `apps/api` 目录解析。开发时通过 `pnpm dev:api` 启动自动进入正确目录。
+- [实施任务](docs/implementation-tasks.md)
+- [验收清单](docs/acceptance-checklist.md)
+- [交付说明](docs/delivery-notes.md)

@@ -16,4 +16,17 @@ export default () => ({
     maxTotalSizeMB: parseInt(process.env.MAX_UPLOAD_TOTAL_SIZE_MB || '5120', 10),
     tempTtlSeconds: parseInt(process.env.TEMP_FILE_TTL_SECONDS || '3600', 10),
   },
+  worker: {
+    pollIntervalMs: parseInt(process.env.WORKER_POLL_INTERVAL_MS || '5000', 10),
+    maxRetry: parseInt(process.env.WORKER_MAX_RETRY || '3', 10),
+    concurrency: parseInt(process.env.WORKER_CONCURRENCY || '2', 10),
+  },
+  ingestion: {
+    pollIntervalMs: parseInt(process.env.INGESTION_POLL_INTERVAL_MS || '3000', 10),
+    staleJobTimeoutMs: parseInt(process.env.INGESTION_STALE_JOB_TIMEOUT_MS || '60000', 10),
+  },
+  thumbnail: {
+    maxWidth: parseInt(process.env.THUMBNAIL_MAX_WIDTH || '400', 10),
+    maxHeight: parseInt(process.env.THUMBNAIL_MAX_HEIGHT || '400', 10),
+  },
 });

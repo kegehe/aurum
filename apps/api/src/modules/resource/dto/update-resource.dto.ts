@@ -1,4 +1,4 @@
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, IsUUID, MaxLength, ValidateIf } from 'class-validator';
 
 /**
  * 更新资源元数据 DTO
@@ -15,9 +15,12 @@ export class UpdateResourceDto {
   @MaxLength(2000)
   description?: string;
 
+  /** 传 null 显式断开分类关联，传 UUID 设置新分类 */
   @IsOptional()
-  @IsString()
-  categoryId?: string;
+  @ValidateIf((o) => o.categoryId !== null)
+  @IsNotEmpty()
+  @IsUUID()
+  categoryId?: string | null;
 
   @IsOptional()
   @IsString()

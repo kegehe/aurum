@@ -1,8 +1,14 @@
 import { Module } from '@nestjs/common';
+import { StatsController } from './stats.controller';
+import { StatsService } from './stats.service';
+import { StatsRepository } from './repositories/stats.repository';
 
 /**
- * 统计模块（阶段13实现）
- * 职责：首页统计、类型数量、最近上传、失败任务
+ * 统计模块
+ * 职责：仪表盘聚合统计、资源类型分布等。
  */
-@Module({})
+@Module({
+  controllers: [StatsController],
+  providers: [StatsService, StatsRepository],
+})
 export class StatsModule {}

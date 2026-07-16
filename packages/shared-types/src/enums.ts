@@ -18,6 +18,59 @@ export enum ResourceType {
   other = 'other',
 }
 
+/** 资源进入系统的方式 */
+export enum AcquisitionMode {
+  local_upload = 'local_upload',
+  link_only = 'link_only',
+  metadata_only = 'metadata_only',
+  archive_snapshot = 'archive_snapshot',
+  mirror_file = 'mirror_file',
+}
+
+/** 外部来源连接器类型 */
+export enum SourceType {
+  link_metadata = 'link_metadata',
+  github = 'github',
+  rss = 'rss',
+  custom = 'custom',
+}
+
+/** 外部资源地址用途 */
+export enum LocatorType {
+  page = 'page',
+  download = 'download',
+  api = 'api',
+  mirror = 'mirror',
+  preview = 'preview',
+  favicon = 'favicon',
+}
+
+/** 许可证确认状态 */
+export enum LicenseStatus {
+  unknown = 'unknown',
+  verified = 'verified',
+  restricted = 'restricted',
+  rejected = 'rejected',
+}
+
+/** 外部资源导入任务类型 */
+export enum IngestionJobType {
+  import_url = 'import_url',
+  sync_source = 'sync_source',
+  download_file = 'download_file',
+  check_locator = 'check_locator',
+  capture_page = 'capture_page',
+}
+
+/** 外部资源导入任务状态 */
+export enum IngestionJobStatus {
+  pending = 'pending',
+  processing = 'processing',
+  completed = 'completed',
+  failed = 'failed',
+  canceled = 'canceled',
+}
+
 /** 文件角色 */
 export enum FileRole {
   original = 'original',
