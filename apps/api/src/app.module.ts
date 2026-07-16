@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import configuration from './common/config/configuration';
 import { envValidationSchema } from './common/config/env.validation';
@@ -18,6 +19,8 @@ import { CollectionModule } from './modules/collection/collection.module';
 import { TrashModule } from './modules/trash/trash.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { ConsistencyModule } from './modules/consistency/consistency.module';
+import { SourceModule } from './modules/source/source.module';
+import { IngestionModule } from './modules/ingestion/ingestion.module';
 
 @Module({
   imports: [
@@ -30,6 +33,7 @@ import { ConsistencyModule } from './modules/consistency/consistency.module';
       },
       envFilePath: ['.env'],
     }),
+    ScheduleModule.forRoot(),
     PrismaModule,
     StorageModule,
     FileModule,
@@ -43,6 +47,8 @@ import { ConsistencyModule } from './modules/consistency/consistency.module';
     TrashModule,
     StatsModule,
     ConsistencyModule,
+    SourceModule,
+    IngestionModule,
     // Resource/Upload 模块的 controller/service 在后续步骤填充，
     // 注册顺序：Resource 依赖 Storage/File/Processing/Tag/Category/Collection
     ResourceModule,

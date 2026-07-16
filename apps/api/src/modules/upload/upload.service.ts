@@ -10,7 +10,14 @@ import { ResourceRepository } from '../resource/repositories/resource.repository
 import { ResourceFileRepository } from '../file/repositories/resource-file.repository';
 import { ProcessingJobRepository } from '../processing/repositories/processing-job.repository';
 import { IStorageService, STORAGE_SERVICE } from '../storage/interfaces/storage-service.interface';
-import { FileRole, JobStatus, JobType, ProcessingStatus } from '../../common/constants/enums';
+import {
+  AcquisitionMode,
+  FileRole,
+  JobStatus,
+  JobType,
+  LicenseStatus,
+  ProcessingStatus,
+} from '../../common/constants/enums';
 import { inferResourceType } from './resource-type.util';
 import { UploadResourceDto } from './dto/upload-resource.dto';
 
@@ -107,6 +114,8 @@ export class UploadService {
           source: body.source,
           author: body.author,
           licenseNote: body.licenseNote,
+          acquisitionMode: AcquisitionMode.local_upload,
+          licenseStatus: LicenseStatus.unknown,
           processingStatus: ProcessingStatus.pending,
           duplicateOf: existing ? { connect: { id: existing.id } } : undefined,
         },

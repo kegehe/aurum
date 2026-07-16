@@ -21,6 +21,53 @@ export enum ResourceType {
   other = 'other',
 }
 
+export enum AcquisitionMode {
+  local_upload = 'local_upload',
+  link_only = 'link_only',
+  metadata_only = 'metadata_only',
+  archive_snapshot = 'archive_snapshot',
+  mirror_file = 'mirror_file',
+}
+
+export enum SourceType {
+  link_metadata = 'link_metadata',
+  github = 'github',
+  rss = 'rss',
+  custom = 'custom',
+}
+
+export enum LocatorType {
+  page = 'page',
+  download = 'download',
+  api = 'api',
+  mirror = 'mirror',
+  preview = 'preview',
+  favicon = 'favicon',
+}
+
+export enum LicenseStatus {
+  unknown = 'unknown',
+  verified = 'verified',
+  restricted = 'restricted',
+  rejected = 'rejected',
+}
+
+export enum IngestionJobType {
+  import_url = 'import_url',
+  sync_source = 'sync_source',
+  download_file = 'download_file',
+  check_locator = 'check_locator',
+  capture_page = 'capture_page',
+}
+
+export enum IngestionJobStatus {
+  pending = 'pending',
+  processing = 'processing',
+  completed = 'completed',
+  failed = 'failed',
+  canceled = 'canceled',
+}
+
 export enum FileRole {
   original = 'original',
   thumbnail = 'thumbnail',

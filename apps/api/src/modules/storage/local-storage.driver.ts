@@ -3,7 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { IStorageService } from './interfaces/storage-service.interface';
+import type { Readable } from 'node:stream';
+import { IStorageService, StorageObjectInfo } from './interfaces/storage-service.interface';
 import { generateStorageKey } from './storage-key.util';
 
 /**
@@ -82,7 +83,7 @@ export class LocalStorageDriver implements IStorageService {
     }
   }
 
-  async getStream(key: string): Promise<NodeJS.ReadableStream> {
+  async getStream(key: string): Promise<Readable> {
     const filePath = this.resolvePath(key);
     try {
       await fs.access(filePath);
@@ -111,6 +112,47 @@ export class LocalStorageDriver implements IStorageService {
     } catch {
       return false;
     }
+  }
+
+  async listKeys(prefix: string = ''): Promise<string[]> {
+    const objects = await this.listObjects(prefix);
+    return objects.map((object) => object.key);
+  }
+
+  async listObjects(prefix: string = ''): Promise<StorageObjectInfo[]> {
+    const rootPath = prefix ? this.resolvePath(prefix) : this.root;
+    const objects: StorageObjectInfo[] = [];
+
+    const walk = async (dir: string) => {
+      let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean }>;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch (e) {
+        const err = e as NodeJS.ErrnoException;
+        if (err.code === 'ENOENT') return;
+        throw e;
+      }
+
+      for (const entry of entries) {
+        if (entry.name === '.gitkeep') {
+          continue;
+        }
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+        } else if (entry.isFile()) {
+          const stat = await fs.stat(fullPath);
+          objects.push({
+            key: path.relative(this.root, fullPath).split(path.sep).join('/'),
+            modifiedAt: stat.mtime,
+            sizeBytes: stat.size,
+          });
+        }
+      }
+    };
+
+    await walk(rootPath);
+    return objects.sort((a, b) => a.key.localeCompare(b.key));
   }
 
   generateKey(role: string, hash: string, variant?: string, extension?: string): string {

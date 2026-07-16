@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { Prisma, Resource } from '@prisma/client';
 
@@ -26,6 +26,15 @@ export class ResourceRepository {
     return this.prisma.resource.findUnique({ where: { id } });
   }
 
+  findByIdentityUrl(identityUrl: string) {
+    return this.prisma.resourceLocator.findFirst({
+      where: {
+        identityUrl,
+      },
+      select: { resourceId: true, resource: { select: { deletedAt: true } } },
+    });
+  }
+
   /**
    * 查询详情：含文件、标签、重复源资源
    */
@@ -36,6 +45,42 @@ export class ResourceRepository {
         files: { orderBy: { createdAt: 'asc' } },
         tags: { include: { tag: true } },
         duplicateOf: { select: { id: true, title: true } },
+        sourceRecord: { select: { id: true, name: true, slug: true } },
+        license: { select: { id: true, spdxId: true, name: true, url: true } },
+        locators: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }] },
+        provenance: { orderBy: { capturedAt: 'desc' }, take: 1 },
+      },
+    });
+  }
+
+  findDeletedWithFiles() {
+    return this.prisma.resource.findMany({
+      where: { deletedAt: { not: null } },
+      include: {
+        files: { select: { storagePath: true } },
+      },
+      orderBy: { deletedAt: 'asc' },
+    });
+  }
+
+  findActiveOriginalFiles(ids: string[]) {
+    return this.prisma.resource.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        title: true,
+        originalFilename: true,
+        files: {
+          where: { fileRole: 'original', variant: '' },
+          take: 1,
+          select: {
+            storagePath: true,
+            mimeType: true,
+            extension: true,
+            sizeBytes: true,
+          },
+        },
       },
     });
   }
@@ -75,11 +120,43 @@ export class ResourceRepository {
     return this.prisma.resource.update({ where: { id }, data });
   }
 
+  async batchSetCategory(ids: string[], categoryId: string | null): Promise<number> {
+    const result = await this.prisma.resource.updateMany({
+      where: { id: { in: ids }, deletedAt: null },
+      data: { categoryId },
+    });
+    return result.count;
+  }
+
+  async batchSetFavorite(ids: string[], isFavorite: boolean): Promise<number> {
+    const result = await this.prisma.resource.updateMany({
+      where: { id: { in: ids }, deletedAt: null },
+      data: { isFavorite },
+    });
+    return result.count;
+  }
+
+  async batchSoftDelete(ids: string[]): Promise<number> {
+    const result = await this.prisma.resource.updateMany({
+      where: { id: { in: ids }, deletedAt: null },
+      data: { deletedAt: new Date() },
+    });
+    return result.count;
+  }
+
   /** 软删除：设置 deletedAt */
   async softDelete(id: string): Promise<Resource> {
     return this.prisma.resource.update({
       where: { id },
       data: { deletedAt: new Date() },
+    });
+  }
+
+  /** 只更新资源的处理状态 */
+  async updateProcessingStatus(id: string, status: string): Promise<Resource> {
+    return this.prisma.resource.update({
+      where: { id },
+      data: { processingStatus: status },
     });
   }
 
@@ -89,5 +166,14 @@ export class ResourceRepository {
       where: { id },
       data: { deletedAt: null },
     });
+  }
+
+  async deleteDeleted(id: string): Promise<void> {
+    const result = await this.prisma.resource.deleteMany({
+      where: { id, deletedAt: { not: null } },
+    });
+    if (result.count === 0) {
+      throw new NotFoundException(`Deleted resource ${id} not found`);
+    }
   }
 }

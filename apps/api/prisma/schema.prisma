@@ -38,6 +38,13 @@ model Resource {
   source           String?
   author           String?
   licenseNote      String?
+  // 外部资源接入字段。local_upload 为已有上传资源的默认模式。
+  acquisitionMode  String   @default("local_upload")
+  sourceId         String?
+  licenseId        String?
+  licenseStatus    String   @default("unknown")
+  externalCreatedAt DateTime?
+  externalUpdatedAt DateTime?
   isFavorite       Boolean  @default(false)
   // ProcessingStatus 枚举值（pending/processing/completed/failed）
   processingStatus String   @default("pending")
@@ -54,6 +61,8 @@ model Resource {
 
   // 关系
   category        Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  sourceRecord    Source?              @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  license         License?             @relation(fields: [licenseId], references: [id], onDelete: SetNull)
   duplicateOf     Resource?            @relation("ResourceDuplicates", fields: [duplicateOfId], references: [id], onDelete: SetNull)
   duplicates      Resource[]           @relation("ResourceDuplicates")
   files           ResourceFile[]
@@ -61,16 +70,165 @@ model Resource {
   collectionItems CollectionResource[]
   processingJobs  ProcessingJob[]
   covers          Collection[]         @relation("CollectionCover")
+  locators        ResourceLocator[]
+  provenance      ResourceProvenance[]
+  ingestionJobs   IngestionJob[]
 
   @@index([sha256])
   @@index([isFavorite])
   @@index([processingStatus])
   @@index([resourceType])
   @@index([categoryId])
+  @@index([sourceId])
+  @@index([licenseId])
+  @@index([acquisitionMode])
+  @@index([licenseStatus])
   @@index([createdAt])
   @@index([updatedAt])
   @@index([deletedAt])
+  // 复合索引：几乎所有查询都过滤 deletedAt IS NULL，复合索引可同时满足筛选+排序
+  @@index([deletedAt, createdAt])
+  @@index([deletedAt, resourceType])
+  @@index([deletedAt, categoryId])
+  @@index([deletedAt, isFavorite])
+  @@index([deletedAt, processingStatus])
+  @@index([sizeBytes])
   @@map("resources")
+}
+
+model Source {
+  id                 String   @id @default(uuid())
+  name               String
+  slug               String   @unique
+  baseUrl            String?
+  sourceType         String
+  enabled            Boolean  @default(true)
+  allowedModes       String   @default("link_only,metadata_only")
+  termsUrl           String?
+  robotsUrl          String?
+  defaultLicenseId   String?
+  rateLimitPerMinute Int      @default(30)
+  maxConcurrency     Int      @default(1)
+  requiresReview     Boolean  @default(false)
+  config             String?
+  lastSyncedAt       DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  defaultLicense License?            @relation("SourceDefaultLicense", fields: [defaultLicenseId], references: [id], onDelete: SetNull)
+  resources      Resource[]
+  locators       ResourceLocator[]
+  provenance     ResourceProvenance[]
+  ingestionJobs  IngestionJob[]
+
+  @@index([enabled])
+  @@map("sources")
+}
+
+model License {
+  id                   String   @id @default(uuid())
+  spdxId               String?  @unique
+  name                 String
+  url                  String?
+  text                 String?
+  allowsCommercialUse  Boolean?
+  allowsRedistribution Boolean?
+  allowsDerivatives    Boolean?
+  requiresAttribution  Boolean  @default(false)
+  shareAlike           Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  resources       Resource[]
+  defaultForSources Source[] @relation("SourceDefaultLicense")
+
+  @@map("licenses")
+}
+
+model ResourceLocator {
+  id             String   @id @default(uuid())
+  resourceId     String
+  sourceId       String?
+  locatorType    String
+  url            String
+  canonicalUrl   String?
+  identityUrl    String?  @unique
+  externalId     String?
+  isPrimary      Boolean  @default(false)
+  httpStatus     Int?
+  contentType    String?
+  contentLength  BigInt?
+  etag           String?
+  lastModified   DateTime?
+  lastCheckedAt  DateTime?
+  lastError      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  source   Source?  @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  @@index([resourceId])
+  @@index([sourceId])
+  @@unique([sourceId, externalId])
+  @@map("resource_locators")
+}
+
+model ResourceProvenance {
+  id               String   @id @default(uuid())
+  resourceId       String
+  sourceId         String?
+  ingestionJobId   String?
+  connectorType    String
+  connectorVersion String
+  originalUrl      String
+  publisher        String?
+  authorName       String?
+  authorUrl        String?
+  licenseText      String?
+  licenseUrl       String?
+  attributionText  String?
+  rawMetadata      String?
+  capturedAt       DateTime @default(now())
+
+  resource     Resource      @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  source       Source?       @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  ingestionJob IngestionJob? @relation(fields: [ingestionJobId], references: [id], onDelete: SetNull)
+
+  @@index([resourceId])
+  @@index([sourceId])
+  @@index([ingestionJobId])
+  @@map("resource_provenance")
+}
+
+model IngestionJob {
+  id             String   @id @default(uuid())
+  sourceId       String?
+  resourceId     String?
+  jobType        String
+  status         String   @default("pending")
+  request        String
+  result         String?
+  idempotencyKey String
+  retryCount     Int      @default(0)
+  nextRunAt      DateTime?
+  startedAt      DateTime?
+  leaseToken     String?
+  finishedAt     DateTime?
+  errorCode      String?
+  errorMessage   String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  source     Source?              @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  resource   Resource?            @relation(fields: [resourceId], references: [id], onDelete: SetNull)
+  provenance ResourceProvenance[]
+
+  @@index([status, nextRunAt])
+  @@index([idempotencyKey])
+  @@index([sourceId])
+  @@index([resourceId])
+  @@map("ingestion_jobs")
 }
 
 model ResourceFile {
