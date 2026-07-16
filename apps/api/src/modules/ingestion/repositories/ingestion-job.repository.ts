@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { IngestionJob, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { IngestionJobStatus, IngestionJobType } from '../../../common/constants/enums';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -35,29 +36,37 @@ export class IngestionJobRepository {
     });
   }
 
-  async claimNext() {
-    const job = await this.prisma.ingestionJob.findFirst({
-      where: {
-        status: IngestionJobStatus.pending,
-        OR: [{ nextRunAt: null }, { nextRunAt: { lte: new Date() } }],
-      },
-      orderBy: { createdAt: 'asc' },
+  /**
+   * 原子认领下一个待处理任务
+   *
+   * 在交互式事务中完成 findFirst + updateMany，确保整个认领过程原子化。
+   * leaseToken 用于防止任务被多个 worker 同时认领。
+   */
+  async claimNext(): Promise<IngestionJob | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const job = await tx.ingestionJob.findFirst({
+        where: {
+          status: IngestionJobStatus.pending,
+          OR: [{ nextRunAt: null }, { nextRunAt: { lte: new Date() } }],
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+      if (!job) return null;
+      const leaseToken = randomUUID();
+      const result = await tx.ingestionJob.updateMany({
+        where: { id: job.id, status: IngestionJobStatus.pending },
+        data: {
+          status: IngestionJobStatus.processing,
+          startedAt: new Date(),
+          leaseToken,
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+      if (result.count !== 1) return null;
+      const claimed = await tx.ingestionJob.findUnique({ where: { id: job.id } });
+      return claimed?.leaseToken ? claimed : null;
     });
-    if (!job) return null;
-    const leaseToken = randomUUID();
-    const result = await this.prisma.ingestionJob.updateMany({
-      where: { id: job.id, status: IngestionJobStatus.pending },
-      data: {
-        status: IngestionJobStatus.processing,
-        startedAt: new Date(),
-        leaseToken,
-        errorCode: null,
-        errorMessage: null,
-      },
-    });
-    if (result.count !== 1) return null;
-    const claimed = await this.prisma.ingestionJob.findUnique({ where: { id: job.id } });
-    return claimed?.leaseToken ? claimed : null;
   }
 
   async complete(id: string, leaseToken: string, resourceId: string, result: string): Promise<boolean> {
@@ -118,7 +127,7 @@ export class IngestionJobRepository {
   async findMany(params: { status?: string; sourceId?: string; resourceId?: string; page?: number; pageSize?: number }) {
     const page = params.page ?? 1;
     const pageSize = params.pageSize ?? 20;
-    const where: Record<string, unknown> = {};
+    const where: Prisma.IngestionJobWhereInput = {};
     if (params.status) where.status = params.status;
     if (params.sourceId) where.sourceId = params.sourceId;
     if (params.resourceId) where.resourceId = params.resourceId;

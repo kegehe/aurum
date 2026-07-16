@@ -32,6 +32,7 @@ export default function ImportLinkPage() {
   const [tags, setTags] = useState<TagWithUsage[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [pollError, setPollError] = useState<string | null>(null);
   const [job, setJob] = useState<IngestionJobItem | null>(null);
   const flatCategories = useMemo(() => flattenCategories(categories), [categories]);
 
@@ -53,6 +54,7 @@ export default function ImportLinkPage() {
 
   const pollJob = (jobId: string) => {
     stopPolling();
+    setPollError(null);
     pollTimer.current = setInterval(() => {
       void getIngestionJob(jobId)
         .then((nextJob) => {
@@ -63,7 +65,10 @@ export default function ImportLinkPage() {
           }
           if (nextJob.status === 'failed' || nextJob.status === 'canceled') stopPolling();
         })
-        .catch(() => stopPolling());
+        .catch((err) => {
+          setPollError(err instanceof Error ? err.message : '轮询任务状态失败');
+          stopPolling();
+        });
     }, 1000);
   };
 
@@ -71,6 +76,7 @@ export default function ImportLinkPage() {
     event.preventDefault();
     if (!url.trim()) return;
     setSubmitting(true);
+    setPollError(null);
     try {
       const created = await createLinkImport({
         url: url.trim(),
@@ -193,6 +199,7 @@ export default function ImportLinkPage() {
               <div>
                 <p className="font-medium">{job.status === 'failed' ? '导入失败' : job.status === 'completed' ? '导入完成' : '正在导入'}</p>
                 {job.errorMessage && <p className="mt-1 text-destructive">{job.errorMessage}</p>}
+                {pollError && !job.errorMessage && <p className="mt-1 text-destructive">网络错误：{pollError}</p>}
                 {job.status === 'failed' && (
                   <Button variant="outline" size="sm" className="mt-2" onClick={retry} disabled={retrying}>
                     重试

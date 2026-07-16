@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { toast } from 'sonner';
-import { Undo2, Trash2, RotateCcw } from 'lucide-react';
+import { Undo2, Trash2, RotateCcw, ExternalLink } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
 import { DataTable, type Column } from '@/components/shared/data-table';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -10,7 +10,7 @@ import { ResourceTypeIcon } from '@/components/shared/resource-type-icon';
 import { ResourceTypeBadge } from '@/components/shared/resource-type-badge';
 import { Button } from '@/components/ui/button';
 import { emptyTrash, listResources, permanentDeleteResource, restoreResource } from '@/lib/api/resources';
-import { formatBytes, formatDateTime } from '@/lib/format';
+import { formatByteString, formatDateTime } from '@/lib/format';
 import type { ResourceListItem } from '@/lib/types';
 
 export default function TrashPage() {
@@ -102,7 +102,11 @@ export default function TrashPage() {
       header: '资源名称',
       render: (r) => (
         <div className="flex items-center gap-2">
-          <ResourceTypeIcon type={r.resourceType} className="h-5 w-5 text-muted-foreground" />
+          {r.acquisitionMode === 'link_only' ? (
+            <ExternalLink className="h-5 w-5 text-primary" />
+          ) : (
+            <ResourceTypeIcon type={r.resourceType} className="h-5 w-5 text-muted-foreground" />
+          )}
           <span className="font-medium">{r.title || r.originalFilename}</span>
         </div>
       ),
@@ -118,7 +122,7 @@ export default function TrashPage() {
       header: '大小',
       className: 'w-20 text-right',
       render: (r) => (
-        <span className="text-muted-foreground">{formatBytes(parseInt(r.sizeBytes, 10))}</span>
+        <span className="text-muted-foreground">{r.acquisitionMode === 'link_only' ? '链接' : formatByteString(r.sizeBytes)}</span>
       ),
     },
     {

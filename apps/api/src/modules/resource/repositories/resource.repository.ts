@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { Prisma, Resource } from '@prisma/client';
 
@@ -168,12 +168,14 @@ export class ResourceRepository {
     });
   }
 
-  async deleteDeleted(id: string): Promise<void> {
+  /**
+   * 彻底删除已在回收站中的资源记录
+   * 幂等：如果记录已被并发请求删除（count=0），静默返回而不抛异常。
+   */
+  async deleteDeleted(id: string): Promise<number> {
     const result = await this.prisma.resource.deleteMany({
       where: { id, deletedAt: { not: null } },
     });
-    if (result.count === 0) {
-      throw new NotFoundException(`Deleted resource ${id} not found`);
-    }
+    return result.count;
   }
 }

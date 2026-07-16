@@ -1,4 +1,4 @@
-import { ArrayMinSize, IsArray, IsBoolean, IsOptional, IsString } from 'class-validator';
+import { ArrayMinSize, IsArray, IsBoolean, IsNotEmpty, IsOptional, IsString, IsUUID, ValidateIf } from 'class-validator';
 
 export class BatchResourceIdsDto {
   @IsArray()
@@ -15,8 +15,11 @@ export class BatchTagResourcesDto extends BatchResourceIdsDto {
 }
 
 export class BatchCategoryResourcesDto extends BatchResourceIdsDto {
+  /** 传 null 显式断开分类关联，传 UUID 设置新分类 */
   @IsOptional()
-  @IsString()
+  @ValidateIf((o) => o.categoryId !== null)
+  @IsNotEmpty()
+  @IsUUID()
   categoryId?: string | null;
 }
 

@@ -37,6 +37,7 @@ function normalizeResource(resource: CollectionDetail['resources'][number]): Res
     height: resource.height ?? null,
     durationSeconds: resource.durationSeconds ?? null,
     searchVector: resource.searchVector ?? null,
+    acquisitionMode: resource.acquisitionMode,
     createdAt: resource.createdAt,
     updatedAt: resource.updatedAt,
     deletedAt: resource.deletedAt ?? null,

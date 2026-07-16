@@ -64,7 +64,7 @@ import {
 import { listTags } from '@/lib/api/tags';
 import { createCategory, deleteCategory, listCategories, updateCategory } from '@/lib/api/categories';
 import { batchAddToCollection, listCollections } from '@/lib/api/collections';
-import { formatBytes, formatDate } from '@/lib/format';
+import { formatByteString, formatDate } from '@/lib/format';
 import { RESOURCE_TYPE_LABELS } from '@/lib/constants';
 import type { ResourceListItem, TagWithUsage, CategoryTreeNode, CollectionItem } from '@/lib/types';
 import type { ResourceType } from '@resource-service/shared-types';
@@ -618,7 +618,7 @@ export default function ResourcesPage() {
       className: 'w-24 text-right',
       render: (r) => (
         <span className="text-muted-foreground">
-          {r.acquisitionMode === 'link_only' ? r.originalFilename : formatBytes(parseInt(r.sizeBytes, 10))}
+          {r.acquisitionMode === 'link_only' ? '链接' : formatByteString(r.sizeBytes)}
         </span>
       ),
     },

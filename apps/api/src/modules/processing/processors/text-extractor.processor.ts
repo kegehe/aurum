@@ -73,7 +73,10 @@ export class TextExtractor implements IJobProcessor {
     }
 
     // 存储提取文本
-    const hash = resource.sha256!;
+    if (!resource.sha256) {
+      throw new Error(`Resource ${resourceId} has no sha256 hash; cannot generate storage key`);
+    }
+    const hash = resource.sha256;
     const storageKey = this.storage.generateKey(
       FileRole.extracted_text,
       hash,
@@ -112,16 +115,10 @@ export class TextExtractor implements IJobProcessor {
 
   /**
    * 使用 pdf-parse 提取 PDF 文本
+   * 解析失败时抛出错误，由调度器决定重试或标记失败
    */
   private async extractPdf(buffer: Buffer): Promise<string> {
-    try {
-      const data = await pdfParse(buffer);
-      return data.text || '';
-    } catch (err) {
-      this.logger.warn(
-        `PDF text extraction failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return '';
-    }
+    const data = await pdfParse(buffer);
+    return data.text || '';
   }
 }

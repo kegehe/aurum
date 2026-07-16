@@ -168,6 +168,7 @@ describe('ResourceService batch operations', () => {
     });
     resourceRepo.deleteDeleted.mockImplementation(async (id: string) => {
       calls.push(`db:${id}`);
+      return 1;
     });
 
     await expect(service.permanentDelete('r1')).resolves.toEqual({
@@ -203,13 +204,34 @@ describe('ResourceService batch operations', () => {
     });
     resourceRepo.deleteDeleted.mockImplementation(async (id: string) => {
       calls.push(`db:${id}`);
+      return 1;
     });
 
     await expect(service.emptyTrash()).resolves.toEqual({
       deletedResources: 2,
       deletedFiles: 2,
+      skippedResources: 0,
     });
     expect(calls).toEqual(['file:originals/a.txt', 'db:r1', 'file:originals/b.txt', 'db:r2']);
+  });
+
+  it('skips resources already deleted by a concurrent request', async () => {
+    const { service, resourceRepo, storage } = createService();
+    resourceRepo.findDeletedWithFiles.mockResolvedValue([
+      { id: 'r1', files: [{ storagePath: 'originals/a.txt' }] },
+      { id: 'r2', files: [{ storagePath: 'originals/b.txt' }] },
+    ]);
+    storage.delete.mockResolvedValue(undefined);
+    // r1 正常删除，r2 已被并发请求删除（count=0）
+    resourceRepo.deleteDeleted
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(0);
+
+    await expect(service.emptyTrash()).resolves.toEqual({
+      deletedResources: 1,
+      deletedFiles: 1,
+      skippedResources: 1,
+    });
   });
 
   it('does not delete trash records after a storage deletion failure', async () => {

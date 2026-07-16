@@ -26,7 +26,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { listResources } from '@/lib/api/resources';
 import { retryJob } from '@/lib/api/processing';
 import { getDashboardOverview } from '@/lib/api/stats';
-import { formatBytes, formatByteString, formatDateTime } from '@/lib/format';
+import { formatByteString, formatDateTime } from '@/lib/format';
 import { RESOURCE_TYPE_LABELS } from '@/lib/constants';
 import type { DashboardOverview, ResourceListItem } from '@/lib/types';
 
@@ -202,7 +202,7 @@ export default function DashboardPage() {
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-medium">{r.title || r.originalFilename}</p>
                         <p className="text-xs text-muted-foreground">
-                          {r.acquisitionMode === 'link_only' ? r.originalFilename : formatBytes(parseInt(r.sizeBytes, 10))} · {formatDateTime(r.createdAt)}
+                          {r.acquisitionMode === 'link_only' ? '链接' : formatByteString(r.sizeBytes)} · {formatDateTime(r.createdAt)}
                         </p>
                       </div>
                       <ResourceTypeBadge type={r.resourceType} />

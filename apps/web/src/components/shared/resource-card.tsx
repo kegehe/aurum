@@ -9,14 +9,7 @@ import { ResourceTypeIcon } from './resource-type-icon';
 import { PROCESSING_STATUS_LABELS } from '@/lib/constants';
 import { getResourceThumbnailUrl } from '@/lib/api/resources';
 import type { ResourceListItem } from '@/lib/types';
-import { formatBytes } from '@/lib/format';
-
-/** 格式化文件大小 */
-function formatSize(bytesStr: string): string {
-  const bytes = parseInt(bytesStr, 10);
-  if (isNaN(bytes)) return bytesStr;
-  return formatBytes(bytes);
-}
+import { formatByteString } from '@/lib/format';
 
 /** 格式化日期 */
 function formatDate(dateStr: string): string {
@@ -116,7 +109,7 @@ function ResourceCardComponent({ resource, selected, onToggle, onDelete, onDragS
           )}
         </div>
         <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <span>{isLink ? resource.originalFilename : formatSize(resource.sizeBytes)}</span>
+          <span>{isLink ? '链接' : formatByteString(resource.sizeBytes)}</span>
           <span>{formatDate(resource.createdAt)}</span>
         </div>
       </CardContent>

@@ -12,6 +12,7 @@ export function formatBytes(bytes: number): string {
 
 /**
  * 格式化后端 BigInt 字符串形式的字节数，避免大文件库统计丢精度。
+ * 小数部分四舍五入到 1 位，与 formatBytes 行为一致。
  */
 export function formatByteString(bytesStr: string): string {
   let bytes: bigint;
@@ -35,8 +36,14 @@ export function formatByteString(bytesStr: string): string {
 
   const whole = bytes / divisor;
   const remainder = bytes % divisor;
-  const decimal = Number((remainder * BigInt(10)) / divisor);
-  const value = whole < BigInt(10) && decimal > 0 ? `${whole.toString()}.${decimal}` : whole.toString();
+  // 四舍五入到 1 位小数：remainder * 10 / divisor + 5 / 10（即 +0.5 后截断）
+  const decimalRaw = Number((remainder * BigInt(10) + divisor / BigInt(2)) / divisor);
+  // decimalRaw 可能是 10（进位），如 0.95 → 1.0
+  if (decimalRaw >= 10) {
+    const rounded = whole + BigInt(1);
+    return `${rounded.toString()} ${units[unitIndex]}`;
+  }
+  const value = whole < BigInt(10) ? `${whole.toString()}.${decimalRaw}` : whole.toString();
   return `${value} ${units[unitIndex]}`;
 }
 

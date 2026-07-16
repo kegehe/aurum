@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import sharp from 'sharp';
 import ffmpeg from 'fluent-ffmpeg';
+import { Prisma } from '@prisma/client';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
 import { IJobScheduler, JOB_SCHEDULER } from '../interfaces/job-scheduler.interface';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
@@ -128,81 +129,83 @@ export class MetadataDetector implements IJobProcessor {
         `Image metadata: ${metadata.width}x${metadata.height} for ${resourceId}`,
       );
     } catch (err) {
-      this.logger.warn(
+      throw new Error(
         `Sharp metadata detection failed for ${resourceId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
 
   private detectVideo(resourceId: string, filePath: string): Promise<void> {
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.logger.warn(`FFprobe timeout for resource ${resourceId}`);
-        resolve();
+        reject(new Error(`FFprobe timeout for resource ${resourceId}`));
       }, 30000); // 30s timeout
 
       ffmpeg.ffprobe(filePath, (err, metadata) => {
         clearTimeout(timeout);
         if (err) {
-          this.logger.warn(
-            `FFprobe failed for resource ${resourceId}: ${err.message}`,
-          );
-          resolve();
+          reject(new Error(`FFprobe failed for resource ${resourceId}: ${err.message}`));
           return;
         }
         const videoStream = metadata.streams.find(
           (s) => s.codec_type === 'video',
         );
-        const updateData: Record<string, unknown> = {};
+        const updateData: Prisma.ResourceUpdateInput = {};
         if (videoStream) {
           updateData.width = videoStream.width ?? null;
           updateData.height = videoStream.height ?? null;
         }
-        if (metadata.format.duration) {
+        // 使用 != null 检查，允许 duration=0 通过（0 秒是有效值）
+        if (metadata.format.duration != null) {
           updateData.durationSeconds = metadata.format.duration;
+        } else {
+          updateData.durationSeconds = null;
         }
         this.resourceRepo
           .update(resourceId, updateData)
           .then(() => {
             this.logger.log(
-              `Video metadata: ${updateData.width ?? '?'}x${updateData.height ?? '?'}, ${updateData.durationSeconds ?? '?'}s for ${resourceId}`,
+              `Video metadata: ${videoStream?.width ?? '?'}x${videoStream?.height ?? '?'}, ${metadata.format.duration ?? '?'}s for ${resourceId}`,
             );
             resolve();
           })
-          .catch(() => resolve());
+          .catch((updateErr) => {
+            reject(new Error(`Failed to save video metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`));
+          });
       });
     });
   }
 
   private detectAudio(resourceId: string, filePath: string): Promise<void> {
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.logger.warn(`FFprobe timeout for resource ${resourceId}`);
-        resolve();
+        reject(new Error(`FFprobe timeout for resource ${resourceId}`));
       }, 30000);
 
       ffmpeg.ffprobe(filePath, (err, metadata) => {
         clearTimeout(timeout);
         if (err) {
-          this.logger.warn(
-            `FFprobe failed for resource ${resourceId}: ${err.message}`,
-          );
-          resolve();
+          reject(new Error(`FFprobe failed for resource ${resourceId}: ${err.message}`));
           return;
         }
-        const updateData: Record<string, unknown> = {};
-        if (metadata.format.duration) {
+        const updateData: Prisma.ResourceUpdateInput = {};
+        // 使用 != null 检查，允许 duration=0 通过（0 秒是有效值）
+        if (metadata.format.duration != null) {
           updateData.durationSeconds = metadata.format.duration;
+        } else {
+          updateData.durationSeconds = null;
         }
         this.resourceRepo
           .update(resourceId, updateData)
           .then(() => {
             this.logger.log(
-              `Audio metadata: duration=${updateData.durationSeconds ?? '?'}s for ${resourceId}`,
+              `Audio metadata: duration=${metadata.format.duration ?? '?'}s for ${resourceId}`,
             );
             resolve();
           })
-          .catch(() => resolve());
+          .catch((updateErr) => {
+            reject(new Error(`Failed to save audio metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`));
+          });
       });
     });
   }

@@ -56,7 +56,7 @@ import {
 } from '@/lib/api/resources';
 import { listTags } from '@/lib/api/tags';
 import { listCategories } from '@/lib/api/categories';
-import { formatBytes, formatDateTime } from '@/lib/format';
+import { formatByteString, formatDateTime } from '@/lib/format';
 import { PROCESSING_STATUS_LABELS } from '@/lib/constants';
 import type { ResourceDetail, TagWithUsage, CategoryTreeNode } from '@/lib/types';
 
@@ -327,7 +327,7 @@ export default function ResourceDetailPage() {
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium">{FILE_ROLE_LABELS[f.fileRole] ?? f.fileRole}</p>
                         <p className="text-xs text-muted-foreground">
-                          {f.mimeType} · {formatBytes(parseInt(f.sizeBytes, 10))}
+                          {f.mimeType} · {formatByteString(f.sizeBytes)}
                           {f.width && f.height ? ` · ${f.width}×${f.height}` : ''}
                         </p>
                       </div>
@@ -362,10 +362,17 @@ export default function ResourceDetailPage() {
                 <span className="text-muted-foreground">MIME</span>
                 <span className="font-mono text-xs">{resource.mimeType}</span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">大小</span>
-                <span>{formatBytes(parseInt(resource.sizeBytes, 10))}</span>
-              </div>
+              {resource.acquisitionMode === 'link_only' ? (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">获取方式</span>
+                  <span>链接</span>
+                </div>
+              ) : (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">大小</span>
+                  <span>{formatByteString(resource.sizeBytes)}</span>
+                </div>
+              )}
               {resource.width && resource.height && (
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">尺寸</span>

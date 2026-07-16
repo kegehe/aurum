@@ -32,39 +32,44 @@ export class ProcessingJobRepository {
 
   /**
    * 原子认领下一个待处理任务
-   * 先原子更新一条 pending → processing，再查询返回完整记录。
-   * updateMany 在 SQLite 下串行化写入，天然安全；
-   * PG 下 update + where 条件在单条语句内原子执行。
+   *
+   * 在交互式事务中完成 findFirst + updateMany，确保整个认领过程原子化：
+   * - SQLite：WAL 模式下串行化写入，天然安全
+   * - PostgreSQL：事务隔离级别保证原子性，无竞态窗口
+   *
+   * 即使多个 worker 同时调用，updateMany 的 WHERE status=pending 条件
+   * 确保只有第一个提交的 worker 能成功认领。
    */
   async claimNext(jobType?: string): Promise<ProcessingJob | null> {
-    // 先找到最旧的 pending 任务
-    const where: Prisma.ProcessingJobWhereInput = {
-      status: JobStatus.pending,
-    };
-    if (jobType) where.jobType = jobType;
+    return this.prisma.$transaction(async (tx) => {
+      const where: Prisma.ProcessingJobWhereInput = {
+        status: JobStatus.pending,
+      };
+      if (jobType) where.jobType = jobType;
 
-    const job = await this.prisma.processingJob.findFirst({
-      where,
-      orderBy: { createdAt: 'asc' },
+      const job = await tx.processingJob.findFirst({
+        where,
+        orderBy: { createdAt: 'asc' },
+      });
+      if (!job) return null;
+
+      // 原子更新：只有 status 仍是 pending 时才更新
+      const updated = await tx.processingJob.updateMany({
+        where: {
+          id: job.id,
+          status: JobStatus.pending, // 二次确认：防止被其他 worker 抢先
+        },
+        data: {
+          status: JobStatus.processing,
+          startedAt: new Date(),
+          finishedAt: null,
+        },
+      });
+
+      if (updated.count === 0) return null; // 被抢走了
+
+      return tx.processingJob.findUnique({ where: { id: job.id } });
     });
-    if (!job) return null;
-
-    // 原子更新：只有 status 仍是 pending 时才更新
-    const updated = await this.prisma.processingJob.updateMany({
-      where: {
-        id: job.id,
-        status: JobStatus.pending, // 二次确认：防止被其他 worker 抢先
-      },
-      data: {
-        status: JobStatus.processing,
-        startedAt: new Date(),
-        finishedAt: null,
-      },
-    });
-
-    if (updated.count === 0) return null; // 被抢走了
-
-    return this.findById(job.id);
   }
 
   /** 更新任务状态，completed/failed 时自动设 finishedAt */

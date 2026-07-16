@@ -99,7 +99,10 @@ export class ResourceService {
     if (dto.author !== undefined) data.author = dto.author;
     if (dto.licenseNote !== undefined) data.licenseNote = dto.licenseNote;
     if (dto.categoryId !== undefined) {
-      data.category = dto.categoryId ? { connect: { id: dto.categoryId } } : { disconnect: true };
+      // null → 断开分类关联；string → 连接新分类
+      data.category = dto.categoryId === null
+        ? { disconnect: true }
+        : { connect: { id: dto.categoryId } };
     }
     const updated = await this.resourceRepo.update(id, data);
     return { ...updated, sizeBytes: updated.sizeBytes.toString() };
@@ -270,11 +273,11 @@ export class ResourceService {
     }
 
     await Promise.all(resource.files.map((file) => this.storage.delete(file.storagePath)));
-    await this.resourceRepo.deleteDeleted(id);
+    const deletedCount = await this.resourceRepo.deleteDeleted(id);
 
     return {
       id,
-      deleted: true,
+      deleted: deletedCount > 0,
       deletedFiles: resource.files.length,
     };
   }
@@ -284,23 +287,26 @@ export class ResourceService {
     const resources = await this.resourceRepo.findDeletedWithFiles();
     let deletedResources = 0;
     let deletedFiles = 0;
+    let skippedResources = 0;
     for (const resource of resources) {
-      try {
-        const storagePaths = resource.files.map((file) => file.storagePath);
-        await Promise.all(storagePaths.map((path) => this.storage.delete(path)));
-        await this.resourceRepo.deleteDeleted(resource.id);
+      const storagePaths = resource.files.map((file) => file.storagePath);
+      // 删除存储文件（忽略已不存在的文件）
+      await Promise.all(storagePaths.map((path) => this.storage.delete(path)));
+      // 删除数据库记录（幂等：并发删除时 count=0 不报错）
+      const count = await this.resourceRepo.deleteDeleted(resource.id);
+      if (count > 0) {
         deletedResources++;
         deletedFiles += storagePaths.length;
-      } catch (e) {
-        if (!(e instanceof NotFoundException)) {
-          throw e;
-        }
+      } else {
+        // 记录已被并发请求删除
+        skippedResources++;
       }
     }
 
     return {
       deletedResources,
       deletedFiles,
+      skippedResources,
     };
   }
 
