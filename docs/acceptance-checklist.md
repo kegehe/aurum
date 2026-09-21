@@ -43,6 +43,8 @@ pnpm test
   - Civitai 连接器与定时自动同步（分页游标、幂等 upsert、审核门禁、下载开关）。
   - GitHub 连接器（Release 资产映射、tag 源码包回退、页号游标、ETag/304、速率限制报错、私有仓库鉴权头）。
   - RSS 连接器（RSS 2.0 / Atom / JSON Feed 解析、offset 切片游标、guid isPermaLink、enclosure/media:content 选择、HTML 摘要与内联图预览、重定向逐跳校验、超出大小上限报错）。
+  - 页面快照（capture_page 任务：archive_snapshot 策略门禁、HTML 存为 snapshot 派生文件、内容未变复用对象、变化时替换并清理旧对象、页面 locator 健康信息回写、超出大小上限的可读报错）。
+  - 派生文件下载端点的角色白名单与 attachment + nosniff 分发（含 /preview 对 HTML/XML 的内联降级防护）。
   - LinkMetadata 提取、LocatorHealthChecker 健康探测调度。
   - 导入任务仓储与 IngestionScheduler。
 - 样式实验室：
@@ -95,8 +97,9 @@ pnpm dev
 7. 打开处理任务页，筛选失败任务并执行重试。
 8. 在「来源」页分别配置 Civitai、GitHub（填 `owner/repo`）、RSS（Base URL 填 Feed 地址）来源并启用自动同步，确认：列表「同步方式」列显示获取方式、点「开始下载」后资源带来源信息入库、再次同步游标继续推进（GitHub 翻页 / RSS `offset:N` 切片）。
 9. 在「添加链接」页导入一个网页链接，确认元数据提取（标题/预览/来源）与 SSRF 拦截生效。
-10. 在「设置 → AI 配置」保存密钥并测试连通性，到「样式实验室」上传图片确认分析结果与导出。
-11. 打开仪表盘，确认资源总数、存储占用、失败任务等统计可显示。
+10. 打开一个带页面链接的外部资源详情，点「生成快照」：来源未放行 `archive_snapshot` 时提示被策略拒绝；在来源勾选「允许生成页面快照」后重试，确认文件列表出现「页面快照 text/html」、可「取回」（下载而非在线打开），按钮变为「更新快照」，链接健康里页面一条转为 200。
+11. 在「设置 → AI 配置」保存密钥并测试连通性，到「样式实验室」上传图片确认分析结果与导出。
+12. 打开仪表盘，确认资源总数、存储占用、失败任务等统计可显示。
 
 ## 尚未自动化的验收项
 

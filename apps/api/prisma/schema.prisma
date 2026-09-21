@@ -241,7 +241,7 @@ model IngestionJob {
 model ResourceFile {
   id              String   @id @default(uuid())
   resourceId      String
-  // FileRole 枚举值（original/thumbnail/preview/extracted_text/transcode）
+  // FileRole 枚举值（original/thumbnail/preview/extracted_text/transcode/snapshot）
   fileRole        String
   variant         String   @default("")
   storagePath     String

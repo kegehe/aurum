@@ -71,6 +71,7 @@ export enum FileRole {
   preview = 'preview',
   extracted_text = 'extracted_text',
   transcode = 'transcode',
+  snapshot = 'snapshot',
 }
 
 /** 资源处理状态（资源级） */

@@ -1,7 +1,20 @@
-import { Controller, Delete, Get, Param, Patch, Post, Query, Req, Res, Body } from '@nestjs/common';
+import {
+  BadRequestException,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  Res,
+  Body,
+} from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { Readable } from 'node:stream';
 import { ResourceService } from './resource.service';
+import { FileRole } from '../../common/constants/enums';
 import { SearchResourceDto } from '../search/dto/search-resource.dto';
 import { UpdateResourceDto } from './dto/update-resource.dto';
 import {
@@ -165,16 +178,63 @@ export class ResourceController {
   }
 
   /**
+   * 下载派生文件（页面快照 / 缩略图 / 提取文本 / 转码）
+   *
+   * 角色名走白名单且不参与路径拼接；一律 attachment 分发 —— 快照是不可信的
+   * 远端 HTML，内联分发等于在我们的源上执行它的脚本。
+   */
+  @Get(':id/files/:role/download')
+  async downloadDerived(
+    @Param('id') id: string,
+    @Param('role') role: string,
+    @Res() res: Response,
+  ) {
+    const allowed: string[] = [
+      FileRole.snapshot,
+      FileRole.thumbnail,
+      FileRole.preview,
+      FileRole.extracted_text,
+      FileRole.transcode,
+    ];
+    if (!allowed.includes(role)) {
+      throw new BadRequestException(`Unsupported derived file role: ${role}`);
+    }
+    const { stream, mimeType, originalFilename } = await this.resourceService.getDerivedFile(
+      id,
+      role as Exclude<FileRole, FileRole.original>,
+    );
+    const encodedName = encodeURIComponent(originalFilename);
+    res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedName}`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    pipeStream(stream, res);
+  }
+
+  /**
    * 原文件内联预览（浏览器直接显示，不触发下载）
    * 支持 HTTP Range 请求（视频/音频 seek 必需）：返回 206 部分内容
+   *
+   * HTML/XHTML 一类可在文档上下文里执行脚本的内容不在此列：远端抓取或用户
+   * 上传的 HTML 都属于不可信内容，内联分发等于在我们的源上开存储型 XSS。
+   * 这类文件一律降级为附件下载（实施方案 §7 的不可信预览隔离要求）。
    */
   @Get(':id/preview')
   async preview(@Param('id') id: string, @Req() req: Request, @Res() res: Response) {
     const { mimeType, originalFilename, sizeBytes } =
       await this.resourceService.getOriginalFileInfo(id);
     const encodedName = encodeURIComponent(originalFilename);
+    const inlineType = (mimeType || '').split(';', 1)[0].trim().toLowerCase();
+    const unsafeInline =
+      inlineType === 'text/html' ||
+      inlineType === 'application/xhtml+xml' ||
+      inlineType === 'text/xml' ||
+      inlineType === 'application/xml';
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodedName}`);
+    res.setHeader(
+      'Content-Disposition',
+      `${unsafeInline ? 'attachment' : 'inline'}; filename*=UTF-8''${encodedName}`,
+    );
     // 允许浏览器缓存预览 1 小时
     res.setHeader('Cache-Control', 'private, max-age=3600');
 

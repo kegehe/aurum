@@ -66,4 +66,10 @@ export class IngestionController {
   mirrorRemoteResource(@Param('id') id: string) {
     return this.ingestionService.mirrorRemoteResource(id);
   }
+
+  /** 抓取资源页面的 HTML 快照（archive_snapshot 采集方式） */
+  @Post('resources/:id/snapshot')
+  createPageSnapshot(@Param('id') id: string) {
+    return this.ingestionService.createPageSnapshot(id);
+  }
 }

@@ -18,6 +18,7 @@ import {
   Video,
   Loader2,
   Square,
+  Camera,
 } from 'lucide-react';
 import { LoadingState } from '@/components/shared/loading-state';
 import { ErrorState } from '@/components/shared/error-state';
@@ -55,13 +56,12 @@ import {
   getResourceDownloadUrl,
   getResourcePreviewUrl,
   getResourceThumbnailUrl,
+  getResourceFileDownloadUrl,
   checkResourceLocators,
   mirrorRemoteResource,
+  captureResourceSnapshot,
 } from '@/lib/api/resources';
-import {
-  cancelIngestionJob,
-  listIngestionJobs,
-} from '@/lib/api/ingestion';
+import { cancelIngestionJob, listIngestionJobs } from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
 import { formatByteString, formatDateTime } from '@/lib/format';
 import { PROCESSING_STATUS_LABELS, LOCATOR_TYPE_LABELS } from '@/lib/constants';
@@ -76,6 +76,7 @@ function flattenCategories(categories: CategoryTreeNode[]): CategoryTreeNode[] {
 
 const FILE_ROLE_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
   original: FileText,
+  snapshot: FileText,
   thumbnail: Image,
   preview: Image,
   extracted_text: FileText,
@@ -84,6 +85,7 @@ const FILE_ROLE_ICONS: Record<string, React.ComponentType<{ className?: string }
 
 const FILE_ROLE_LABELS: Record<string, string> = {
   original: '原文件',
+  snapshot: '页面快照',
   thumbnail: '缩略图',
   preview: '预览',
   extracted_text: '提取文本',
@@ -201,7 +203,8 @@ function TextViewer({
       </pre>
       {truncated && (
         <p className="px-4 pb-4 pt-2 text-center text-xs text-muted-foreground">
-          文件过大，仅显示前 {TEXT_PREVIEW_MAX_CHARS.toLocaleString()} 个字符。请使用「下载」查看完整内容。
+          文件过大，仅显示前 {TEXT_PREVIEW_MAX_CHARS.toLocaleString()}{' '}
+          个字符。请使用「下载」查看完整内容。
         </p>
       )}
     </div>
@@ -408,7 +411,8 @@ function neighborsParamsFromUrl(searchParams: URLSearchParams): Record<string, u
 function BackButton({ onClick }: { onClick: () => void }) {
   return (
     <Button variant="outline" size="sm" className="gap-1" onClick={onClick}>
-      <ArrowLeft className="h-4 w-4" />返回资源库
+      <ArrowLeft className="h-4 w-4" />
+      返回资源库
     </Button>
   );
 }
@@ -423,7 +427,10 @@ export default function ResourceDetailPage() {
   // 相邻资源导航（上一个/下一个）
   const [previousId, setPreviousId] = useState<string | null>(null);
   const [nextId, setNextId] = useState<string | null>(null);
-  const [neighborsPosition, setNeighborsPosition] = useState<{ current: number; total: number } | null>(null);
+  const [neighborsPosition, setNeighborsPosition] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
 
   const handleBack = useCallback(() => {
     if (window.history.length > 1) {
@@ -448,7 +455,10 @@ export default function ResourceDetailPage() {
   const [externalPreviewError, setExternalPreviewError] = useState(false);
   const [mirroring, setMirroring] = useState(false);
   const [mirrorJob, setMirrorJob] = useState<IngestionJobItem | null>(null);
+  const [snapshotJob, setSnapshotJob] = useState<IngestionJobItem | null>(null);
+  const [snapshotting, setSnapshotting] = useState(false);
   const hadMirrorJobRef = useRef(false);
+  const hadSnapshotJobRef = useRef(false);
 
   // 编辑 Dialog
   const [editOpen, setEditOpen] = useState(false);
@@ -482,7 +492,9 @@ export default function ResourceDetailPage() {
 
   useEffect(() => {
     fetchResource();
-    listCategories().then((d) => setCategories(d.items)).catch(() => {});
+    listCategories()
+      .then((d) => setCategories(d.items))
+      .catch(() => {});
   }, [fetchResource]);
 
   // 拉取相邻资源（携带列表的筛选/排序上下文）。失败时静默隐藏箭头，不影响当前详情。
@@ -509,9 +521,9 @@ export default function ResourceDetailPage() {
     };
   }, [id, contextQuery]);
 
-  const fetchMirrorJob = useCallback(async () => {
+  const fetchRemoteJobs = useCallback(async () => {
     try {
-      const [pending, processing] = await Promise.all([
+      const [pending, processing, snapshotPending, snapshotRunning] = await Promise.all([
         listIngestionJobs({
           resourceId: id,
           jobType: IngestionJobType.download_file,
@@ -524,22 +536,35 @@ export default function ResourceDetailPage() {
           status: IngestionJobStatus.processing,
           pageSize: 1,
         }),
+        listIngestionJobs({
+          resourceId: id,
+          jobType: IngestionJobType.capture_page,
+          status: IngestionJobStatus.pending,
+          pageSize: 1,
+        }),
+        listIngestionJobs({
+          resourceId: id,
+          jobType: IngestionJobType.capture_page,
+          status: IngestionJobStatus.processing,
+          pageSize: 1,
+        }),
       ]);
       setMirrorJob(processing.items[0] ?? pending.items[0] ?? null);
+      setSnapshotJob(snapshotRunning.items[0] ?? snapshotPending.items[0] ?? null);
     } catch {
       // Resource viewing remains available if background-job polling fails.
     }
   }, [id]);
 
   useEffect(() => {
-    void fetchMirrorJob();
-  }, [fetchMirrorJob]);
+    void fetchRemoteJobs();
+  }, [fetchRemoteJobs]);
 
   useEffect(() => {
-    if (!mirrorJob) return;
-    const timer = window.setInterval(() => void fetchMirrorJob(), 3000);
+    if (!mirrorJob && !snapshotJob) return;
+    const timer = window.setInterval(() => void fetchRemoteJobs(), 3000);
     return () => window.clearInterval(timer);
-  }, [fetchMirrorJob, mirrorJob]);
+  }, [fetchRemoteJobs, mirrorJob, snapshotJob]);
 
   useEffect(() => {
     if (mirrorJob) {
@@ -551,6 +576,18 @@ export default function ResourceDetailPage() {
       void fetchResource();
     }
   }, [fetchResource, mirrorJob]);
+
+  // 快照任务结束后重新拉取资源，文件列表才会出现快照
+  useEffect(() => {
+    if (snapshotJob) {
+      hadSnapshotJobRef.current = true;
+      return;
+    }
+    if (hadSnapshotJobRef.current) {
+      hadSnapshotJobRef.current = false;
+      void fetchResource();
+    }
+  }, [fetchResource, snapshotJob]);
 
   const openEdit = () => {
     if (!resource) return;
@@ -631,6 +668,20 @@ export default function ResourceDetailPage() {
     }
   };
 
+  const handleSnapshot = async () => {
+    setSnapshotting(true);
+    try {
+      const job = await captureResourceSnapshot(id);
+      setSnapshotJob(job);
+      toast.success('已提交页面快照任务');
+      void fetchRemoteJobs();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '提交快照任务失败');
+    } finally {
+      setSnapshotting(false);
+    }
+  };
+
   const handleCancelMirror = async () => {
     if (!mirrorJob) return;
     try {
@@ -648,11 +699,13 @@ export default function ResourceDetailPage() {
 
   const primaryLocator = resource?.locators?.find((locator) => locator.isPrimary);
   const previewLocator = resource?.locators?.find((locator) => locator.locatorType === 'preview');
-  const isExternalResource = !!resource?.acquisitionMode && resource.acquisitionMode !== 'local_upload';
+  const isExternalResource =
+    !!resource?.acquisitionMode && resource.acquisitionMode !== 'local_upload';
   // 是否有本地原文件（下载镜像、本地上传）。有本地文件的资源优先展示本地预览/下载按钮。
   const hasLocalOriginalFile = (resource?.files ?? []).some((f) => f.fileRole === 'original');
   // 是否已生成缩略图（作为视频预览封面）
   const hasThumbnail = (resource?.files ?? []).some((f) => f.fileRole === 'thumbnail');
+  const hasSnapshot = (resource?.files ?? []).some((f) => f.fileRole === 'snapshot');
 
   if (loading) {
     return (
@@ -717,56 +770,100 @@ export default function ResourceDetailPage() {
           {hasLocalOriginalFile ? (
             <Button variant="outline" size="sm" className="gap-1" asChild>
               <a href={getResourceDownloadUrl(id)} download>
-                <Download className="h-4 w-4" />下载
+                <Download className="h-4 w-4" />
+                下载
               </a>
             </Button>
           ) : isExternalResource && primaryLocator ? (
             <>
-              {resource.acquisitionMode === 'metadata_only' && (
-                mirrorJob ? (
+              {resource.acquisitionMode === 'metadata_only' &&
+                (mirrorJob ? (
                   <>
                     <Button variant="outline" size="sm" className="gap-1" disabled>
                       <Loader2 className="h-4 w-4 animate-spin" />
                       {mirrorJob.status === IngestionJobStatus.processing ? '下载中' : '等待中'}
                     </Button>
-                    <Button variant="outline" size="sm" onClick={handleCancelMirror} title="停止下载" className="text-destructive hover:text-destructive">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCancelMirror}
+                      title="停止下载"
+                      className="text-destructive hover:text-destructive"
+                    >
                       <Square className="h-4 w-4" />
                     </Button>
                   </>
                 ) : (
-                  <Button variant="outline" size="sm" className="gap-1" onClick={handleMirror} disabled={mirroring}>
-                    <Download className="h-4 w-4" />{mirroring ? '正在提交' : '下载到本地'}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1"
+                    onClick={handleMirror}
+                    disabled={mirroring}
+                  >
+                    <Download className="h-4 w-4" />
+                    {mirroring ? '正在提交' : '下载到本地'}
                   </Button>
-                )
-              )}
+                ))}
               <Button variant="outline" size="sm" className="gap-1" asChild>
                 <a href={primaryLocator.url} target="_blank" rel="noreferrer">
-                  <ExternalLink className="h-4 w-4" />打开链接
+                  <ExternalLink className="h-4 w-4" />
+                  打开链接
                 </a>
               </Button>
             </>
           ) : (
             <Button variant="outline" size="sm" className="gap-1" asChild>
               <a href={getResourceDownloadUrl(id)} download>
-                <Download className="h-4 w-4" />下载
+                <Download className="h-4 w-4" />
+                下载
               </a>
             </Button>
           )}
+          {isExternalResource &&
+            primaryLocator &&
+            (snapshotJob ? (
+              <Button variant="outline" size="sm" className="gap-1" disabled>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {snapshotJob.status === IngestionJobStatus.processing ? '快照中' : '等待中'}
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={handleSnapshot}
+                disabled={snapshotting}
+                title="抓取页面 HTML 存档，不含 JavaScript 渲染结果"
+              >
+                <Camera className="h-4 w-4" />
+                {snapshotting ? '正在提交' : hasSnapshot ? '更新快照' : '生成快照'}
+              </Button>
+            ))}
           <Button variant="outline" size="sm" className="gap-1" onClick={openEdit}>
-            <Pencil className="h-4 w-4" />编辑
+            <Pencil className="h-4 w-4" />
+            编辑
           </Button>
           {resource.deletedAt ? (
             <Button variant="outline" size="sm" className="gap-1" onClick={handleRestore}>
-              <RotateCcw className="h-4 w-4" />恢复
+              <RotateCcw className="h-4 w-4" />
+              恢复
             </Button>
           ) : (
-            <Button variant="outline" size="sm" className="gap-1" onClick={() => setDeleteOpen(true)}>
-              <Trash2 className="h-4 w-4 text-destructive" />删除
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={() => setDeleteOpen(true)}
+            >
+              <Trash2 className="h-4 w-4 text-destructive" />
+              删除
             </Button>
           )}
           {hasLocalOriginalFile && (
             <Button variant="outline" size="sm" className="gap-1" onClick={handleReprocess}>
-              <RefreshCw className="h-4 w-4" />重新处理
+              <RefreshCw className="h-4 w-4" />
+              重新处理
             </Button>
           )}
         </div>
@@ -820,12 +917,22 @@ export default function ResourceDetailPage() {
                     <div key={f.id} className="flex items-center gap-3 rounded-md border px-3 py-2">
                       <RoleIcon className="h-5 w-5 text-muted-foreground" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium">{FILE_ROLE_LABELS[f.fileRole] ?? f.fileRole}</p>
+                        <p className="text-sm font-medium">
+                          {FILE_ROLE_LABELS[f.fileRole] ?? f.fileRole}
+                        </p>
                         <p className="text-xs text-muted-foreground">
                           {f.mimeType} · {formatByteString(f.sizeBytes)}
                           {f.width && f.height ? ` · ${f.width}×${f.height}` : ''}
                         </p>
                       </div>
+                      {f.fileRole !== 'original' && (
+                        <Button variant="ghost" size="sm" className="gap-1 px-2" asChild>
+                          <a href={getResourceFileDownloadUrl(id, f.fileRole)} download>
+                            <Download className="h-3.5 w-3.5" />
+                            <span className="text-xs">取回</span>
+                          </a>
+                        </Button>
+                      )}
                     </div>
                   );
                 })}
@@ -880,7 +987,9 @@ export default function ResourceDetailPage() {
               {resource.width && resource.height && (
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">尺寸</span>
-                  <span>{resource.width} × {resource.height}</span>
+                  <span>
+                    {resource.width} × {resource.height}
+                  </span>
                 </div>
               )}
               {resource.durationSeconds && (
@@ -891,7 +1000,15 @@ export default function ResourceDetailPage() {
               )}
               <div className="flex justify-between">
                 <span className="text-muted-foreground">处理状态</span>
-                <Badge variant={resource.processingStatus === 'failed' ? 'destructive' : resource.processingStatus === 'completed' ? 'success' : 'secondary'}>
+                <Badge
+                  variant={
+                    resource.processingStatus === 'failed'
+                      ? 'destructive'
+                      : resource.processingStatus === 'completed'
+                        ? 'success'
+                        : 'secondary'
+                  }
+                >
                   {PROCESSING_STATUS_LABELS[resource.processingStatus] ?? resource.processingStatus}
                 </Badge>
               </div>
@@ -931,14 +1048,21 @@ export default function ResourceDetailPage() {
               {primaryLocator && (
                 <div className="flex justify-between gap-3">
                   <span className="shrink-0 text-muted-foreground">外部链接</span>
-                  <a href={primaryLocator.url} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">
+                  <a
+                    href={primaryLocator.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="truncate text-primary hover:underline"
+                  >
                     {primaryLocator.url}
                   </a>
                 </div>
               )}
               <div className="flex justify-between">
                 <span className="text-muted-foreground">SHA256</span>
-                <span className="font-mono text-xs max-w-32 truncate">{resource.sha256 ?? '-'}</span>
+                <span className="font-mono text-xs max-w-32 truncate">
+                  {resource.sha256 ?? '-'}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">创建时间</span>
@@ -962,7 +1086,8 @@ export default function ResourceDetailPage() {
               <CardHeader className="flex flex-row items-center justify-between">
                 <CardTitle className="text-base">链接健康</CardTitle>
                 <Button variant="outline" size="sm" className="gap-1" onClick={handleCheckLocators}>
-                  <RefreshCw className="h-3.5 w-3.5" />重新检查
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  重新检查
                 </Button>
               </CardHeader>
               <CardContent className="space-y-2">
@@ -972,7 +1097,10 @@ export default function ResourceDetailPage() {
                   </div>
                 )}
                 {resource.locators.map((locator) => (
-                  <div key={locator.id} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+                  <div
+                    key={locator.id}
+                    className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                  >
                     <Badge variant="outline" className="text-xs shrink-0">
                       {LOCATOR_TYPE_LABELS[locator.locatorType] ?? locator.locatorType}
                     </Badge>
@@ -990,7 +1118,9 @@ export default function ResourceDetailPage() {
                         {locator.httpStatus}
                       </Badge>
                     ) : (
-                      <Badge variant="outline" className="text-xs shrink-0 text-muted-foreground">未检查</Badge>
+                      <Badge variant="outline" className="text-xs shrink-0 text-muted-foreground">
+                        未检查
+                      </Badge>
                     )}
                     <a
                       href={locator.url}
@@ -1025,11 +1155,18 @@ export default function ResourceDetailPage() {
                   <div key={p.id} className="space-y-1.5 rounded-md border px-3 py-2">
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">连接器</span>
-                      <span>{p.connectorType} v{p.connectorVersion}</span>
+                      <span>
+                        {p.connectorType} v{p.connectorVersion}
+                      </span>
                     </div>
                     <div className="flex justify-between gap-3">
                       <span className="shrink-0 text-muted-foreground">原始 URL</span>
-                      <a href={p.originalUrl} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">
+                      <a
+                        href={p.originalUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="truncate text-primary hover:underline"
+                      >
                         {p.originalUrl}
                       </a>
                     </div>
@@ -1043,7 +1180,14 @@ export default function ResourceDetailPage() {
                       <div className="flex justify-between gap-3">
                         <span className="shrink-0 text-muted-foreground">作者</span>
                         {p.authorUrl ? (
-                          <a href={p.authorUrl} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">{p.authorName}</a>
+                          <a
+                            href={p.authorUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="truncate text-primary hover:underline"
+                          >
+                            {p.authorName}
+                          </a>
                         ) : (
                           <span>{p.authorName}</span>
                         )}
@@ -1064,16 +1208,19 @@ export default function ResourceDetailPage() {
       </div>
 
       {/* 编辑 Dialog */}
-      <Dialog open={editOpen} onOpenChange={(open) => {
-        setEditOpen(open);
-        if (!open) {
-          setEditTitle('');
-          setEditDescription('');
-          setEditSource('');
-          setEditAuthor('');
-          setEditCategoryId('');
-        }
-      }}>
+      <Dialog
+        open={editOpen}
+        onOpenChange={(open) => {
+          setEditOpen(open);
+          if (!open) {
+            setEditTitle('');
+            setEditDescription('');
+            setEditSource('');
+            setEditAuthor('');
+            setEditCategoryId('');
+          }
+        }}
+      >
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>编辑资源</DialogTitle>
@@ -1081,19 +1228,36 @@ export default function ResourceDetailPage() {
           <div className="space-y-3 max-h-96 overflow-y-auto">
             <div className="space-y-1">
               <Label>标题</Label>
-              <Input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} maxLength={255} />
+              <Input
+                value={editTitle}
+                onChange={(e) => setEditTitle(e.target.value)}
+                maxLength={255}
+              />
             </div>
             <div className="space-y-1">
               <Label>描述</Label>
-              <Textarea value={editDescription} onChange={(e) => setEditDescription(e.target.value)} maxLength={2000} rows={3} />
+              <Textarea
+                value={editDescription}
+                onChange={(e) => setEditDescription(e.target.value)}
+                maxLength={2000}
+                rows={3}
+              />
             </div>
             <div className="space-y-1">
               <Label>来源</Label>
-              <Input value={editSource} onChange={(e) => setEditSource(e.target.value)} maxLength={255} />
+              <Input
+                value={editSource}
+                onChange={(e) => setEditSource(e.target.value)}
+                maxLength={255}
+              />
             </div>
             <div className="space-y-1">
               <Label>作者</Label>
-              <Input value={editAuthor} onChange={(e) => setEditAuthor(e.target.value)} maxLength={255} />
+              <Input
+                value={editAuthor}
+                onChange={(e) => setEditAuthor(e.target.value)}
+                maxLength={255}
+              />
             </div>
             <div className="space-y-1">
               <Label>分类</Label>
@@ -1116,7 +1280,9 @@ export default function ResourceDetailPage() {
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
+            <Button variant="outline" onClick={() => setEditOpen(false)}>
+              取消
+            </Button>
             <Button onClick={handleSave}>保存</Button>
           </DialogFooter>
         </DialogContent>

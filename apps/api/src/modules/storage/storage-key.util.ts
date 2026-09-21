@@ -7,6 +7,7 @@ const ROLE_DIR_MAP: Record<string, string> = {
   preview: 'previews',
   extracted_text: 'extracted-text',
   transcode: 'transcodes',
+  snapshot: 'snapshots',
 };
 
 /**
@@ -19,6 +20,7 @@ const ROLE_SUFFIX_MAP: Record<string, string> = {
   preview: 'preview',
   extracted_text: '',
   transcode: 'transcode',
+  snapshot: 'snapshot',
 };
 
 /**

@@ -68,6 +68,7 @@ export enum FileRole {
   preview = 'preview',
   extracted_text = 'extracted_text',
   transcode = 'transcode',
+  snapshot = 'snapshot',
 }
 
 export enum ProcessingStatus {

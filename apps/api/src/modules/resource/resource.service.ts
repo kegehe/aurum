@@ -482,6 +482,37 @@ export class ResourceService {
   }
 
   /**
+   * 获取派生文件（快照 / 缩略图 / 提取文本 / 转码）的可读流
+   *
+   * 原文件走 /download，派生文件按角色取，避免为每个角色开一个端点。
+   * 存储路径只来自数据库记录，角色名不参与路径拼接。
+   */
+  async getDerivedFile(
+    id: string,
+    role: Exclude<FileRole, FileRole.original>,
+  ): Promise<{
+    stream: Readable;
+    mimeType: string;
+    originalFilename: string;
+  }> {
+    const resource = await this.resourceRepo.findById(id);
+    if (!resource) {
+      throw new NotFoundException(`Resource ${id} not found`);
+    }
+    const file = await this.fileRepo.findByResourceAndRole(id, role);
+    if (!file) {
+      throw new NotFoundException(`${role} file for resource ${id} not found`);
+    }
+    const base = resource.originalFilename.replace(/\.[a-zA-Z0-9]{1,10}$/, '');
+    const stream = await this.storage.getStream(file.storagePath);
+    return {
+      stream,
+      mimeType: file.mimeType,
+      originalFilename: `${base}.${role}${file.extension ? `.${file.extension}` : ''}`,
+    };
+  }
+
+  /**
    * 获取缩略图可读流
    * 如果缩略图尚未生成，返回 null
    */

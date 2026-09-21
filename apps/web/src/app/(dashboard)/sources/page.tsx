@@ -112,6 +112,7 @@ export default function SourcesPage() {
   const [formCivitaiNsfw, setFormCivitaiNsfw] = useState(false);
   // GitHub 配置：仓库（owner/repo 或 github.com URL）
   const [formGithubRepo, setFormGithubRepo] = useState('');
+  const [formAllowSnapshot, setFormAllowSnapshot] = useState(false);
   const [formLimit, setFormLimit] = useState('100');
   const [formMaxPages, setFormMaxPages] = useState('1');
   const [formAutoSyncInterval, setFormAutoSyncInterval] = useState('off');
@@ -233,6 +234,7 @@ export default function SourcesPage() {
     setFormCivitaiPeriod('AllTime');
     setFormCivitaiNsfw(false);
     setFormGithubRepo('');
+    setFormAllowSnapshot(false);
     setFormLimit('100');
     setFormMaxPages('1');
     setFormAutoSyncInterval('off');
@@ -268,6 +270,9 @@ export default function SourcesPage() {
     setFormCivitaiPeriod('AllTime');
     setFormCivitaiNsfw(false);
     setFormGithubRepo('');
+    setFormAllowSnapshot(
+      (source.allowedModes ?? '').split(',').some((mode) => mode.trim() === 'archive_snapshot'),
+    );
     setFormLimit('100');
     setFormMaxPages('1');
     if (source.sourceType === 'civitai' && source.config) {
@@ -420,9 +425,13 @@ export default function SourcesPage() {
       ? {
           // Metadata-only sources do not download during sync, but a user may
           // explicitly review an item and mirror it later from its detail page.
-          allowedModes: metadataOnly
-            ? 'link_only,metadata_only,mirror_file'
-            : 'link_only,mirror_file',
+          allowedModes: [
+            ...(metadataOnly
+              ? ['link_only', 'metadata_only', 'mirror_file']
+              : ['link_only', 'mirror_file']),
+            // 页面快照只在用户显式点「生成快照」时抓取，来源需先放行该采集方式
+            ...(formAllowSnapshot ? ['archive_snapshot'] : []),
+          ].join(','),
           requiresReview: metadataOnly,
           // 与输入框 min=2/max=10 及后端 DTO 约束保持一致，避免 1 或超限值落库
           maxConcurrency: Math.min(10, Math.max(2, parseInt(formMaxConcurrency) || 4)),
@@ -983,6 +992,18 @@ export default function SourcesPage() {
                     />
                   </div>
                 </div>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={formAllowSnapshot}
+                    onChange={(e) => setFormAllowSnapshot(e.target.checked)}
+                    className="rounded border-gray-300"
+                  />
+                  允许生成页面快照
+                  <span className="text-muted-foreground">
+                    资源详情页可手动抓取页面 HTML（archive_snapshot），用于日后追溯来源内容
+                  </span>
+                </label>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-2">
                     <Label htmlFor="source-rate-limit" className="text-xs">

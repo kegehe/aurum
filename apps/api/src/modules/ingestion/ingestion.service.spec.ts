@@ -1,4 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { SafeUrlService } from '../../common/security/safe-url.service';
@@ -34,6 +35,7 @@ function createService(
     civitaiConnector?: object;
     githubConnector?: object;
     feedConnector?: object;
+    safeUrl?: object;
     storage?: object;
     fileRepo?: object;
     scheduler?: object;
@@ -45,7 +47,7 @@ function createService(
     (options.jobRepo ?? {}) as never,
     (options.sourceRepo ?? {}) as never,
     (options.resourceRepo ?? {}) as never,
-    new SafeUrlService(),
+    (options.safeUrl ?? new SafeUrlService()) as never,
     (options.linkMetadataConnector ?? {}) as never,
     (options.locatorHealthChecker ?? {}) as never,
     (options.civitaiConnector ?? {}) as never,
@@ -1610,5 +1612,286 @@ describe('IngestionService scheduleAutoSyncs', () => {
     expect(created).toBe(1);
     expect(jobRepo.create).toHaveBeenCalledTimes(1);
     expect((jobRepo.create.mock.calls[0][0] as { sourceId: string }).sourceId).toBe('s-good');
+  });
+});
+
+/** capture_page 测试共用的依赖 mock */
+function makeSnapshotMocks(
+  options: {
+    resource?: object | null;
+    existingSnapshot?: { id: string; storagePath: string } | null;
+    html?: string;
+  } = {},
+) {
+  const html = options.html ?? '<html><body>page</body></html>';
+  const resource =
+    options.resource === undefined
+      ? {
+          id: 'res-1',
+          deletedAt: null,
+          sourceId: null,
+          originalFilename: 'page.html',
+          locators: [
+            {
+              id: 'loc-page',
+              locatorType: 'page',
+              url: 'https://example.com/posts/1',
+              canonicalUrl: 'https://example.com/posts/one',
+              identityUrl: null,
+              isPrimary: true,
+            },
+          ],
+        }
+      : options.resource;
+
+  const prisma = {
+    resource: { findUnique: vi.fn().mockResolvedValue(resource) },
+    resourceFile: {
+      findUnique: vi.fn().mockResolvedValue(options.existingSnapshot ?? null),
+      upsert: vi.fn().mockResolvedValue({ id: 'file-snapshot' }),
+    },
+    resourceLocator: { update: vi.fn().mockResolvedValue({}) },
+    ingestionJob: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+  };
+
+  const storage = {
+    generateKey: vi.fn(
+      (role: string, hash: string, _variant?: string, ext?: string) =>
+        `${role}s/ab/cd/${hash}.${ext ?? 'bin'}`,
+    ),
+    put: vi.fn().mockResolvedValue(undefined),
+    delete: vi.fn().mockResolvedValue(undefined),
+  };
+  const sha256 = createHash('sha256').update(html, 'utf-8').digest('hex');
+  const safeUrl = {
+    normalize: vi.fn((value: string) => new URL(value)),
+    fetchHtml: vi.fn().mockResolvedValue({
+      url: 'https://example.com/posts/one',
+      status: 200,
+      body: html,
+    }),
+  };
+  return { prisma, storage, safeUrl, sha256, html };
+}
+
+function createSnapshotJobService(
+  mocks: ReturnType<typeof makeSnapshotMocks>,
+  jobId: string,
+  url = 'https://example.com/posts/one',
+) {
+  const jobRepo = {
+    claimNext: vi.fn().mockResolvedValue({
+      id: jobId,
+      leaseToken: `lease-${jobId}`,
+      jobType: IngestionJobType.capture_page,
+      request: JSON.stringify({ resourceId: 'res-1', url }),
+    }),
+    complete: vi.fn().mockResolvedValue(true),
+    fail: vi.fn().mockResolvedValue(true),
+  };
+  const service = createService({
+    prisma: mocks.prisma,
+    storage: mocks.storage,
+    safeUrl: mocks.safeUrl,
+    jobRepo,
+  });
+  return { service, jobRepo };
+}
+
+describe('IngestionService page snapshots', () => {
+  it('queues a capture_page job for the resource page URL', async () => {
+    const mocks = makeSnapshotMocks();
+    const jobRepo = {
+      create: vi.fn().mockImplementation(async (data) => ({ id: 'job-1', ...data })),
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null),
+    };
+    const service = createService({
+      prisma: mocks.prisma,
+      storage: mocks.storage,
+      safeUrl: mocks.safeUrl,
+      jobRepo,
+    });
+
+    const job = await service.createPageSnapshot('res-1');
+
+    expect(job).toMatchObject({ jobType: 'capture_page', resourceId: 'res-1' });
+    expect(JSON.parse((jobRepo.create.mock.calls[0][0] as { request: string }).request)).toEqual({
+      resourceId: 'res-1',
+      url: 'https://example.com/posts/one',
+    });
+  });
+
+  it('reuses the active snapshot job instead of queueing a second one', async () => {
+    const mocks = makeSnapshotMocks();
+    const active = { id: 'job-active', status: 'pending' };
+    const jobRepo = {
+      create: vi.fn(),
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(active),
+    };
+    const service = createService({
+      prisma: mocks.prisma,
+      storage: mocks.storage,
+      safeUrl: mocks.safeUrl,
+      jobRepo,
+    });
+
+    await expect(service.createPageSnapshot('res-1')).resolves.toBe(active);
+    expect(jobRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses to snapshot a deleted resource', async () => {
+    const mocks = makeSnapshotMocks({
+      resource: { id: 'r', deletedAt: new Date(), locators: [] },
+    });
+    const service = createService({
+      prisma: mocks.prisma,
+      storage: mocks.storage,
+      safeUrl: mocks.safeUrl,
+    });
+
+    await expect(service.createPageSnapshot('r')).rejects.toThrow(/deleted/);
+  });
+
+  it('refuses a resource without any usable URL', async () => {
+    const mocks = makeSnapshotMocks({
+      resource: { id: 'r', deletedAt: null, locators: [] },
+    });
+    const service = createService({
+      prisma: mocks.prisma,
+      storage: mocks.storage,
+      safeUrl: mocks.safeUrl,
+    });
+
+    await expect(service.createPageSnapshot('r')).rejects.toThrow(/page URL/);
+  });
+
+  it('enforces the archive_snapshot source policy for sourced resources', async () => {
+    const mocks = makeSnapshotMocks({
+      resource: {
+        id: 'res-1',
+        deletedAt: null,
+        sourceId: 'src-1',
+        locators: [
+          { id: 'l', locatorType: 'page', url: 'https://example.com/a', canonicalUrl: null },
+        ],
+      },
+    });
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'src-1',
+        enabled: true,
+        allowedModes: 'link_only,mirror_file',
+        requiresReview: false,
+      }),
+    });
+    const service = createService({
+      prisma: mocks.prisma,
+      sourceRepo,
+      storage: mocks.storage,
+      safeUrl: mocks.safeUrl,
+      jobRepo: { create: vi.fn(), findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null) },
+    });
+
+    await expect(service.createPageSnapshot('res-1')).rejects.toThrow(/archive_snapshot/);
+  });
+
+  it('stores the fetched HTML as a snapshot file and refreshes the page locator', async () => {
+    const mocks = makeSnapshotMocks();
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-1');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    const key = `snapshots/ab/cd/${mocks.sha256}.html`;
+    expect(mocks.storage.put).toHaveBeenCalledWith(key, Buffer.from(mocks.html, 'utf-8'));
+    expect(mocks.prisma.resourceFile.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          resourceId: 'res-1',
+          fileRole: 'snapshot',
+          storagePath: key,
+          mimeType: 'text/html',
+          extension: 'html',
+        }),
+      }),
+    );
+    expect(mocks.prisma.resourceLocator.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'loc-page' },
+        data: expect.objectContaining({ httpStatus: 200, contentType: 'text/html' }),
+      }),
+    );
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'snap-job-1',
+      'lease-snap-job-1',
+      'res-1',
+      expect.stringContaining('"status":"captured"'),
+    );
+  });
+
+  it('keeps the existing snapshot object when the page content is unchanged', async () => {
+    const sha = createHash('sha256')
+      .update('<html><body>page</body></html>', 'utf-8')
+      .digest('hex');
+    const mocks = makeSnapshotMocks({
+      existingSnapshot: { id: 'f-1', storagePath: `snapshots/ab/cd/${sha}.html` },
+    });
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-2');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(mocks.storage.put).not.toHaveBeenCalled();
+    expect(mocks.prisma.resourceFile.upsert).not.toHaveBeenCalled();
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'snap-job-2',
+      'lease-snap-job-2',
+      'res-1',
+      expect.stringContaining('"status":"unchanged"'),
+    );
+  });
+
+  it('replaces the record and removes the previous object when the page changed', async () => {
+    const mocks = makeSnapshotMocks({
+      existingSnapshot: { id: 'f-old', storagePath: 'snapshots/ab/cd/stale.html' },
+    });
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-3');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(mocks.storage.delete).toHaveBeenCalledWith('snapshots/ab/cd/stale.html');
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'snap-job-3',
+      'lease-snap-job-3',
+      'res-1',
+      expect.stringContaining('"status":"updated"'),
+    );
+  });
+
+  it('reports the offending URL when the page cannot be fetched', async () => {
+    const mocks = makeSnapshotMocks();
+    mocks.safeUrl.fetchHtml.mockRejectedValue(new Error('Remote HTML exceeds 2097152 byte limit'));
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-5');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(mocks.storage.put).not.toHaveBeenCalled();
+    const [errorCode, errorMessage] = jobRepo.fail.mock.calls[0].slice(2) as [string, string];
+    expect(errorCode).toBe('invalid_remote_resource');
+    expect(errorMessage).toContain('https://example.com/posts/one');
+    expect(errorMessage).toContain('byte limit');
+  });
+
+  it('fails the job when the fetched page is empty', async () => {
+    const mocks = makeSnapshotMocks({ html: '   ' });
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-4');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(mocks.storage.put).not.toHaveBeenCalled();
+    expect(jobRepo.fail).toHaveBeenCalled();
   });
 });

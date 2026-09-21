@@ -53,6 +53,11 @@ interface DownloadResourceRequest {
   resourceId: string;
 }
 
+interface CapturePageRequest {
+  resourceId: string;
+  url: string;
+}
+
 interface DownloadJobControl {
   id: string;
   leaseToken: string;
@@ -67,6 +72,11 @@ const SYNC_DOWNLOAD_CONCURRENCY_CAP = 20;
 const SYNC_MAX_PAGES_CAP = 50;
 /** 下载跟随重定向的最大跳数（与 SafeUrlService.fetchHtml 一致） */
 const DOWNLOAD_MAX_REDIRECTS = 5;
+/**
+ * 页面快照的响应体上限。现代新闻/社区站点的骨架 HTML 常在 0.5–2 MB，
+ * 上限太小会让快照对真实页面失效；再大则说明抓到的不是页面本身。
+ */
+const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
 
 class SyncJobCanceledError extends Error {}
 
@@ -212,7 +222,8 @@ export class IngestionService {
         job.jobType !== IngestionJobType.import_url &&
         job.jobType !== IngestionJobType.check_locator &&
         job.jobType !== IngestionJobType.sync_source &&
-        job.jobType !== IngestionJobType.download_file
+        job.jobType !== IngestionJobType.download_file &&
+        job.jobType !== IngestionJobType.capture_page
       ) {
         throw new BadRequestException(`Unsupported ingestion job type: ${job.jobType}`);
       }
@@ -251,6 +262,10 @@ export class IngestionService {
       }
       if (job.jobType === IngestionJobType.download_file) {
         await this.runDownloadResourceJob(job, leaseToken);
+        return true;
+      }
+      if (job.jobType === IngestionJobType.capture_page) {
+        await this.runCapturePageJob(job, leaseToken);
         return true;
       }
       const request = this.parseLinkImportRequest(job.request);
@@ -491,6 +506,84 @@ export class IngestionService {
   }
 
   /**
+   * 为资源创建页面快照任务（capture_page）
+   *
+   * 快照保存的是页面 HTML，用于日后追溯"当时抓到的是什么"。
+   * 点击即实施方案 §6.2 要求的显式确认；带来源的资源还额外受
+   * `archive_snapshot` 来源策略门禁约束。
+   */
+  async createPageSnapshot(resourceId: string) {
+    const resource = await this.prisma.resource.findUnique({
+      where: { id: resourceId },
+      include: { locators: true },
+    });
+    if (!resource) throw new NotFoundException(`Resource ${resourceId} not found`);
+    if (resource.deletedAt) throw new BadRequestException('Cannot snapshot a deleted resource');
+
+    const target = this.resolveSnapshotUrl(resource);
+    if (!target) throw new BadRequestException('Resource has no page URL to snapshot');
+    let parsed: URL;
+    try {
+      parsed = new URL(target);
+    } catch {
+      throw new BadRequestException(`Invalid snapshot URL: ${target}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new BadRequestException('Snapshot URL must use http or https');
+    }
+
+    if (resource.sourceId) {
+      await this.assertDownloadAllowed(resource.sourceId, AcquisitionMode.archive_snapshot, true);
+    }
+
+    const normalizedUrl = this.safeUrl.normalize(parsed.toString()).toString();
+    const request: CapturePageRequest = { resourceId, url: normalizedUrl };
+    const idempotencyKey = createHash('sha256')
+      .update(`${IngestionJobType.capture_page}:${resourceId}:${normalizedUrl}`)
+      .digest('hex');
+    const existing = await this.jobRepo.findActiveByIdempotencyKey(idempotencyKey);
+    if (existing) return existing;
+    try {
+      return await this.jobRepo.create({
+        sourceId: resource.sourceId ?? undefined,
+        resourceId,
+        jobType: IngestionJobType.capture_page,
+        request: JSON.stringify(request),
+        idempotencyKey,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const activeJob = await this.jobRepo.findActiveByIdempotencyKey(idempotencyKey);
+        if (activeJob) return activeJob;
+      }
+      throw error;
+    }
+  }
+
+  /** 快照目标地址：页面链接优先，其次 API / 下载链接的规范地址 */
+  private resolveSnapshotUrl(resource: {
+    locators: Array<{
+      locatorType: string;
+      url: string;
+      canonicalUrl?: string | null;
+      identityUrl?: string | null;
+      isPrimary?: boolean;
+    }>;
+  }): string | null {
+    for (const type of [LocatorType.page, LocatorType.api, LocatorType.download]) {
+      const locator = resource.locators.find((item) => item.locatorType === type);
+      const candidate = locator?.canonicalUrl || locator?.url;
+      if (candidate) return candidate;
+    }
+    // 少数历史资源只有 identityUrl（导入时未建页面 locator）
+    return (
+      resource.locators.find((item) => item.isPrimary)?.identityUrl ??
+      resource.locators[0]?.identityUrl ??
+      null
+    );
+  }
+
+  /**
    * 创建来源同步任务
    *
    * 校验来源存在、启用且支持同步操作，解析 Source.config 获取当前 cursor，
@@ -679,6 +772,127 @@ export class IngestionService {
     this.logger.log(`Mirrored remote resource ${resource.id}`);
   }
 
+  /**
+   * 执行页面快照任务
+   *
+   * 走 SafeUrlService.fetchHtml：DNS-pinning、逐跳重定向校验、内容类型必须是
+   * text/html、响应体限量。不执行 JavaScript、不抓子资源，因此快照是"服务端
+   * 返回的骨架 HTML"，与浏览器渲染结果不同（这是有意为之的轻量实现，
+   * 详见 docs/delivery-notes.md 的限制说明）。
+   *
+   * 同一资源只保留一份快照（resourceId + fileRole + variant 唯一）：内容未变时
+   * 复用已有对象，内容变化时写入新对象并清理旧对象。
+   */
+  private async runCapturePageJob(job: IngestionJob, leaseToken: string): Promise<void> {
+    const request = this.parseCapturePageRequest(job.request);
+    const resource = await this.prisma.resource.findUnique({
+      where: { id: request.resourceId },
+      include: { locators: true },
+    });
+    if (!resource) throw new NotFoundException(`Resource ${request.resourceId} not found`);
+    if (resource.deletedAt) throw new BadRequestException('Cannot snapshot a deleted resource');
+
+    let fetched;
+    try {
+      fetched = await this.safeUrl.fetchHtml(request.url, {}, SNAPSHOT_MAX_BYTES);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new BadRequestException(`Failed to snapshot ${request.url}: ${detail}`);
+    }
+    const html = fetched.body;
+    if (!html.trim()) throw new BadRequestException('Snapshot response was empty');
+    const sha256 = createHash('sha256').update(html, 'utf-8').digest('hex');
+    const storageKey = this.storage.generateKey(FileRole.snapshot, sha256, undefined, 'html');
+    const existing = await this.prisma.resourceFile.findUnique({
+      where: {
+        resourceId_fileRole_variant: {
+          resourceId: resource.id,
+          fileRole: FileRole.snapshot,
+          variant: '',
+        },
+      },
+      select: { id: true, storagePath: true },
+    });
+
+    await this.touchJob(job.id, leaseToken);
+    // 页面内容未变：只刷新页面 locator 的健康信息，不重复写对象与文件记录
+    if (existing && existing.storagePath === storageKey) {
+      await this.markLocatorSnapshotChecked(resource.locators, fetched.status);
+      await this.jobRepo.complete(
+        job.id,
+        leaseToken,
+        resource.id,
+        JSON.stringify({ status: 'unchanged', sha256, capturedUrl: fetched.url }),
+      );
+      return;
+    }
+
+    await this.storage.put(storageKey, Buffer.from(html, 'utf-8'));
+    const sizeBytes = BigInt(Buffer.byteLength(html, 'utf-8'));
+    await this.prisma.resourceFile.upsert({
+      where: {
+        resourceId_fileRole_variant: {
+          resourceId: resource.id,
+          fileRole: FileRole.snapshot,
+          variant: '',
+        },
+      },
+      create: {
+        resourceId: resource.id,
+        fileRole: FileRole.snapshot,
+        variant: '',
+        storagePath: storageKey,
+        mimeType: 'text/html',
+        extension: 'html',
+        sizeBytes,
+      },
+      update: {
+        storagePath: storageKey,
+        mimeType: 'text/html',
+        extension: 'html',
+        sizeBytes,
+      },
+    });
+    // 旧快照对象与新的 hash 不同才会残留，best-effort 清理
+    if (existing && existing.storagePath !== storageKey) {
+      await this.storage.delete(existing.storagePath).catch(() => undefined);
+    }
+    await this.markLocatorSnapshotChecked(resource.locators, fetched.status);
+
+    await this.jobRepo.complete(
+      job.id,
+      leaseToken,
+      resource.id,
+      JSON.stringify({
+        status: existing ? 'updated' : 'captured',
+        sha256,
+        sizeBytes: Number(sizeBytes),
+        capturedUrl: fetched.url,
+      }),
+    );
+    this.logger.log(`Captured page snapshot of ${fetched.url} for resource ${resource.id}`);
+  }
+
+  /** 快照成功即证明页面可达：把页面 locator 的健康信息一并刷新 */
+  private async markLocatorSnapshotChecked(
+    locators: Array<{ id: string; locatorType: string }>,
+    httpStatus: number,
+  ): Promise<void> {
+    const pageLocator = locators.find((item) => item.locatorType === LocatorType.page);
+    if (!pageLocator) return;
+    await this.prisma.resourceLocator
+      .update({
+        where: { id: pageLocator.id },
+        data: {
+          httpStatus,
+          lastCheckedAt: new Date(),
+          lastError: null,
+          contentType: 'text/html',
+        },
+      })
+      .catch(() => undefined);
+  }
+
   private parseLinkImportRequest(serialized: string): LinkImportRequest {
     const request: unknown = JSON.parse(serialized);
     if (
@@ -716,6 +930,19 @@ export class IngestionService {
       throw new BadRequestException('Invalid remote download request');
     }
     return request as DownloadResourceRequest;
+  }
+
+  private parseCapturePageRequest(serialized: string): CapturePageRequest {
+    const request: unknown = JSON.parse(serialized);
+    if (
+      !request ||
+      typeof request !== 'object' ||
+      typeof (request as { resourceId?: unknown }).resourceId !== 'string' ||
+      typeof (request as { url?: unknown }).url !== 'string'
+    ) {
+      throw new BadRequestException('Invalid page snapshot request');
+    }
+    return request as CapturePageRequest;
   }
 
   private async assertLinkImportAllowed(sourceId: string, targetUrl: string): Promise<void> {

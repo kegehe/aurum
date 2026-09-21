@@ -10,6 +10,9 @@
 - 外部资源接入 P1-P3：来源配置管理、链接导入、SSRF 防护、元数据提取。
 - 外部资源接入 P4：来源策略执行、链接健康检查、策略门禁。
 - Civitai / GitHub / RSS 连接器与来源定时自动同步（GitHub 走官方 REST API：分页游标、ETag/If-None-Match、速率限制报错、Release 资产导入；RSS 支持 RSS 2.0 / Atom / JSON Feed，抓取走 SSRF 防护并逐跳校验，按 enclosure → media:content → 页面链接选择下载地址）。
+- 页面快照（archive_snapshot 采集方式）：资源详情页手动触发 `capture_page` 任务，抓取页面 HTML 存为 `snapshot` 派生文件，受来源策略门禁约束。
+  - **有意采用轻量实现**：只用 `SafeUrlService.fetchHtml`（DNS-pinning、逐跳重定向校验、2 MB 上限、必须返回 text/html），不引入无头浏览器。因此快照是服务端返回的骨架 HTML，**不含 JavaScript 渲染结果、子资源与懒加载内容**；需要渲染态存档时再按实施方案 P7/M5 评估 Playwright（限定网络、配额、超时、独立临时目录）。
+  - 快照一律以 `attachment` 分发并带 `nosniff`；`/preview` 对 HTML/XHTML/XML 也降级为附件，避免不可信页面在本站源上执行脚本。
 - 样式实验室（AI 视觉样式分析 + 本地降级）与页面内 AI 配置管理。
 - AI 设计运营台（design 模块：文档/版本/候选/ChangeSet 原子发布/受控渲染）。
 - 已移除集合（collection）、标签（tag）、许可证（license）模块。
@@ -44,7 +47,7 @@ pnpm build:web
 
 最近一次验收结果（2026-09-21）：
 
-- `pnpm test`: 28 个测试文件，273 条测试通过。
+- `pnpm test`: 28 个测试文件，283 条测试通过。
 - `pnpm typecheck`: 通过。
 - `pnpm lint`: 通过（API 6 条 unused-vars 警告，无错误）。
 - `pnpm build:api`: 通过。

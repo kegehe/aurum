@@ -84,9 +84,7 @@ export function restoreResource(id: string): Promise<{ id: string; deletedAt: st
 }
 
 /** 批量从回收站恢复：一次请求恢复多个资源，并返回未恢复成功的资源 ID */
-export function batchRestoreResources(
-  resourceIds: string[],
-): Promise<{
+export function batchRestoreResources(resourceIds: string[]): Promise<{
   resourceIds: string[];
   restored: number;
   failed: number;
@@ -127,6 +125,11 @@ export function getResourceThumbnailUrl(id: string): string {
   return `${BASE_URL}/resources/${encodeURIComponent(id)}/thumbnail`;
 }
 
+/** 派生文件（页面快照等）下载地址 */
+export function getResourceFileDownloadUrl(id: string, role: string): string {
+  return `${BASE_URL}/resources/${encodeURIComponent(id)}/files/${encodeURIComponent(role)}/download`;
+}
+
 /** 手动触发资源定位器健康检查 */
 export function checkResourceLocators(id: string): Promise<{ jobs: unknown[]; message: string }> {
   return post(`/resources/${id}/locators/check`);
@@ -135,4 +138,9 @@ export function checkResourceLocators(id: string): Promise<{ jobs: unknown[]; me
 /** Queue a user-approved download of a remote resource into local storage. */
 export function mirrorRemoteResource(id: string): Promise<IngestionJobItem> {
   return post(`/resources/${id}/mirror`);
+}
+
+/** 抓取资源页面的 HTML 快照 */
+export function captureResourceSnapshot(id: string): Promise<IngestionJobItem> {
+  return post(`/resources/${id}/snapshot`);
 }
