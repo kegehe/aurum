@@ -9,6 +9,7 @@ import { LinkMetadataConnector } from './connectors/link-metadata.connector';
 import { LocatorHealthChecker } from './connectors/locator-health-checker';
 import { CivitaiConnector } from './connectors/civitai.connector';
 import { GitHubConnector } from './connectors/github.connector';
+import { FeedConnector } from './connectors/feed.connector';
 import { IngestionController } from './ingestion.controller';
 import { IngestionScheduler } from './ingestion.scheduler';
 import { IngestionService } from './ingestion.service';
@@ -26,6 +27,7 @@ import { IngestionJobRepository } from './repositories/ingestion-job.repository'
     LocatorHealthChecker,
     CivitaiConnector,
     GitHubConnector,
+    FeedConnector,
   ],
 })
 export class IngestionModule {}

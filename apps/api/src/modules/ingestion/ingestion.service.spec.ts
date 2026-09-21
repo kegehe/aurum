@@ -33,6 +33,7 @@ function createService(
     locatorHealthChecker?: object;
     civitaiConnector?: object;
     githubConnector?: object;
+    feedConnector?: object;
     storage?: object;
     fileRepo?: object;
     scheduler?: object;
@@ -49,6 +50,7 @@ function createService(
     (options.locatorHealthChecker ?? {}) as never,
     (options.civitaiConnector ?? {}) as never,
     (options.githubConnector ?? {}) as never,
+    (options.feedConnector ?? {}) as never,
     (options.storage ?? {}) as never,
     (options.fileRepo ?? {}) as never,
     (options.scheduler ?? { enqueue: vi.fn().mockResolvedValue(undefined) }) as never,
@@ -292,7 +294,10 @@ describe('IngestionService deleteJob', () => {
     jobRepo.findById.mockResolvedValueOnce({ id: 'pending', status: IngestionJobStatus.pending });
     await expect(service.deleteJob('pending')).rejects.toBeInstanceOf(BadRequestException);
 
-    jobRepo.findById.mockResolvedValueOnce({ id: 'running', status: IngestionJobStatus.processing });
+    jobRepo.findById.mockResolvedValueOnce({
+      id: 'running',
+      status: IngestionJobStatus.processing,
+    });
     await expect(service.deleteJob('running')).rejects.toBeInstanceOf(BadRequestException);
     expect(jobRepo.deleteTerminal).not.toHaveBeenCalled();
   });
@@ -1371,6 +1376,99 @@ describe('IngestionService sync_source', () => {
       config: JSON.stringify(changedConfig),
     });
     expect(jobRepo.complete).toHaveBeenCalled();
+  });
+
+  it('dispatches rss sources to the feed connector with baseUrl as feedUrl', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.resourceLocator.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      resourceId: 'existing',
+      id: 'loc-existing',
+    });
+
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-rss-1',
+        leaseToken: 'lease-rss-1',
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-rss', cursor: 'offset:50' }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn(),
+    };
+
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-rss',
+        name: 'RSS Source',
+        enabled: true,
+        sourceType: 'rss',
+        baseUrl: 'https://example.com/feed.xml',
+        config: JSON.stringify({ cursor: 'offset:50' }),
+      }),
+    });
+
+    const feedConnector = {
+      type: 'rss' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({ items: [], nextCursor: null, totalItems: 0 }),
+    };
+
+    const service = createService({ prisma, jobRepo, sourceRepo, feedConnector });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(feedConnector.sync).toHaveBeenCalledWith({
+      cursor: 'offset:50',
+      limit: undefined,
+      filters: { feedUrl: 'https://example.com/feed.xml' },
+    });
+    expect(jobRepo.complete).toHaveBeenCalled();
+  });
+
+  it('keeps an explicit feedUrl from config.filters over the source baseUrl', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.resourceLocator.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      resourceId: 'existing',
+      id: 'loc-existing',
+    });
+
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-rss-2',
+        leaseToken: 'lease-rss-2',
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-rss', cursor: null }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn(),
+    };
+
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-rss',
+        name: 'RSS Source',
+        enabled: true,
+        sourceType: 'rss',
+        baseUrl: 'https://example.com/feed.xml',
+        config: JSON.stringify({ filters: { feedUrl: 'https://cdn.example.com/atom.xml' } }),
+      }),
+    });
+
+    const feedConnector = {
+      type: 'rss' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({ items: [], nextCursor: null, totalItems: 0 }),
+    };
+
+    const service = createService({ prisma, jobRepo, sourceRepo, feedConnector });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(feedConnector.sync).toHaveBeenCalledWith({
+      cursor: null,
+      limit: undefined,
+      filters: { feedUrl: 'https://cdn.example.com/atom.xml' },
+    });
   });
 
   it('clamps sync maxPages to a safe ceiling', () => {

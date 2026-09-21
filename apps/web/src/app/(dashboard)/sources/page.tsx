@@ -41,6 +41,9 @@ import type { SourceItem, IngestionJobItem } from '@/lib/types';
 
 const SOURCE_TYPES = Object.entries(SOURCE_TYPE_LABELS);
 
+/** 有后台连接器、支持 sync_source 的来源类型 */
+const SYNC_SOURCE_TYPES = new Set(['civitai', 'github', 'rss']);
+
 /** 定时自动同步间隔选项（小时）；'off' = 关闭 */
 const AUTO_SYNC_INTERVAL_OPTIONS = [
   { value: 'off', label: '关闭' },
@@ -116,8 +119,8 @@ export default function SourcesPage() {
   // 可选的下载目录（已有来源目录 + 存储根下的自定义目录），供 datalist 建议
   const [availableDirectories, setAvailableDirectories] = useState<string[]>([]);
 
-  // 可同步的来源类型（有后台连接器支持 sync_source）：civitai / github
-  const isSyncSource = formSourceType === 'civitai' || formSourceType === 'github';
+  // 可同步的来源类型（有后台连接器支持 sync_source）：civitai / github / rss
+  const isSyncSource = SYNC_SOURCE_TYPES.has(formSourceType);
 
   // 同步状态
   const [activeSyncJobs, setActiveSyncJobs] = useState<Record<string, IngestionJobItem>>({});
@@ -258,7 +261,7 @@ export default function SourcesPage() {
     setFormDownloadInterval(
       String(Math.min(60000, Math.max(0, source.downloadIntervalMs ?? 1000))),
     );
-    // 获取方式：需要人工审核 = 仅保存元数据，否则自动下载图片
+    // 获取方式：需要人工审核 = 仅保存元数据，否则自动下载文件/图片
     setFormSyncMode(source.requiresReview ? 'metadata_only' : 'auto_download');
     // 重置 Civitai 配置，然后按需从 config 解析
     setFormCivitaiSort('Newest');
@@ -284,6 +287,15 @@ export default function SourcesPage() {
         const config = JSON.parse(source.config);
         setFormGithubRepo(typeof config.repo === 'string' ? config.repo : '');
         setFormLimit(String(config.limit ?? 30));
+        setFormMaxPages(String(config.maxPages ?? 1));
+      } catch {
+        // keep defaults
+      }
+    }
+    if (source.sourceType === 'rss' && source.config) {
+      try {
+        const config = JSON.parse(source.config);
+        setFormLimit(String(config.limit ?? 50));
         setFormMaxPages(String(config.maxPages ?? 1));
       } catch {
         // keep defaults
@@ -362,6 +374,26 @@ export default function SourcesPage() {
         ...(cursor && existingRepo === repo ? { cursor } : {}),
       });
     }
+    if (formSourceType === 'rss') {
+      // Feed 的游标是本次拉取结果里的切片偏移，Feed 地址（Base URL）一变就从头来
+      let cursor: string | undefined;
+      if (existingConfig) {
+        try {
+          const parsed = JSON.parse(existingConfig);
+          if (typeof parsed.cursor === 'string') cursor = parsed.cursor;
+        } catch {
+          // malformed config — ignore
+        }
+      }
+      const limit = Number.parseInt(formLimit, 10);
+      const maxPages = Number.parseInt(formMaxPages, 10);
+      const feedUrlChanged = (editingSource?.baseUrl ?? '') !== formBaseUrl.trim();
+      return JSON.stringify({
+        limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 200) : 50,
+        maxPages: Number.isFinite(maxPages) && maxPages > 0 ? maxPages : 1,
+        ...(cursor && !feedUrlChanged ? { cursor } : {}),
+      });
+    }
     return undefined;
   };
 
@@ -369,6 +401,10 @@ export default function SourcesPage() {
     if (!formName.trim() || !formSlug.trim()) return;
     if (formSourceType === 'github' && !formGithubRepo.trim()) {
       toast.error('GitHub 来源需要填写仓库（owner/repo）');
+      return;
+    }
+    if (formSourceType === 'rss' && !formBaseUrl.trim()) {
+      toast.error('RSS 来源需要在 Base URL 填写 Feed 地址');
       return;
     }
     // 仅同步型来源按表单重写 config；其它类型保留原有 config，
@@ -394,7 +430,7 @@ export default function SourcesPage() {
           downloadIntervalMs: Math.min(60000, Math.max(0, parseInt(formDownloadInterval) || 0)),
         }
       : {};
-    // 定时自动同步间隔（小时）：仅同步型来源（civitai/github）可配置。
+    // 定时自动同步间隔（小时）：仅同步型来源（civitai/github/rss）可配置。
     // 'off' = 关闭（创建时省略字段，更新时置 null 清除）。
     // 非同步来源不发送该字段：创建时省略、更新时保留原值，
     // 避免在创建对话框里把同步间隔残留写到不支持同步的来源上。
@@ -608,8 +644,8 @@ export default function SourcesPage() {
       header: '同步方式',
       className: 'w-28',
       render: (s) => {
-        // 同步仅 civitai 类型支持；其它来源显示占位符
-        if (s.sourceType !== 'civitai' && s.sourceType !== 'github') {
+        // 仅登记的同步型来源有获取方式；其它来源显示占位符
+        if (!SYNC_SOURCE_TYPES.has(s.sourceType)) {
           return (
             <Badge variant="outline" className="text-xs">
               —
@@ -744,7 +780,7 @@ export default function SourcesPage() {
       className: 'w-40 text-right',
       render: (s) => (
         <div className="flex justify-end gap-1">
-          {(s.sourceType === 'civitai' || s.sourceType === 'github') && activeSyncJobs[s.id] ? (
+          {SYNC_SOURCE_TYPES.has(s.sourceType) && activeSyncJobs[s.id] ? (
             <Button
               variant="ghost"
               size="sm"
@@ -756,7 +792,7 @@ export default function SourcesPage() {
               <Square className="h-3.5 w-3.5" />
             </Button>
           ) : (
-            (s.sourceType === 'civitai' || s.sourceType === 'github') && (
+            SYNC_SOURCE_TYPES.has(s.sourceType) && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -867,16 +903,29 @@ export default function SourcesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="source-base-url">Base URL</Label>
+                <Label htmlFor="source-base-url">
+                  {formSourceType === 'rss' ? 'Feed 地址' : 'Base URL'}
+                  {formSourceType === 'rss' && ' *'}
+                </Label>
                 <Input
                   id="source-base-url"
                   value={formBaseUrl}
                   onChange={(e) => setFormBaseUrl(e.target.value)}
-                  placeholder="https://example.com"
+                  placeholder={
+                    formSourceType === 'rss'
+                      ? 'https://example.com/feed.xml'
+                      : 'https://example.com'
+                  }
                 />
+                {formSourceType === 'rss' && (
+                  <p className="text-xs text-muted-foreground">
+                    支持 RSS 2.0 / Atom / JSON Feed；条目带 enclosure 或 media:content
+                    时下载附件，否则只记录页面链接。
+                  </p>
+                )}
               </div>
             </div>
-            {/* 同步来源（civitai / github）设置 */}
+            {/* 同步来源（civitai / github / rss）设置 */}
             {isSyncSource && (
               <div className="space-y-3 border rounded-md p-3">
                 <Label className="text-sm font-medium">同步设置</Label>
@@ -913,7 +962,7 @@ export default function SourcesPage() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="auto_download">
-                          {formSourceType === 'github' ? '自动下载文件' : '自动下载图片'}
+                          {formSourceType === 'civitai' ? '自动下载图片' : '自动下载文件'}
                         </SelectItem>
                         <SelectItem value="metadata_only">仅保存元数据</SelectItem>
                       </SelectContent>
@@ -1084,7 +1133,9 @@ export default function SourcesPage() {
                       placeholder={
                         formSourceType === 'github'
                           ? '如 github/owner-repo'
-                          : '如 civitai/my-images'
+                          : formSourceType === 'rss'
+                            ? '如 rss/my-feed'
+                            : '如 civitai/my-images'
                       }
                       list="source-download-directory-options"
                       maxLength={200}

@@ -31,6 +31,7 @@ import { LinkMetadataConnector } from './connectors/link-metadata.connector';
 import { LocatorHealthChecker } from './connectors/locator-health-checker';
 import { CivitaiConnector } from './connectors/civitai.connector';
 import { GitHubConnector } from './connectors/github.connector';
+import { FeedConnector } from './connectors/feed.connector';
 import { ResourceConnector } from './connectors/resource-connector.interface';
 import { CreateLinkImportDto } from './dto/create-link-import.dto';
 import { QueryIngestionJobsDto } from './dto/query-ingestion-jobs.dto';
@@ -89,6 +90,7 @@ export class IngestionService {
     private readonly locatorHealthChecker: LocatorHealthChecker,
     private readonly civitaiConnector: CivitaiConnector,
     private readonly githubConnector: GitHubConnector,
+    private readonly feedConnector: FeedConnector,
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
     private readonly fileRepo: ResourceFileRepository,
     @Inject(JOB_SCHEDULER) private readonly scheduler: IJobScheduler,
@@ -895,6 +897,8 @@ export class IngestionService {
     if (filters.nsfw === undefined && config.nsfw !== undefined) filters.nsfw = config.nsfw;
     // GitHub 等连接器的仓库定位同样支持顶层 repo
     if (!filters.repo && config.repo) filters.repo = config.repo;
+    // RSS 连接的 Feed 地址直接取来源的 baseUrl（站点的 feed 链接）
+    if (!filters.feedUrl && source.baseUrl) filters.feedUrl = source.baseUrl;
 
     // 每次同步最多连续抓取多少页（config.maxPages，默认 1），每页最多 limit 条。
     // 页间通过 cursor 续传，抓完的页数越多耗时越长（后台执行，任务心跳保持）。
@@ -1785,6 +1789,7 @@ export class IngestionService {
   private getConnectorForSourceType(sourceType: string): ResourceConnector | null {
     if (sourceType === 'civitai') return this.civitaiConnector;
     if (sourceType === 'github') return this.githubConnector;
+    if (sourceType === 'rss') return this.feedConnector;
     return null;
   }
 
