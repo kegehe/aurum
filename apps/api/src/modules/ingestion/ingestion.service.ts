@@ -2,13 +2,8 @@ import { BadRequestException, Inject, Injectable, Logger, NotFoundException } fr
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { IngestionJob } from '@prisma/client';
-import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream } from 'node:fs';
-import { unlink } from 'node:fs/promises';
-import * as os from 'node:os';
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
-import fileType from 'file-type';
-import { Dispatcher, fetch } from 'undici';
 import {
   AcquisitionMode,
   FileRole,
@@ -23,7 +18,6 @@ import { SafeUrlService } from '../../common/security/safe-url.service';
 import { IStorageService, STORAGE_SERVICE } from '../storage/interfaces/storage-service.interface';
 import { ResourceFileRepository } from '../file/repositories/resource-file.repository';
 import { JOB_SCHEDULER, IJobScheduler } from '../processing/interfaces/job-scheduler.interface';
-import { inferResourceType } from '../upload/resource-type.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
 import { SourceRepository } from '../source/repositories/source.repository';
@@ -32,6 +26,7 @@ import { LocatorHealthChecker } from './connectors/locator-health-checker';
 import { CivitaiConnector } from './connectors/civitai.connector';
 import { GitHubConnector } from './connectors/github.connector';
 import { FeedConnector } from './connectors/feed.connector';
+import { DirectDownloadConnector } from './connectors/direct-download.connector';
 import { ResourceConnector } from './connectors/resource-connector.interface';
 import { CreateLinkImportDto } from './dto/create-link-import.dto';
 import { QueryIngestionJobsDto } from './dto/query-ingestion-jobs.dto';
@@ -70,8 +65,8 @@ const SYNC_DOWNLOAD_CONCURRENCY = 4;
 const SYNC_DOWNLOAD_CONCURRENCY_CAP = 20;
 /** 单次来源同步最多连续抓取的页数（上限，防止误配导致大量下载） */
 const SYNC_MAX_PAGES_CAP = 50;
-/** 下载跟随重定向的最大跳数（与 SafeUrlService.fetchHtml 一致） */
-const DOWNLOAD_MAX_REDIRECTS = 5;
+/** 单个远端文件的整体下载超时（DirectDownloadConnector 内部另有读写超时） */
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 180_000;
 /**
  * 页面快照的响应体上限。现代新闻/社区站点的骨架 HTML 常在 0.5–2 MB，
  * 上限太小会让快照对真实页面失效；再大则说明抓到的不是页面本身。
@@ -101,6 +96,7 @@ export class IngestionService {
     private readonly civitaiConnector: CivitaiConnector,
     private readonly githubConnector: GitHubConnector,
     private readonly feedConnector: FeedConnector,
+    private readonly directDownload: DirectDownloadConnector,
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
     private readonly fileRepo: ResourceFileRepository,
     @Inject(JOB_SCHEDULER) private readonly scheduler: IJobScheduler,
@@ -1350,54 +1346,12 @@ export class IngestionService {
   }
 
   /**
-   * 带 SSRF 校验的下载请求：手动跟随重定向，并在每一跳校验目标主机为公网地址。
-   *
-   * 代理模式下 dispatcher 不做 DNS-pinning（连接由本地代理发出），
-   * 若依赖 undici 的自动重定向跟随，重定向目标（可能指向内网）将绕过公网校验。
-   * 与 SafeUrlService.fetchHtml / LocatorHealthChecker 的逐跳校验保持一致。
-   *
-   * 使用 `redirect: 'manual'`，仅在收到 3xx 时按 Location 手动跳转；
-   * 超过 DOWNLOAD_MAX_REDIRECTS 跳或 Location 缺失时抛错。
-   */
-  private async fetchWithSsfrRedirectCheck(
-    url: string,
-    dispatcher: Dispatcher,
-    signal: AbortSignal,
-    headers: Record<string, string>,
-  ): Promise<Response> {
-    let current = url;
-    for (let redirects = 0; redirects <= DOWNLOAD_MAX_REDIRECTS; redirects++) {
-      const target = new URL(current);
-      // 重定向 Location 理论上可指向任意协议；undici fetch 仅支持 http/https，
-      // 这里显式拦截避免把 file:// 等怪协议一路带到 fetch 才报错。
-      if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-        throw new Error(`Unsupported protocol in download URL: ${target.protocol}`);
-      }
-      await this.safeUrl.resolvePublicHost(target.hostname);
-      const response = await fetch(current, {
-        dispatcher,
-        signal,
-        redirect: 'manual',
-        headers,
-      });
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        await response.body?.cancel().catch(() => undefined);
-        if (!location) throw new Error('Redirect response has no location');
-        current = new URL(location, current).toString();
-        continue;
-      }
-      return response;
-    }
-    throw new Error(`Too many redirects (maximum ${DOWNLOAD_MAX_REDIRECTS})`);
-  }
-
-  /**
    * 下载远端文件并写入 ResourceFile(original)
    *
-   * 流程：流式下载到临时文件（带大小上限）→ 计算 SHA-256 → 魔数识别 MIME →
-   * 写入存储 → 事务更新 Resource + 建 ResourceFile + 更新 locator → 入队元数据检测。
-   * 任何失败都会清理临时文件并更新 locator.lastError。
+   * 取文件本身交给 DirectDownloadConnector（SSRF 逐跳校验、限量流式落盘、
+   * 魔数识别 MIME、写正式存储）；这里只负责任务控制与资源记录：取消/租约心跳、
+   * 事务更新 Resource + 建原文件记录 + 更新 locator、入队元数据检测。
+   * 下载失败记录到 locator.lastError 并返回 'failed'，不中断整批同步。
    */
   private async downloadRemoteFile(
     resourceId: string,
@@ -1406,26 +1360,14 @@ export class IngestionService {
     jobControl?: DownloadJobControl,
     downloadDirectory?: string | null,
   ): Promise<'downloaded' | 'failed'> {
-    const maxBytes = this.config.get<number>('download.maxFileSizeMB')! * 1024 * 1024;
-    const tempPath = path.join(os.tmpdir(), `aurum-dl-${randomUUID()}`);
-    let downloadHost: string;
-    try {
-      downloadHost = new URL(remote.url).hostname;
-    } catch {
-      await this.markLocatorError(locatorId, 'Invalid download URL');
-      return 'failed';
-    }
-    const dispatcher = this.safeUrl.createSafeDispatcher(
-      { headersTimeout: 30_000, bodyTimeout: 120_000 },
-      downloadHost,
-    );
-    let downloadedBytes = 0;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 180_000);
+    const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TOTAL_TIMEOUT_MS);
     let canceled = false;
     const assertJobActive = async () => {
       if (jobControl) await this.assertSyncJobActive(jobControl.id, jobControl.leaseToken);
     };
+    // 每 500ms 探测一次任务是否已取消：取消时立即中止 fetch，
+    // 否则要等到下一次读流才会发现。
     const cancellationPoll = jobControl
       ? setInterval(() => {
           void assertJobActive().catch((error) => {
@@ -1438,138 +1380,31 @@ export class IngestionService {
       : null;
 
     try {
-      await assertJobActive();
-      // 带 SSRF 校验的请求：代理模式下 dispatcher 不做 DNS-pinning，
-      // 重定向的每一跳都在应用层校验目标主机为公网地址（见 fetchWithSsfrRedirectCheck）
-      const response = await this.fetchWithSsfrRedirectCheck(
-        remote.url,
-        dispatcher,
-        controller.signal,
-        {
-          'user-agent': 'aurum-downloader/0.1',
-          accept: '*/*',
-        },
-      );
-
-      if (!response.ok) {
-        await this.markLocatorError(locatorId, `HTTP ${response.status}`);
-        this.logger.warn(`Download ${remote.externalId} failed: HTTP ${response.status}`);
-        return 'failed';
-      }
-
-      const responseMimeType = response.headers
-        .get('content-type')
-        ?.split(';', 1)[0]
-        ?.trim()
-        .toLowerCase();
-      if (this.isClearlyNonFileMimeType(responseMimeType, remote.resourceType)) {
-        await this.markLocatorError(
-          locatorId,
-          `Unexpected response content type: ${responseMimeType}`,
-        );
-        await response.body?.cancel().catch(() => undefined);
-        return 'failed';
-      }
-
-      const declaredLength = Number(response.headers.get('content-length') ?? 0);
-      if (declaredLength > maxBytes) {
-        await this.markLocatorError(
-          locatorId,
-          `File too large: ${declaredLength} bytes > ${maxBytes} limit`,
-        );
-        await response.body?.cancel().catch(() => undefined);
-        return 'failed';
-      }
-
-      if (!response.body) {
-        await this.markLocatorError(locatorId, 'Empty response body');
-        return 'failed';
-      }
-
-      // 流式写入临时文件并计算 SHA-256，避免大文件读入内存
-      const hash = createHash('sha256');
-      const writeStream = createWriteStream(tempPath);
-      // 挂上错误监听：写入流（临时目录不可写/磁盘满等）出错时通过变量传播，
-      // 避免无监听导致 'error' 事件未处理而崩溃进程。
-      // 用共享的 errorWait 唤醒背压等待，而不是每次等待都加 once('error') 监听器，
-      // 避免大文件多次背压时监听器累积触发 MaxListenersExceededWarning。
-      let writeStreamError: Error | null = null;
-      let notifyErrorWait: (() => void) | null = null;
-      const errorWait = new Promise<void>((resolve) => {
-        notifyErrorWait = resolve;
+      const downloaded = await this.directDownload.download({
+        url: remote.url,
+        expectedResourceType: remote.resourceType,
+        declaredMimeType: remote.mimeType ?? null,
+        downloadDirectory,
+        signal: controller.signal,
+        onCheckpoint: assertJobActive,
       });
-      writeStream.on('error', (err) => {
-        writeStreamError = err;
-        notifyErrorWait?.();
-      });
-      const reader = response.body.getReader();
-      try {
-        while (true) {
-          await assertJobActive();
-          const { done, value } = await reader.read();
-          if (done) break;
-          await assertJobActive();
-          if (writeStreamError) throw writeStreamError;
-          downloadedBytes += value.byteLength;
-          if (downloadedBytes > maxBytes) {
-            throw new Error(`File exceeds ${maxBytes} byte limit`);
-          }
-          hash.update(value);
-          if (!writeStream.write(value)) {
-            // 背压：等待 drain；若写入流出错，errorWait 会立即唤醒并抛错
-            await Promise.race([
-              new Promise<void>((resolve) => writeStream.once('drain', resolve)),
-              errorWait,
-            ]);
-            if (writeStreamError) throw writeStreamError;
-          }
-        }
-      } finally {
-        await new Promise<void>((resolve, reject) => {
-          writeStream.end((err?: Error) => (err ? reject(err) : resolve()));
-        });
-      }
-      if (writeStreamError) throw writeStreamError;
 
-      if (downloadedBytes === 0) {
-        throw new Error('Empty download (0 bytes)');
-      }
-
-      const sha256 = hash.digest('hex');
-
-      // 魔数识别真实 MIME（不信任远端 Content-Type）
-      const detected = await fileType.fromFile(tempPath).catch(() => null);
-      if (!detected && this.requiresMediaContent(remote.resourceType)) {
-        throw new Error(
-          `Downloaded content is not a recognizable ${remote.resourceType} file` +
-            (responseMimeType ? ` (response type: ${responseMimeType})` : ''),
-        );
-      }
-      const mimeType = detected?.mime ?? remote.mimeType ?? 'application/octet-stream';
-      const ext = detected?.ext ?? this.extensionFromUrl(remote.url) ?? 'bin';
-      const resourceType = inferResourceType(mimeType, ext);
-
-      // 写入正式存储；若来源配置了下载目录，则在角色目录前加上该自定义子目录前缀
-      let storageKey = this.storage.generateKey(FileRole.original, sha256, undefined, ext);
-      if (downloadDirectory && downloadDirectory.length > 0) {
-        storageKey = `${downloadDirectory}/${storageKey}`;
-      }
-      await assertJobActive();
-      await this.storage.put(storageKey, createReadStream(tempPath));
-      await assertJobActive();
-
-      // 事务：更新资源元数据 + 建原文件记录 + 更新 locator + 查重
+      // 事务：更新资源元数据 + 建原文件记录 + 更新 locator + 按 sha256 查重
       await this.commitDownloadedFile({
         resourceId,
         locatorId,
         remote,
-        sha256,
-        mimeType,
-        extension: ext,
-        resourceType,
-        sizeBytes: BigInt(downloadedBytes),
-        storageKey,
-        originalFilename: this.remoteOriginalFilename(remote.url, remote.externalId, ext),
+        sha256: downloaded.sha256,
+        mimeType: downloaded.mimeType,
+        extension: downloaded.extension,
+        resourceType: downloaded.resourceType,
+        sizeBytes: BigInt(downloaded.sizeBytes),
+        storageKey: downloaded.storageKey,
+        originalFilename: this.remoteOriginalFilename(
+          remote.url,
+          remote.externalId,
+          downloaded.extension,
+        ),
         completion: jobControl?.completeOnCommit
           ? {
               id: jobControl.id,
@@ -1599,8 +1434,6 @@ export class IngestionService {
     } finally {
       clearTimeout(timeout);
       if (cancellationPoll) clearInterval(cancellationPoll);
-      await dispatcher.close().catch(() => undefined);
-      await unlink(tempPath).catch(() => undefined);
     }
   }
 
@@ -1717,17 +1550,6 @@ export class IngestionService {
     return file !== null;
   }
 
-  /** 从 URL 路径推断扩展名（小写，仅限字母数字） */
-  private extensionFromUrl(url: string): string | null {
-    try {
-      const pathname = new URL(url).pathname;
-      const ext = pathname.split('.').pop()?.toLowerCase() ?? '';
-      return /^[a-z0-9]{1,10}$/.test(ext) ? ext : null;
-    } catch {
-      return null;
-    }
-  }
-
   private remoteOriginalFilename(url: string, externalId: string, extension: string): string {
     let name = '';
     try {
@@ -1743,23 +1565,6 @@ export class IngestionService {
       .replace(/[^a-zA-Z0-9._-]+/g, '-')
       .replace(/^-+|-+$/g, '');
     return `${normalized || `remote-${fallback || 'file'}`}.${extension}`;
-  }
-
-  private isClearlyNonFileMimeType(mimeType: string | undefined, resourceType: string): boolean {
-    if (!mimeType) return false;
-    if (
-      mimeType === 'text/html' ||
-      mimeType === 'application/json' ||
-      mimeType === 'application/xml' ||
-      mimeType === 'text/xml'
-    ) {
-      return true;
-    }
-    return mimeType.startsWith('text/') && resourceType !== ResourceType.text;
-  }
-
-  private requiresMediaContent(resourceType: string): boolean {
-    return resourceType === ResourceType.image || resourceType === ResourceType.video;
   }
 
   /**

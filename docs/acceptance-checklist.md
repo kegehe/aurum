@@ -46,6 +46,7 @@ pnpm test
   - 页面快照（capture_page 任务：archive_snapshot 策略门禁、HTML 存为 snapshot 派生文件、内容未变复用对象、变化时替换并清理旧对象、页面 locator 健康信息回写、超出大小上限的可读报错）。
   - 派生文件下载端点的角色白名单与 attachment + nosniff 分发（含 /preview 对 HTML/XML 的内联降级防护）。
   - LinkMetadata 提取、LocatorHealthChecker 健康探测调度。
+  - 直连下载连接器（重定向逐跳公网校验、file:// 等协议拦截、声明长度与实际字节两级限量、魔数 MIME 与回退、HTML 响应拒绝、下载目录前缀、检查点回调与取消传播、失败清理）。
   - 导入任务仓储与 IngestionScheduler。
 - 样式实验室：
   - 样式分析服务、Claude Vision 客户端（mock）、本地降级分析、CSS Tokens 导出。

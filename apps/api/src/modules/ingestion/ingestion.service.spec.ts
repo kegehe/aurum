@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { SafeUrlService } from '../../common/security/safe-url.service';
+import { DirectDownloadConnector } from './connectors/direct-download.connector';
 import { IngestionJobStatus, IngestionJobType } from '../../common/constants/enums';
 import { IngestionService } from './ingestion.service';
 
@@ -35,6 +36,7 @@ function createService(
     civitaiConnector?: object;
     githubConnector?: object;
     feedConnector?: object;
+    directDownload?: object;
     safeUrl?: object;
     storage?: object;
     fileRepo?: object;
@@ -42,21 +44,26 @@ function createService(
     config?: object;
   } = {},
 ) {
+  const safeUrl = (options.safeUrl ?? new SafeUrlService()) as never;
+  const storage = (options.storage ?? {}) as never;
+  const config = (options.config ?? { get: vi.fn().mockReturnValue(100) }) as never;
   const service = new IngestionService(
     (options.prisma ?? {}) as never,
     (options.jobRepo ?? {}) as never,
     (options.sourceRepo ?? {}) as never,
     (options.resourceRepo ?? {}) as never,
-    (options.safeUrl ?? new SafeUrlService()) as never,
+    safeUrl,
     (options.linkMetadataConnector ?? {}) as never,
     (options.locatorHealthChecker ?? {}) as never,
     (options.civitaiConnector ?? {}) as never,
     (options.githubConnector ?? {}) as never,
     (options.feedConnector ?? {}) as never,
-    (options.storage ?? {}) as never,
+    // 下载路径用真实连接器：既有测试通过 mock undici/file-type 覆盖端到端行为
+    (options.directDownload ?? new DirectDownloadConnector(safeUrl, storage, config)) as never,
+    storage,
     (options.fileRepo ?? {}) as never,
     (options.scheduler ?? { enqueue: vi.fn().mockResolvedValue(undefined) }) as never,
-    (options.config ?? { get: vi.fn().mockReturnValue(100) }) as never,
+    config,
   );
   return service;
 }
