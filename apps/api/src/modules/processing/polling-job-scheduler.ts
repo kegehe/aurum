@@ -30,6 +30,7 @@ export class PollingJobScheduler implements IJobScheduler, OnModuleInit, OnModul
   private readonly pollIntervalMs: number;
   private readonly concurrency: number;
   private readonly maxRetry: number;
+  private readonly processingEnabled: boolean;
 
   constructor(
     private readonly jobRepo: ProcessingJobRepository,
@@ -39,9 +40,15 @@ export class PollingJobScheduler implements IJobScheduler, OnModuleInit, OnModul
     this.pollIntervalMs = config.get<number>('worker.pollIntervalMs')!;
     this.concurrency = config.get<number>('worker.concurrency')!;
     this.maxRetry = config.get<number>('worker.maxRetry')!;
+    this.processingEnabled = config.get<boolean>('execution.processingEnabled') ?? true;
   }
 
   async onModuleInit(): Promise<void> {
+    if (!this.processingEnabled) {
+      // 独立 Worker 模式下本进程只入队，不认领任务（stale 恢复也由 Worker 负责）
+      this.logger.log('处理任务执行已关闭（EXECUTION_ENABLED=false），本进程只入队');
+      return;
+    }
     // 恢复 stuck 任务
     await this.resetStaleProcessingJobs();
     this.start();
@@ -85,7 +92,7 @@ export class PollingJobScheduler implements IJobScheduler, OnModuleInit, OnModul
   }
 
   start(): void {
-    if (this.running) return;
+    if (!this.processingEnabled || this.running) return;
     this.running = true;
     this.pollTimer = setInterval(() => this.poll(), this.pollIntervalMs);
     this.logger.log(

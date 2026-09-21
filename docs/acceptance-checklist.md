@@ -55,6 +55,7 @@ pnpm test
 - 设计运营台：
   - 设计文档/版本/候选/ChangeSet 原子发布、schema 校验、内部调用守卫、URL 参考治理、受控渲染快照与视觉 diff。
 - 处理任务与临时文件清理工具。
+- 进程分工开关（`EXECUTION_ENABLED` 关闭处理执行、`INGESTION_ENABLED` 关闭摄入调度）与 SQLite WAL / busy_timeout 初始化。
 
 ## 静态验收
 

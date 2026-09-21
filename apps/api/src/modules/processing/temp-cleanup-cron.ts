@@ -18,6 +18,8 @@ export class TempCleanupCron {
 
   @Cron(CronExpression.EVERY_HOUR)
   async handleCleanup(): Promise<void> {
+    // 临时目录由执行任务的进程负责清理；API 让位给独立 Worker 时避免两进程同时删
+    if (!(this.config.get<boolean>('execution.processingEnabled') ?? true)) return;
     const root = this.config.get<string>('storage.root')!;
     const tempDir = path.resolve(root, 'temp');
     const ttl = this.config.get<number>('upload.tempTtlSeconds')! * 1000;

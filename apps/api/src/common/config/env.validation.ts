@@ -13,6 +13,9 @@ export const envValidationSchema = Joi.object({
   MAX_UPLOAD_SIZE_MB: Joi.number().integer().min(1).default(1024),
   MAX_UPLOAD_TOTAL_SIZE_MB: Joi.number().integer().min(1).default(5120),
   TEMP_FILE_TTL_SECONDS: Joi.number().integer().min(60).default(3600),
+  // 本进程是否执行处理任务 / 是否运行摄入调度；拆独立 Worker 时按进程关闭其一
+  EXECUTION_ENABLED: Joi.boolean().truthy('true').falsy('false').default(true),
+  INGESTION_ENABLED: Joi.boolean().truthy('true').falsy('false').default(true),
   WORKER_POLL_INTERVAL_MS: Joi.number().integer().min(100).default(5000),
   WORKER_MAX_RETRY: Joi.number().integer().min(0).max(10).default(3),
   WORKER_CONCURRENCY: Joi.number().integer().min(1).max(10).default(2),

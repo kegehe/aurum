@@ -1,3 +1,8 @@
+/** 开关型环境变量：未设置视为开启，仅显式写 false/0/off/no 时关闭 */
+function isDisabled(value: string | undefined): boolean {
+  return ['false', '0', 'off', 'no'].includes((value ?? '').trim().toLowerCase());
+}
+
 /**
  * 应用配置：从环境变量读取并解析为结构化配置
  */
@@ -20,6 +25,15 @@ export default () => ({
     pollIntervalMs: parseInt(process.env.WORKER_POLL_INTERVAL_MS || '5000', 10),
     maxRetry: parseInt(process.env.WORKER_MAX_RETRY || '3', 10),
     concurrency: parseInt(process.env.WORKER_CONCURRENCY || '2', 10),
+  },
+  /**
+   * 本进程承担哪部分工作。单进程部署（默认）两者皆 true；
+   * 拆出独立 Worker 时：API 设 EXECUTION_ENABLED=false（只入队），
+   * Worker 设 INGESTION_ENABLED=false（只跑处理任务）。
+   */
+  execution: {
+    processingEnabled: !isDisabled(process.env.EXECUTION_ENABLED),
+    ingestionEnabled: !isDisabled(process.env.INGESTION_ENABLED),
   },
   ingestion: {
     pollIntervalMs: parseInt(process.env.INGESTION_POLL_INTERVAL_MS || '3000', 10),

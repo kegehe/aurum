@@ -26,6 +26,11 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit() {
+    if ((this.config.get<boolean>('execution.ingestionEnabled') ?? true) === false) {
+      // 独立 Worker 模式：摄入调度仍由 API 承担，本进程不轮询，避免两进程并发同步
+      this.logger.log('摄入调度已关闭（INGESTION_ENABLED=false）');
+      return;
+    }
     this.staleJobTimeoutMs =
       this.config.get<number>('ingestion.staleJobTimeoutMs') ?? this.staleJobTimeoutMs;
     const interval = this.config.get<number>('ingestion.pollIntervalMs') ?? 3000;

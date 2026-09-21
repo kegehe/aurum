@@ -15,6 +15,7 @@
   - 快照一律以 `attachment` 分发并带 `nosniff`；`/preview` 对 HTML/XHTML/XML 也降级为附件，避免不可信页面在本站源上执行脚本。
 - 样式实验室（AI 视觉样式分析 + 本地降级）与页面内 AI 配置管理。
 - AI 设计运营台（design 模块：文档/版本/候选/ChangeSet 原子发布/受控渲染）。
+- 处理任务可拆独立 Worker 进程（`@aurum/worker` 转发 `@aurum/api` 的 worker 入口）：环境变量决定本进程是否执行处理任务 / 是否跑摄入调度，默认保持单进程全开。
 - 直连下载抽成独立连接器 `DirectDownloadConnector`（SSRF 逐跳重定向校验、限量流式落盘、SHA-256、魔数 MIME 识别、写正式存储），IngestionService 只保留任务控制与资源记录；来源同步 / 单资源镜像 / 后续批量下载与独立 Worker 共用同一份实现。
 - 已移除集合（collection）、标签（tag）、许可证（license）模块。
 - 已补充测试与验收文档。
@@ -35,6 +36,20 @@ pnpm dev
 - Web: `http://localhost:3001`
 - API: `http://localhost:3000/api`
 - Health: `http://localhost:3000/api/health`
+
+默认单进程即可跑完全部工作（API 进程内轮询并执行处理任务）。要把处理任务放到独立进程：
+
+```bash
+# 终端 1：API 只入队，不执行处理任务
+EXECUTION_ENABLED=false pnpm dev:api
+# 终端 2：Worker（自动关掉摄入调度，只跑处理任务）
+pnpm dev:worker
+```
+
+两进程共享同一个 SQLite 库文件，因此 PrismaService 启动时会开 `journal_mode=WAL` 与
+`busy_timeout=5000`；`STORAGE_ROOT` 与 `.env` 按 `apps/api` 目录解析，Worker 也必须以该目录
+为工作目录启动（`@aurum/worker` 的 start 脚本已如此处理）。摄入调度（来源同步、下载）默认
+仍留在 API 进程：其单飞标志与租约心跳只在单进程内成立，两进程同时轮询会打破该假设。
 
 ## 验收命令
 
@@ -57,6 +72,7 @@ pnpm build:web
 ## P4 新增功能
 
 ### 后端
+
 - **LocatorHealthChecker**：HEAD/GET 探测 URL 可用性，获取 HTTP 状态、ETag、内容类型等
 - **check_locator 任务处理**：IngestionService 支持 `check_locator` jobType，更新 ResourceLocator 健康信息
 - **链接健康检查调度**：IngestionScheduler 定期扫描过期 locator，创建 check_locator 任务
@@ -64,6 +80,7 @@ pnpm build:web
 - **手动检查端点**：`POST /resources/:id/locators/check`
 
 ### 前端
+
 - **来源管理页面**（/sources）：CRUD + 启用/禁用切换 + allowedModes 复选框
 - **资源详情增强**：链接健康面板 + 来源追溯面板 + 失效链接警告
 - **import-link 增强**：来源选择下拉框 + baseUrl 提示

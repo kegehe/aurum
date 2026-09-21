@@ -1,6 +1,8 @@
 {
   "name": "@aurum/api",
   "version": "0.1.0",
+  "main": "dist/app.module.js",
+  "types": "dist/app.module.d.ts",
   "private": true,
   "description": "Aurum 后端 API（NestJS）",
   "scripts": {

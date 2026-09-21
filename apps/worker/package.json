@@ -2,9 +2,20 @@
   "name": "@aurum/worker",
   "version": "0.1.0",
   "private": true,
-  "description": "异步处理 Worker（阶段6实现）",
+  "description": "Aurum 处理任务 Worker（独立进程；入口转发 @aurum/api 的 dist/worker.js，避免两套 @nestjs/core 实例）",
+  "main": "dist/main.js",
   "scripts": {
-    "typecheck": "echo 'not implemented'",
-    "lint": "echo 'not implemented'"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\"",
+    "start": "cd ../api && node ../worker/dist/main.js",
+    "start:dev": "cd ../api && node ../worker/dist/main.js"
+  },
+  "dependencies": {
+    "@aurum/api": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
   }
 }

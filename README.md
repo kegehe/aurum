@@ -17,7 +17,7 @@ Aurum 是面向个人、工作室或小团队的多类型资源管理平台。�
 | 分类           | 树形分类                                                                           |
 | 批量操作       | 批量移动分类、收藏/取消收藏、软删除、ZIP 下载                                    |
 | 回收站         | 软删除、恢复、彻底删除、清空回收站                                                  |
-| 处理任务       | 进程内轮询调度、任务列表、统计、失败重试、临时文件清理                              |
+| 处理任务       | 轮询调度（可拆独立 Worker 进程）、任务列表、统计、失败重试、临时文件清理                              |
 | 统计与一致性   | 概览统计、资源类型统计、存储文件一致性检查                                          |
 | 外部资源接入   | 来源配置、链接导入、SSRF 防护、幂等任务、元数据提取、Civitai/GitHub/RSS 定时自动同步、页面 HTML 快照 |
 | 样式实验室     | AI 视觉样式分析（配色/字体/排版/布局）、多种布局变体、生图提示词 / CSS Tokens 导出   |
@@ -85,7 +85,12 @@ pnpm dev
 ```bash
 pnpm dev:api
 pnpm dev:web
+pnpm dev:worker   # 可选：把处理任务（缩略图/转码/文本提取）拆到独立进程
 ```
+
+默认 `pnpm dev` 单进程即跑完全部工作。要让 API 只负责入队，给 API 进程设
+`EXECUTION_ENABLED=false` 再启动 `pnpm dev:worker`；两进程共用一个 SQLite 库，
+启动时会自动开启 `journal_mode=WAL` 与 `busy_timeout`。
 
 打开 `http://localhost:3001` 使用前端界面。健康检查地址为 `http://localhost:3000/api/health`。
 
@@ -96,6 +101,7 @@ pnpm dev:web
 | `pnpm dev`         | 同时启动 API 与 Web    |
 | `pnpm dev:api`     | 启动 API 开发服务      |
 | `pnpm dev:web`     | 启动 Web 开发服务      |
+| `pnpm dev:worker`  | 启动处理任务 Worker    |
 | `pnpm test`        | 运行 API 单元测试      |
 | `pnpm typecheck`   | 全 workspace 类型检查  |
 | `pnpm lint`        | 全 workspace lint      |
