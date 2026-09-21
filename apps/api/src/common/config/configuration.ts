@@ -24,11 +24,30 @@ export default () => ({
   ingestion: {
     pollIntervalMs: parseInt(process.env.INGESTION_POLL_INTERVAL_MS || '3000', 10),
     staleJobTimeoutMs: parseInt(process.env.INGESTION_STALE_JOB_TIMEOUT_MS || '60000', 10),
-    healthCheckIntervalMs: parseInt(process.env.INGESTION_HEALTH_CHECK_INTERVAL_MS || '21600000', 10),
+    healthCheckIntervalMs: parseInt(
+      process.env.INGESTION_HEALTH_CHECK_INTERVAL_MS || '21600000',
+      10,
+    ),
     healthCheckBatchSize: parseInt(process.env.INGESTION_HEALTH_CHECK_BATCH_SIZE || '10', 10),
+    autoSyncCheckIntervalMs: parseInt(
+      process.env.INGESTION_AUTO_SYNC_CHECK_INTERVAL_MS || '60000',
+      10,
+    ),
+    autoSyncBatchSize: parseInt(process.env.INGESTION_AUTO_SYNC_BATCH_SIZE || '10', 10),
   },
   thumbnail: {
     maxWidth: parseInt(process.env.THUMBNAIL_MAX_WIDTH || '400', 10),
     maxHeight: parseInt(process.env.THUMBNAIL_MAX_HEIGHT || '400', 10),
+  },
+  download: {
+    maxFileSizeMB: parseInt(process.env.MAX_DOWNLOAD_FILE_SIZE_MB || '100', 10),
+  },
+  ai: {
+    // 环境变量回退配置：数据库未配置生效项时使用。
+    // 数据库配置可在「设置 → AI 配置」中运行时管理，无需重启。
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+    baseUrl: process.env.ANTHROPIC_BASE_URL || '',
+    styleModel: process.env.AI_STYLE_MODEL || 'claude-sonnet-5',
+    maxImageSizeMB: parseInt(process.env.MAX_STYLE_IMAGE_SIZE_MB || '20', 10),
   },
 });

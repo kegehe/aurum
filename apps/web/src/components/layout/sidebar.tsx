@@ -5,15 +5,16 @@ import {
   FolderOpen,
   Upload,
   Link,
-  Tags,
-  Layers,
+  Download,
   Cpu,
   Trash2,
   Globe,
-  Scale,
+  Palette,
+  Settings,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { AurumMark } from '@/components/brand/aurum-mark';
 import { SidebarNavItem } from './sidebar-nav-item';
 import { NAV_ITEMS } from '@/lib/constants';
 
@@ -22,12 +23,12 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   FolderOpen,
   Upload,
   Link,
-  Tags,
-  Layers,
+  Download,
   Cpu,
   Trash2,
   Globe,
-  Scale,
+  Palette,
+  Settings,
 };
 
 export function Sidebar() {
@@ -35,10 +36,8 @@ export function Sidebar() {
     <aside className="fixed left-0 top-0 z-30 flex h-screen w-60 flex-col border-r border-sidebar-border bg-sidebar">
       {/* Logo */}
       <div className="flex h-14 items-center gap-2 border-b border-sidebar-border px-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-sidebar-active text-sidebar-active-foreground text-sm font-bold">
-          R
-        </div>
-        <span className="font-semibold text-sidebar-foreground">资源管理</span>
+        <AurumMark className="h-8 w-8" title="Aurum" />
+        <span className="font-semibold tracking-normal text-sidebar-foreground">Aurum</span>
       </div>
 
       {/* Navigation */}
@@ -68,7 +67,7 @@ export function Sidebar() {
 
       {/* Footer */}
       <div className="border-t border-sidebar-border p-3">
-        <p className="text-xs text-muted-foreground">资源管理平台 v0.2.0</p>
+        <p className="text-xs text-muted-foreground">Aurum v0.2.0</p>
       </div>
     </aside>
   );

@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import { ProcessingService } from './processing.service';
 import { QueryProcessingJobsDto } from './dto/query-processing-jobs.dto';
 
@@ -28,5 +28,17 @@ export class ProcessingController {
   @Post('jobs/:jobId/retry')
   retryJob(@Param('jobId') jobId: string) {
     return this.processingService.retryJob(jobId);
+  }
+
+  /** 删除指定已结束（terminal）的任务记录 */
+  @Delete('jobs/:jobId')
+  deleteJob(@Param('jobId') jobId: string) {
+    return this.processingService.deleteJob(jobId);
+  }
+
+  /** 清空所有已结束（terminal）的任务记录 */
+  @Delete('jobs')
+  clearJobs() {
+    return this.processingService.clearJobs();
   }
 }

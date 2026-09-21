@@ -12,9 +12,8 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { createLinkImport, getIngestionJob, retryIngestionJob } from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
-import { listTags } from '@/lib/api/tags';
 import { listSources } from '@/lib/api/sources';
-import type { CategoryTreeNode, IngestionJobItem, TagWithUsage, SourceItem } from '@/lib/types';
+import type { CategoryTreeNode, IngestionJobItem, SourceItem } from '@/lib/types';
 
 const NO_CATEGORY_VALUE = '__no_category__';
 
@@ -28,9 +27,7 @@ export default function ImportLinkPage() {
   const [url, setUrl] = useState('');
   const [title, setTitle] = useState('');
   const [categoryId, setCategoryId] = useState(NO_CATEGORY_VALUE);
-  const [tagIds, setTagIds] = useState<string[]>([]);
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
-  const [tags, setTags] = useState<TagWithUsage[]>([]);
   const [sources, setSources] = useState<SourceItem[]>([]);
   const [sourceId, setSourceId] = useState('__none__');
   const [submitting, setSubmitting] = useState(false);
@@ -45,7 +42,6 @@ export default function ImportLinkPage() {
 
   useEffect(() => {
     void listCategories().then((result) => setCategories(result.items)).catch(() => undefined);
-    void listTags().then((result) => setTags(result.items)).catch(() => undefined);
     void listSources({ enabled: true, pageSize: 100 }).then((result) => setSources(result.items)).catch(() => undefined);
   }, []);
 
@@ -87,7 +83,6 @@ export default function ImportLinkPage() {
         sourceId: sourceId && sourceId !== '__none__' ? sourceId : undefined,
         title: title.trim() || undefined,
         categoryId: categoryId === NO_CATEGORY_VALUE ? undefined : categoryId,
-        tagIds: tagIds.length ? tagIds : undefined,
       });
       setJob(created);
       pollJob(created.id);
@@ -96,10 +91,6 @@ export default function ImportLinkPage() {
     } finally {
       setSubmitting(false);
     }
-  };
-
-  const toggleTag = (tagId: string) => {
-    setTagIds((current) => (current.includes(tagId) ? current.filter((id) => id !== tagId) : [...current, tagId]));
   };
 
   const retry = async () => {
@@ -190,26 +181,6 @@ export default function ImportLinkPage() {
                 </SelectContent>
               </Select>
             </div>
-            {tags.length > 0 && (
-              <div className="space-y-1.5">
-                <Label>标签</Label>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  {tags.map((tag) => (
-                    <label key={tag.id} className="flex min-w-0 items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={tagIds.includes(tag.id)}
-                        onChange={() => toggleTag(tag.id)}
-                        disabled={isRunning}
-                        className="h-4 w-4 shrink-0 accent-primary"
-                      />
-                      {tag.color && <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: tag.color }} />}
-                      <span className="truncate">{tag.name}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            )}
             <Button type="submit" disabled={submitting || isRunning} className="gap-2">
               {submitting || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <LinkIcon className="h-4 w-4" />}
               添加链接

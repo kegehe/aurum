@@ -6,6 +6,7 @@ import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import ffmpeg from 'fluent-ffmpeg';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
+import { streamStorageToTemp } from '../temp-file.util';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
 import { ResourceFileRepository } from '../../file/repositories/resource-file.repository';
 import {
@@ -37,18 +38,14 @@ export class VideoCoverGenerator implements IJobProcessor {
       throw new Error(`Resource ${resourceId} not found`);
     }
 
-    const originalFile = await this.fileRepo.findByResourceAndRole(
-      resourceId,
-      FileRole.original,
-    );
+    const originalFile = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.original);
     if (!originalFile) {
       throw new Error(`No original file for ${resourceId}`);
     }
 
-    const tmpIn = path.join(os.tmpdir(), `vcover-in-${randomUUID()}`);
+    // 流式下载到临时文件（FFmpeg 需要文件路径，不能直接用流）
+    const tmpIn = await streamStorageToTemp(this.storage, originalFile.storagePath, 'vcover-in');
     const tmpOut = path.join(os.tmpdir(), `vcover-out-${randomUUID()}.jpg`);
-    const buf = await this.storage.get(originalFile.storagePath);
-    await fs.writeFile(tmpIn, buf);
 
     try {
       // FFmpeg 截取第 1 秒的一帧
@@ -66,21 +63,13 @@ export class VideoCoverGenerator implements IJobProcessor {
 
       // 生成 storage key 并写入正式存储
       const hash = resource.sha256!;
-      const storageKey = this.storage.generateKey(
-        FileRole.thumbnail,
-        hash,
-        undefined,
-        'jpg',
-      );
+      const storageKey = this.storage.generateKey(FileRole.thumbnail, hash, undefined, 'jpg');
 
       const stream = createReadStream(tmpOut);
       await this.storage.put(storageKey, stream);
 
       // 创建派生文件记录（幂等：已存在则跳过）
-      const existing = await this.fileRepo.findByResourceAndRole(
-        resourceId,
-        FileRole.thumbnail,
-      );
+      const existing = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.thumbnail);
       if (!existing) {
         await this.fileRepo.create({
           resource: { connect: { id: resourceId } },
@@ -93,9 +82,7 @@ export class VideoCoverGenerator implements IJobProcessor {
         });
       }
 
-      this.logger.log(
-        `Video cover generated for resource ${resourceId} (${stats.size} bytes)`,
-      );
+      this.logger.log(`Video cover generated for resource ${resourceId} (${stats.size} bytes)`);
     } finally {
       await fs.unlink(tmpIn).catch(() => {});
       await fs.unlink(tmpOut).catch(() => {});

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ResourceType } from '../../common/constants/enums';
 import { SearchService } from './search.service';
-import { ResourceSortField, SortOrder, TagFilterMode } from './dto/search-resource.dto';
+import { ResourceSortField, SortOrder } from './dto/search-resource.dto';
 
 describe('SearchService', () => {
   const service = new SearchService();
@@ -12,6 +12,18 @@ describe('SearchService', () => {
 
   it('omits soft-delete filter when includeDeleted is true', () => {
     expect(service.buildWhereClause({ includeDeleted: true })).toEqual({});
+  });
+
+  it('filters to deleted-only resources when deletedOnly is true', () => {
+    expect(service.buildWhereClause({ deletedOnly: true })).toEqual({
+      deletedAt: { not: null },
+    });
+  });
+
+  it('prefers deletedOnly over includeDeleted', () => {
+    expect(service.buildWhereClause({ deletedOnly: true, includeDeleted: true })).toEqual({
+      deletedAt: { not: null },
+    });
   });
 
   it('builds keyword search across searchable fields', () => {
@@ -32,35 +44,15 @@ describe('SearchService', () => {
     });
   });
 
-  it('builds AND tag filters by default', () => {
-    expect(service.buildWhereClause({ tagIds: ['tag-a', 'tag-b'] })).toEqual({
-      AND: [
-        { deletedAt: null },
-        { tags: { some: { tagId: 'tag-a' } } },
-        { tags: { some: { tagId: 'tag-b' } } },
-      ],
-    });
-  });
-
-  it('builds OR tag filters when requested', () => {
-    expect(service.buildWhereClause({
-      tagIds: ['tag-a', 'tag-b'],
-      tagMode: TagFilterMode.or,
-    })).toEqual({
-      AND: [
-        { deletedAt: null },
-        { tags: { some: { tagId: { in: ['tag-a', 'tag-b'] } } } },
-      ],
-    });
-  });
-
   it('builds structured type, category, favorite, and size filters', () => {
-    expect(service.buildWhereClause({
-      resourceType: ResourceType.image,
-      categoryId: 'cat-1',
-      isFavorite: true,
-      sizeRange: { min: 10, max: 100 },
-    })).toEqual({
+    expect(
+      service.buildWhereClause({
+        resourceType: ResourceType.image,
+        categoryId: 'cat-1',
+        isFavorite: true,
+        sizeRange: { min: 10, max: 100 },
+      }),
+    ).toEqual({
       AND: [
         { deletedAt: null },
         { resourceType: ResourceType.image },
@@ -73,10 +65,7 @@ describe('SearchService', () => {
 
   it('builds uncategorized root-folder filters', () => {
     expect(service.buildWhereClause({ uncategorized: true })).toEqual({
-      AND: [
-        { deletedAt: null },
-        { categoryId: null },
-      ],
+      AND: [{ deletedAt: null }, { categoryId: null }],
     });
   });
 

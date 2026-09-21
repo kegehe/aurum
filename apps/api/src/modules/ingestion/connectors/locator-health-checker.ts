@@ -37,15 +37,17 @@ export class LocatorHealthChecker {
     try {
       let current = this.safeUrl.normalize(rawUrl);
       const signal = AbortSignal.timeout(CHECK_TIMEOUT_MS);
-      const dispatcher = this.safeUrl.createSafeDispatcher({
-        headersTimeout: 10_000,
-        bodyTimeout: 10_000,
-      });
+      const dispatcher = this.safeUrl.createSafeDispatcher(
+        { headersTimeout: 10_000, bodyTimeout: 10_000 },
+        current.hostname,
+      );
 
       try {
         let redirectsUsed = 0;
         for (let step = 0; step <= MAX_REDIRECTS; step++) {
           await options.validateUrl?.(current.toString());
+          // SSRF 校验：代理模式下 dispatcher 不做 DNS-pinning，这里显式校验目标主机为公网地址
+          await this.safeUrl.resolvePublicHost(current.hostname);
 
           // 先尝试 HEAD
           const headResponse = await fetch(current, {
@@ -54,7 +56,7 @@ export class LocatorHealthChecker {
             signal,
             method: 'HEAD',
             headers: {
-              'user-agent': 'resource-service-health-checker/0.1',
+              'user-agent': 'aurum-health-checker/0.1',
             },
           });
 
@@ -135,13 +137,15 @@ export class LocatorHealthChecker {
     let current = url;
     for (let step = 0; step <= MAX_REDIRECTS; step++) {
       await options.validateUrl?.(current.toString());
+      // SSRF 校验：代理模式下 dispatcher 不做 DNS-pinning，这里显式校验目标主机为公网地址
+      await this.safeUrl.resolvePublicHost(current.hostname);
       const response = await fetch(current, {
         dispatcher,
         redirect: 'manual',
         signal,
         method: 'GET',
         headers: {
-          'user-agent': 'resource-service-health-checker/0.1',
+          'user-agent': 'aurum-health-checker/0.1',
           range: 'bytes=0-0',
         },
       });
@@ -156,7 +160,10 @@ export class LocatorHealthChecker {
         current = this.safeUrl.normalize(new URL(location, current).toString());
         redirectsUsed++;
         if (redirectsUsed > MAX_REDIRECTS) {
-          return makeErrorResult(0, `Too many redirects in GET fallback (maximum ${MAX_REDIRECTS})`);
+          return makeErrorResult(
+            0,
+            `Too many redirects in GET fallback (maximum ${MAX_REDIRECTS})`,
+          );
         }
         continue;
       }

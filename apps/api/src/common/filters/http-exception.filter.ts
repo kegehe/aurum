@@ -55,7 +55,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
       const detail = exception instanceof Error ? exception.stack : String(exception);
       // 生产环境不输出完整 stack trace，避免泄露代码路径
       if (process.env.NODE_ENV === 'production') {
-        this.logger.error(`Unhandled exception: ${exception instanceof Error ? exception.message : String(exception)}`);
+        this.logger.error(
+          `Unhandled exception: ${exception instanceof Error ? exception.message : String(exception)}`,
+        );
       } else {
         this.logger.error(`Unhandled exception: ${detail}`);
       }

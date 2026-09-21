@@ -1,9 +1,6 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  IJobScheduler,
-  JobHandler,
-} from './interfaces/job-scheduler.interface';
+import { IJobScheduler, JobHandler } from './interfaces/job-scheduler.interface';
 import { ProcessingJobRepository } from './repositories/processing-job.repository';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
 import { JobStatus, JobType, ProcessingStatus } from '../../common/constants/enums';
@@ -24,9 +21,7 @@ import { JobStatus, JobType, ProcessingStatus } from '../../common/constants/enu
  * 在 ProcessingModule 改 useClass 即可。
  */
 @Injectable()
-export class PollingJobScheduler
-  implements IJobScheduler, OnModuleInit, OnModuleDestroy
-{
+export class PollingJobScheduler implements IJobScheduler, OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PollingJobScheduler.name);
   private readonly handlers = new Map<string, JobHandler>();
   private pollTimer: NodeJS.Timeout | null = null;
@@ -67,9 +62,7 @@ export class PollingJobScheduler
         (j.status === JobStatus.pending || j.status === JobStatus.processing),
     );
     if (conflict) {
-      this.logger.debug(
-        `Skipping duplicate job ${jobType} for resource ${resourceId}`,
-      );
+      this.logger.debug(`Skipping duplicate job ${jobType} for resource ${resourceId}`);
       return;
     }
 
@@ -82,10 +75,7 @@ export class PollingJobScheduler
 
     // 更新资源处理状态为 pending（而非 processing）
     // processing 状态在 job 被 claimNext 时设置
-    await this.resourceRepo.updateProcessingStatus(
-      resourceId,
-      ProcessingStatus.pending,
-    );
+    await this.resourceRepo.updateProcessingStatus(resourceId, ProcessingStatus.pending);
 
     this.logger.log(`Enqueued job ${jobType} for resource ${resourceId}`);
   }
@@ -125,9 +115,7 @@ export class PollingJobScheduler
         if (!claimed) break;
       }
     } catch (err) {
-      this.logger.error(
-        `Poll cycle error: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      this.logger.error(`Poll cycle error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -141,26 +129,18 @@ export class PollingJobScheduler
 
     const handler = this.handlers.get(job.jobType);
     if (!handler) {
-      this.logger.warn(
-        `No handler registered for job type: ${job.jobType}, marking as failed`,
-      );
+      this.logger.warn(`No handler registered for job type: ${job.jobType}, marking as failed`);
       await this.jobRepo.updateStatus(
         job.id,
         JobStatus.failed,
         `No handler for job type: ${job.jobType}`,
       );
-      await this.resourceRepo.updateProcessingStatus(
-        job.resourceId,
-        ProcessingStatus.failed,
-      );
+      await this.resourceRepo.updateProcessingStatus(job.resourceId, ProcessingStatus.failed);
       return true;
     }
 
     // 任务已认领，设置资源状态为 processing
-    await this.resourceRepo.updateProcessingStatus(
-      job.resourceId,
-      ProcessingStatus.processing,
-    );
+    await this.resourceRepo.updateProcessingStatus(job.resourceId, ProcessingStatus.processing);
 
     this.activeJobCount++;
 
@@ -186,17 +166,13 @@ export class PollingJobScheduler
         retryCount: job.retryCount,
       });
       await this.jobRepo.updateStatus(job.id, JobStatus.completed);
-      this.logger.log(
-        `Job ${job.id} (${job.jobType}) completed for resource ${job.resourceId}`,
-      );
+      this.logger.log(`Job ${job.id} (${job.jobType}) completed for resource ${job.resourceId}`);
 
       // 检查该资源是否还有未完成的任务，若没有则更新 processingStatus 为 completed
       await this.checkResourceCompletion(job.resourceId);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Job ${job.id} (${job.jobType}) failed: ${errorMsg}`,
-      );
+      this.logger.error(`Job ${job.id} (${job.jobType}) failed: ${errorMsg}`);
 
       if (job.retryCount < this.maxRetry) {
         await this.jobRepo.incrementRetry(job.id);
@@ -207,9 +183,7 @@ export class PollingJobScheduler
         await this.jobRepo.updateStatus(job.id, JobStatus.failed, errorMsg);
         // 检查资源状态（可能还有其他待处理任务）
         await this.checkResourceCompletion(job.resourceId);
-        this.logger.warn(
-          `Job ${job.id} failed permanently after ${this.maxRetry} retries`,
-        );
+        this.logger.warn(`Job ${job.id} failed permanently after ${this.maxRetry} retries`);
       }
     } finally {
       this.activeJobCount--;
@@ -223,9 +197,7 @@ export class PollingJobScheduler
   private async checkResourceCompletion(resourceId: string): Promise<void> {
     const allJobs = await this.jobRepo.findByResourceId(resourceId);
     const hasUnfinished = allJobs.some(
-      (j) =>
-        j.status === JobStatus.pending ||
-        j.status === JobStatus.processing,
+      (j) => j.status === JobStatus.pending || j.status === JobStatus.processing,
     );
     if (hasUnfinished) return;
 

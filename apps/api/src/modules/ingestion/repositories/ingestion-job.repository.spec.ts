@@ -5,7 +5,9 @@ import { IngestionJobRepository } from './ingestion-job.repository';
 function createRepository(updateCount = 1) {
   const ingestionJob = {
     updateMany: vi.fn().mockResolvedValue({ count: updateCount }),
-    findUnique: vi.fn().mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.failed, retryCount: 0 }),
+    findUnique: vi
+      .fn()
+      .mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.failed, retryCount: 0 }),
   };
   return {
     repository: new IngestionJobRepository({ ingestionJob } as never),
@@ -22,6 +24,21 @@ describe('IngestionJobRepository state transitions', () => {
       expect.objectContaining({
         where: { id: 'job-1', status: IngestionJobStatus.processing, leaseToken: 'lease-1' },
         data: expect.objectContaining({ status: IngestionJobStatus.completed, leaseToken: null }),
+      }),
+    );
+  });
+
+  it('cancels only active jobs', async () => {
+    const { repository, ingestionJob } = createRepository();
+
+    await expect(repository.cancel('job-1')).resolves.toBe(true);
+    expect(ingestionJob.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'job-1',
+          status: { in: [IngestionJobStatus.pending, IngestionJobStatus.processing] },
+        },
+        data: expect.objectContaining({ status: IngestionJobStatus.canceled, leaseToken: null }),
       }),
     );
   });
@@ -48,7 +65,11 @@ describe('IngestionJobRepository state transitions', () => {
 
   it('does not retry a job that has exceeded maxRetry', async () => {
     const { repository, ingestionJob } = createRepository();
-    ingestionJob.findUnique.mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.failed, retryCount: 3 });
+    ingestionJob.findUnique.mockResolvedValue({
+      id: 'job-1',
+      status: IngestionJobStatus.failed,
+      retryCount: 3,
+    });
 
     await expect(repository.retryIfRetryable('job-1', 3)).resolves.toBeNull();
     expect(ingestionJob.updateMany).not.toHaveBeenCalled();
@@ -56,7 +77,11 @@ describe('IngestionJobRepository state transitions', () => {
 
   it('does not retry a job that is not in a terminal state', async () => {
     const { repository, ingestionJob } = createRepository();
-    ingestionJob.findUnique.mockResolvedValue({ id: 'job-1', status: IngestionJobStatus.pending, retryCount: 0 });
+    ingestionJob.findUnique.mockResolvedValue({
+      id: 'job-1',
+      status: IngestionJobStatus.pending,
+      retryCount: 0,
+    });
 
     await expect(repository.retryIfRetryable('job-1')).resolves.toBeNull();
     expect(ingestionJob.updateMany).not.toHaveBeenCalled();

@@ -1,10 +1,10 @@
 {
-  "name": "@resource-service/web",
+  "name": "@aurum/web",
   "version": "0.1.0",
   "private": true,
-  "description": "资源管理平台前端 (Next.js 15)",
+  "description": "Aurum 前端 (Next.js 15)",
   "scripts": {
-    "dev": "next dev --turbopack --port 3001",
+    "dev": "node ../../scripts/wait-for-api.mjs 3000 60000 && next dev --turbopack --port 3001",
     "build": "next build",
     "start": "next start --port 3001",
     "lint": "next lint",
@@ -30,7 +30,7 @@
     "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
-    "@resource-service/shared-types": "workspace:*",
+    "@aurum/shared-types": "workspace:*",
     "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^22.9.0",
     "@types/react": "^19.0.0",

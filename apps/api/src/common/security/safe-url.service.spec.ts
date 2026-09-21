@@ -6,7 +6,9 @@ describe('SafeUrlService', () => {
   const service = new SafeUrlService();
 
   it('accepts public HTTP(S) URLs and removes fragments', () => {
-    expect(service.normalize('https://example.com/path#section').toString()).toBe('https://example.com/path');
+    expect(service.normalize('https://example.com/path#section').toString()).toBe(
+      'https://example.com/path',
+    );
   });
 
   it('rejects unsafe protocols and embedded credentials', () => {
@@ -14,7 +16,9 @@ describe('SafeUrlService', () => {
     expect(() => service.normalize('data:text/html,<h1>hello</h1>')).toThrow(BadRequestException);
     expect(() => service.normalize('ftp://example.com/file')).toThrow(BadRequestException);
     expect(() => service.normalize('javascript:alert(1)')).toThrow(BadRequestException);
-    expect(() => service.normalize('https://user:password@example.com')).toThrow(BadRequestException);
+    expect(() => service.normalize('https://user:password@example.com')).toThrow(
+      BadRequestException,
+    );
   });
 
   it('blocks loopback, private and link-local addresses', () => {
@@ -49,8 +53,11 @@ describe('SafeUrlService', () => {
     const body = { getReader: () => reader };
 
     await expect(
-      (service as unknown as { readLimitedBody: (stream: unknown, maxBytes: number) => Promise<string> })
-        .readLimitedBody(body, 2),
+      (
+        service as unknown as {
+          readLimitedBody: (stream: unknown, maxBytes: number) => Promise<string>;
+        }
+      ).readLimitedBody(body, 2),
     ).rejects.toThrow('Remote HTML exceeds');
     expect(reader.cancel).toHaveBeenCalledOnce();
   });

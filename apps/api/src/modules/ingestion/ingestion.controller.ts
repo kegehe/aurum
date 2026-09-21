@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import { CreateLinkImportDto } from './dto/create-link-import.dto';
 import { QueryIngestionJobsDto } from './dto/query-ingestion-jobs.dto';
 import { IngestionService } from './ingestion.service';
@@ -12,9 +12,20 @@ export class IngestionController {
     return this.ingestionService.createLinkImport(dto);
   }
 
+  @Post('imports/sources/:sourceId/sync')
+  createSourceSync(@Param('sourceId') sourceId: string) {
+    return this.ingestionService.createSourceSync(sourceId);
+  }
+
   @Get('ingestion/jobs')
   listJobs(@Query() query: QueryIngestionJobsDto) {
     return this.ingestionService.listJobs(query);
+  }
+
+  /** 摄入任务统计（各状态数量） */
+  @Get('ingestion/stats')
+  stats() {
+    return this.ingestionService.getStats();
   }
 
   @Get('ingestion/jobs/:id')
@@ -27,9 +38,32 @@ export class IngestionController {
     return this.ingestionService.retryJob(id);
   }
 
+  @Post('ingestion/jobs/:id/cancel')
+  cancelJob(@Param('id') id: string) {
+    return this.ingestionService.cancelJob(id);
+  }
+
+  /** 删除指定已结束（terminal）的任务记录 */
+  @Delete('ingestion/jobs/:id')
+  deleteJob(@Param('id') id: string) {
+    return this.ingestionService.deleteJob(id);
+  }
+
+  /** 清空所有已结束（terminal）的任务记录 */
+  @Delete('ingestion/jobs')
+  clearJobs() {
+    return this.ingestionService.clearJobs();
+  }
+
   /** 手动触发资源所有定位器的健康检查 */
   @Post('resources/:id/locators/check')
   checkResourceLocators(@Param('id') id: string) {
     return this.ingestionService.checkResourceLocators(id);
+  }
+
+  /** Download a reviewed remote resource into local storage. */
+  @Post('resources/:id/mirror')
+  mirrorRemoteResource(@Param('id') id: string) {
+    return this.ingestionService.mirrorRemoteResource(id);
   }
 }

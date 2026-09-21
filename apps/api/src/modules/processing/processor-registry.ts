@@ -27,36 +27,24 @@ export class ProcessorRegistry implements OnModuleInit {
 
   onModuleInit(): void {
     // 注册元数据检测
-    this.scheduler.onJobType(
-      this.metadataDetector.jobType,
-      async (job) => {
-        await this.metadataDetector.process(job.resourceId, job.id);
-      },
-    );
+    this.scheduler.onJobType(this.metadataDetector.jobType, async (job) => {
+      await this.metadataDetector.process(job.resourceId, job.id);
+    });
 
     // 注册缩略图生成
-    this.scheduler.onJobType(
-      this.thumbnailGenerator.jobType,
-      async (job) => {
-        await this.thumbnailGenerator.process(job.resourceId, job.id);
-      },
-    );
+    this.scheduler.onJobType(this.thumbnailGenerator.jobType, async (job) => {
+      await this.thumbnailGenerator.process(job.resourceId, job.id);
+    });
 
     // 注册视频封面生成
-    this.scheduler.onJobType(
-      this.videoCoverGenerator.jobType,
-      async (job) => {
-        await this.videoCoverGenerator.process(job.resourceId, job.id);
-      },
-    );
+    this.scheduler.onJobType(this.videoCoverGenerator.jobType, async (job) => {
+      await this.videoCoverGenerator.process(job.resourceId, job.id);
+    });
 
     // 注册文本提取
-    this.scheduler.onJobType(
-      this.textExtractor.jobType,
-      async (job) => {
-        await this.textExtractor.process(job.resourceId, job.id);
-      },
-    );
+    this.scheduler.onJobType(this.textExtractor.jobType, async (job) => {
+      await this.textExtractor.process(job.resourceId, job.id);
+    });
 
     this.logger.log('All job processors registered');
   }

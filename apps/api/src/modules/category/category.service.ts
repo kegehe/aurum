@@ -12,7 +12,9 @@ export class CategoryService {
     const counts = await this.categoryRepo.resourceCountsByCategory();
 
     const roots = await this.categoryRepo.findTree();
-    const attachCounts = (category: CategoryTreeItem): CategoryTreeItem & { resourceCount: number } => ({
+    const attachCounts = (
+      category: CategoryTreeItem,
+    ): CategoryTreeItem & { resourceCount: number } => ({
       ...category,
       resourceCount: counts[category.id] ?? 0,
       children: category.children.map(attachCounts),

@@ -13,15 +13,15 @@ import { ProcessingModule } from './modules/processing/processing.module';
 import { MetadataModule } from './modules/metadata/metadata.module';
 import { PreviewModule } from './modules/preview/preview.module';
 import { SearchModule } from './modules/search/search.module';
-import { TagModule } from './modules/tag/tag.module';
 import { CategoryModule } from './modules/category/category.module';
-import { CollectionModule } from './modules/collection/collection.module';
 import { TrashModule } from './modules/trash/trash.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { ConsistencyModule } from './modules/consistency/consistency.module';
 import { SourceModule } from './modules/source/source.module';
-import { LicenseModule } from './modules/license/license.module';
 import { IngestionModule } from './modules/ingestion/ingestion.module';
+import { StyleModule } from './modules/style/style.module';
+import { AiSettingsModule } from './modules/ai-settings/ai-settings.module';
+import { DesignModule } from './modules/design/design.module';
 
 @Module({
   imports: [
@@ -42,17 +42,17 @@ import { IngestionModule } from './modules/ingestion/ingestion.module';
     MetadataModule,
     PreviewModule,
     SearchModule,
-    TagModule,
     CategoryModule,
-    CollectionModule,
     TrashModule,
     StatsModule,
     ConsistencyModule,
     SourceModule,
-    LicenseModule,
     IngestionModule,
+    StyleModule,
+    AiSettingsModule,
+    DesignModule,
     // Resource/Upload 模块的 controller/service 在后续步骤填充，
-    // 注册顺序：Resource 依赖 Storage/File/Processing/Tag/Category/Collection
+    // 注册顺序：Resource 依赖 Storage/File/Processing/Category
     ResourceModule,
     UploadModule,
   ],

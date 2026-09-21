@@ -1,4 +1,4 @@
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
 /**
  * 上传资源时可填写的元数据
@@ -16,7 +16,7 @@ export class UploadResourceDto {
   description?: string;
 
   @IsOptional()
-  @IsString()
+  @IsUUID()
   categoryId?: string;
 
   @IsOptional()
@@ -28,9 +28,4 @@ export class UploadResourceDto {
   @IsString()
   @MaxLength(255)
   author?: string;
-
-  @IsOptional()
-  @IsString()
-  @MaxLength(2000)
-  licenseNote?: string;
 }

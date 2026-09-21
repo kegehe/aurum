@@ -20,6 +20,32 @@ export const envValidationSchema = Joi.object({
   INGESTION_STALE_JOB_TIMEOUT_MS: Joi.number().integer().min(20000).default(60000),
   INGESTION_HEALTH_CHECK_INTERVAL_MS: Joi.number().integer().min(60000).default(21600000),
   INGESTION_HEALTH_CHECK_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
+  INGESTION_AUTO_SYNC_CHECK_INTERVAL_MS: Joi.number().integer().min(1000).default(60000),
+  INGESTION_AUTO_SYNC_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
   THUMBNAIL_MAX_WIDTH: Joi.number().integer().min(1).default(400),
   THUMBNAIL_MAX_HEIGHT: Joi.number().integer().min(1).default(400),
+  // 外部同步单文件下载上限（MB）。防止拉取超大数据。
+  MAX_DOWNLOAD_FILE_SIZE_MB: Joi.number().integer().min(1).max(10240).default(100),
+  // 出站 HTTP 代理（本机经本地代理访问外网时配置，如 http://127.0.0.1:10808）。
+  // 未配置时走直连（带 SSRF DNS-pinning）。
+  HTTP_PROXY: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .allow('')
+    .optional(),
+  HTTPS_PROXY: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .allow('')
+    .optional(),
+  NO_PROXY: Joi.string().allow('').optional(),
+  // AI 样式分析（可选：未配置 ANTHROPIC_API_KEY 时样式实验室功能禁用，
+  // 也可在「设置 → AI 配置」页面运行时配置，无需改 .env）
+  ANTHROPIC_API_KEY: Joi.string().allow('').optional(),
+  ANTHROPIC_BASE_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .allow('')
+    .optional(),
+  AI_STYLE_MODEL: Joi.string().default('claude-sonnet-5'),
+  MAX_STYLE_IMAGE_SIZE_MB: Joi.number().integer().min(1).max(100).default(20),
+  DESIGN_READ_API_KEY: Joi.string().min(16).allow('').optional(),
+  DESIGN_INTERNAL_API_KEY: Joi.string().min(16).allow('').optional(),
 });

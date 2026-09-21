@@ -4,6 +4,7 @@ import type {
   ResourceDetail,
   UpdateResourceData,
   SearchResourcesParams,
+  IngestionJobItem,
 } from '../types';
 
 /** 资源列表（分页 + 搜索 + 筛选 + 排序） */
@@ -16,6 +17,22 @@ export function listResources(
 /** 资源详情 */
 export function getResource(id: string): Promise<ResourceDetail> {
   return get(`/resources/${id}`);
+}
+
+/**
+ * 相邻资源导航：在相同筛选/排序上下文（关键字、类型、分类、来源、排序）中
+ * 返回当前资源的上一个/下一个资源 ID，用于详情页左右箭头快速切换。
+ */
+export function getResourceNeighbors(
+  id: string,
+  params?: SearchResourcesParams,
+): Promise<{
+  previousId: string | null;
+  nextId: string | null;
+  currentIndex: number | null;
+  total: number;
+}> {
+  return get(`/resources/${encodeURIComponent(id)}/neighbors`, params as Record<string, unknown>);
 }
 
 /** 更新资源元数据 */
@@ -43,20 +60,6 @@ export function batchDeleteResources(
   return post('/resources/batch/delete', { resourceIds });
 }
 
-export function batchAddTagsToResources(
-  resourceIds: string[],
-  tagIds: string[],
-): Promise<{ resourceIds: string[]; tagIds: string[]; added: number }> {
-  return post('/resources/batch/tags/add', { resourceIds, tagIds });
-}
-
-export function batchRemoveTagsFromResources(
-  resourceIds: string[],
-  tagIds: string[],
-): Promise<{ resourceIds: string[]; tagIds: string[]; removed: number }> {
-  return post('/resources/batch/tags/remove', { resourceIds, tagIds });
-}
-
 export async function downloadResourcesZip(resourceIds: string[]): Promise<Blob> {
   const response = await fetch(`${BASE_URL}/resources/batch/download`, {
     method: 'POST',
@@ -80,6 +83,18 @@ export function restoreResource(id: string): Promise<{ id: string; deletedAt: st
   return post(`/resources/${id}/restore`);
 }
 
+/** 批量从回收站恢复：一次请求恢复多个资源，并返回未恢复成功的资源 ID */
+export function batchRestoreResources(
+  resourceIds: string[],
+): Promise<{
+  resourceIds: string[];
+  restored: number;
+  failed: number;
+  failedResourceIds: string[];
+}> {
+  return post('/resources/batch/restore', { resourceIds });
+}
+
 /** 彻底删除（仅限回收站内资源） */
 export function permanentDeleteResource(
   id: string,
@@ -93,26 +108,8 @@ export function emptyTrash(): Promise<{ deletedResources: number; deletedFiles: 
 }
 
 /** 重新处理 */
-export function reprocessResource(
-  id: string,
-): Promise<{ id: string; processingStatus: string }> {
+export function reprocessResource(id: string): Promise<{ id: string; processingStatus: string }> {
   return post(`/resources/${id}/reprocess`);
-}
-
-/** 为资源添加标签 */
-export function addTagToResource(
-  resourceId: string,
-  tagId: string,
-): Promise<{ resourceId: string; tagId: string; action: string }> {
-  return post(`/resources/${resourceId}/tags/${tagId}`);
-}
-
-/** 从资源移除标签 */
-export function removeTagFromResource(
-  resourceId: string,
-  tagId: string,
-): Promise<{ resourceId: string; tagId: string; action: string }> {
-  return del(`/resources/${resourceId}/tags/${tagId}`);
 }
 
 /** 资源下载 URL */
@@ -133,4 +130,9 @@ export function getResourceThumbnailUrl(id: string): string {
 /** 手动触发资源定位器健康检查 */
 export function checkResourceLocators(id: string): Promise<{ jobs: unknown[]; message: string }> {
   return post(`/resources/${id}/locators/check`);
+}
+
+/** Queue a user-approved download of a remote resource into local storage. */
+export function mirrorRemoteResource(id: string): Promise<IngestionJobItem> {
+  return post(`/resources/${id}/mirror`);
 }

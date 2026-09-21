@@ -2,13 +2,17 @@
 
 ## 当前交付范围
 
-本次交付覆盖资源管理平台的本地开发版：
+本次交付覆盖 Aurum 的本地开发版：
 
 - API 与 Web 可本地启动。
 - SQLite 数据库可迁移、seed。
-- 支持上传、资源库、搜索筛选、标签、分类、集合、批量操作、回收站、处理任务、统计和一致性检查。
-- 外部资源接入 P1-P3：来源配置管理、许可证管理、链接导入、SSRF 防护、元数据提取。
-- 外部资源接入 P4：来源策略执行、许可证种子数据、链接健康检查、策略门禁。
+- 支持上传、资源库、搜索筛选、分类、批量操作、回收站、处理任务、统计和一致性检查。
+- 外部资源接入 P1-P3：来源配置管理、链接导入、SSRF 防护、元数据提取。
+- 外部资源接入 P4：来源策略执行、链接健康检查、策略门禁。
+- Civitai 连接器与来源定时自动同步。
+- 样式实验室（AI 视觉样式分析 + 本地降级）与页面内 AI 配置管理。
+- AI 设计运营台（design 模块：文档/版本/候选/ChangeSet 原子发布/受控渲染）。
+- 已移除集合（collection）、标签（tag）、许可证（license）模块。
 - 已补充测试与验收文档。
 
 ## 启动步骤
@@ -19,7 +23,6 @@ cp .env.example apps/api/.env
 cp apps/web/.env.example apps/web/.env.local
 pnpm db:migrate
 pnpm db:seed
-npx ts-node apps/api/prisma/seed-licenses.ts
 pnpm dev
 ```
 
@@ -39,13 +42,13 @@ pnpm build:api
 pnpm build:web
 ```
 
-最近一次验收结果：
+最近一次验收结果（2026-09-21）：
 
-- `pnpm test`: 13 个测试文件，81 条测试通过。
+- `pnpm test`: 26 个测试文件，228 条测试通过。
 - `pnpm typecheck`: 通过。
-- `pnpm lint`: 通过。
+- `pnpm lint`: 通过（API 6 条 unused-vars 警告，无错误）。
 - `pnpm build:api`: 通过。
-- `pnpm build:web`: 通过（14 个页面）。
+- `pnpm build:web`: 通过。
 
 ## P4 新增功能
 
@@ -53,30 +56,27 @@ pnpm build:web
 - **LocatorHealthChecker**：HEAD/GET 探测 URL 可用性，获取 HTTP 状态、ETag、内容类型等
 - **check_locator 任务处理**：IngestionService 支持 `check_locator` jobType，更新 ResourceLocator 健康信息
 - **链接健康检查调度**：IngestionScheduler 定期扫描过期 locator，创建 check_locator 任务
-- **策略门禁**：`assertDownloadAllowed` 方法，禁止禁用来源/未知许可/需审核来源的 mirror_file/archive_snapshot 任务
+- **策略门禁**：`assertDownloadAllowed` 方法，禁止禁用来源/需审核来源的 mirror_file/archive_snapshot 任务
 - **手动检查端点**：`POST /resources/:id/locators/check`
-- **许可证种子数据**：10 条常见 SPDX 许可 + unknown，upsert 幂等
 
 ### 前端
-- **来源管理页面**（/sources）：CRUD + 启用/禁用切换 + allowedModes 复选框 + 默认许可选择
-- **许可证管理页面**（/licenses）：CRUD + 三态布尔标记（✓/✗/?）+ SPDX ID Badge
-- **资源详情增强**：链接健康面板 + 来源追溯面板 + 许可状态 Badge + 失效链接警告
+- **来源管理页面**（/sources）：CRUD + 启用/禁用切换 + allowedModes 复选框
+- **资源详情增强**：链接健康面板 + 来源追溯面板 + 失效链接警告
 - **import-link 增强**：来源选择下拉框 + baseUrl 提示
-- **侧边栏**：新增"来源管理"和"许可证管理"导航项
+- **侧边栏**：新增"来源管理"导航项
 
 ## 自动化测试覆盖
 
 已覆盖：
 
 - 搜索条件构建。
-- 处理任务列表、统计、重试。
-- 批量资源操作。
-- 批量 DTO 校验。
-- 集合批量加入资源。
-- 集合资源关联仓储错误处理。
-- 批量下载 ZIP 流与错误传播。
-- 永久删除、清空回收站的文件/数据库删除顺序。
-- 资源重新处理后的任务入队和处理状态同步。
+- 处理任务列表、统计、重试、临时文件清理。
+- 批量资源操作与 DTO 校验。
+- 资源服务/仓储、永久删除与回收站清空顺序。
+- 上传分类校验报错。
+- 外部资源接入：来源策略、SSRF 防护、Civitai/LinkMetadata 连接器、导入任务与调度。
+- 样式实验室：分析服务、Claude Vision（mock）、本地降级、CSS Tokens 导出。
+- AI 配置管理与设计运营台工作流（含受控渲染）。
 - IngestionScheduler 健康检查调度。
 
 详细清单见 [acceptance-checklist.md](acceptance-checklist.md)。

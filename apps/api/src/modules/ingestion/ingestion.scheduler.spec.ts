@@ -8,6 +8,7 @@ describe('IngestionScheduler', () => {
       resetStaleJobs: vi.fn().mockResolvedValue(undefined),
       runNextJob: vi.fn().mockResolvedValue(false),
       scheduleLocatorHealthChecks: vi.fn().mockResolvedValue(0),
+      scheduleAutoSyncs: vi.fn().mockResolvedValue(0),
     };
     const config = {
       get: vi.fn((key: string) => {

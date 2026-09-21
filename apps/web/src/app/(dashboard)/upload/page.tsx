@@ -40,6 +40,9 @@ interface QueueItem {
 const NO_FOLDER_VALUE = '__no_folder__';
 const ROOT_FOLDER_VALUE = '__root_folder__';
 
+/** 后端单次批量上传最多允许的文件数（超出部分自动分批） */
+const BATCH_UPLOAD_LIMIT = 20;
+
 function flattenCategories(categories: CategoryTreeNode[]): CategoryTreeNode[] {
   return categories.flatMap((category) => [category, ...flattenCategories(category.children)]);
 }
@@ -48,6 +51,8 @@ export default function UploadPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
+  // 防重入：防止“开始上传”被快速重复点击导致同一批文件并发上传两次
+  const uploadingRef = useRef(false);
 
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -103,6 +108,7 @@ export default function UploadPage() {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragover(false);
+    if (uploading) return;
     if (e.dataTransfer.files.length > 0) {
       addFiles(e.dataTransfer.files);
     }
@@ -110,61 +116,117 @@ export default function UploadPage() {
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      addFiles(e.target.files);
+      if (!uploading) addFiles(e.target.files);
       e.target.value = '';
     }
   };
 
   const startUpload = async () => {
-    if (queue.length === 0) return;
+    if (uploadingRef.current) return;
 
-    // 加载分类（如果还没加载）
-    if (categories.length === 0) await loadCategories();
+    // 只处理待上传（pending）与失败（error）的文件；已成功的跳过，避免重复上传
+    const targets = queue
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ item }) => item.status === 'pending' || item.status === 'error');
+    if (targets.length === 0) return;
 
-    setUploading(true);
-    const metadata: Record<string, string> = {};
-    if (title) metadata.title = title;
-    if (description) metadata.description = description;
-    if (categoryId) metadata.categoryId = categoryId;
-    if (source) metadata.source = source;
-    if (author) metadata.author = author;
+    uploadingRef.current = true;
+    const targetIndices = targets.map((t) => t.idx);
 
-    if (queue.length === 1) {
-      // 单文件上传
-      setQueue((prev) => prev.map((item, i) => (i === 0 ? { ...item, status: 'uploading' as const } : item)));
-      try {
-        const result = await uploadFile(queue[0].file, Object.keys(metadata).length > 0 ? metadata : undefined);
-        setQueue((prev) => prev.map((item, i) => (i === 0 ? { ...item, status: 'success' as const, result: result.resource } : item)));
-        toast.success('上传成功');
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : '上传失败';
-        setQueue((prev) => prev.map((item, i) => (i === 0 ? { ...item, status: 'error' as const, error: msg } : item)));
-      }
-    } else {
-      // 批量上传
-      setQueue((prev) => prev.map((item) => ({ ...item, status: 'uploading' as const })));
-      try {
-        const result = await uploadBatch(queue.map((q) => q.file).slice(0, 20), Object.keys(metadata).length > 0 ? metadata : undefined);
+    try {
+      setUploading(true);
+
+      // 加载分类（如果还没加载）
+      if (categories.length === 0) await loadCategories();
+
+      const metadata: Record<string, string> = {};
+      if (title) metadata.title = title;
+      if (description) metadata.description = description;
+      if (categoryId) metadata.categoryId = categoryId;
+      if (source) metadata.source = source;
+      if (author) metadata.author = author;
+      const meta = Object.keys(metadata).length > 0 ? metadata : undefined;
+
+      if (targets.length === 1) {
+        // 单文件上传
+        const idx = targetIndices[0];
+        setQueue((prev) => prev.map((item, i) => (i === idx ? { ...item, status: 'uploading' as const } : item)));
+        try {
+          const result = await uploadFile(targets[0].item.file, meta);
+          setQueue((prev) => prev.map((item, i) => (i === idx ? { ...item, status: 'success' as const, result: result.resource } : item)));
+          toast.success('上传成功');
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : '上传失败';
+          setQueue((prev) => prev.map((item, i) => (i === idx ? { ...item, status: 'error' as const, error: msg } : item)));
+        }
+      } else {
+        // 批量上传：每批最多 BATCH_UPLOAD_LIMIT 个文件，超出部分自动拆分成多批依次上传
+        const files = targets.map((t) => t.item.file);
+        // 仅将本轮参与上传的文件标记为 uploading，已成功的保持原状
+        setQueue((prev) =>
+          prev.map((item, i) => (targetIndices.includes(i) ? { ...item, status: 'uploading' as const } : item)),
+        );
+
+        let successCount = 0;
+        let failCount = 0;
+        const resultsByIndex = new Map<
+          number,
+          | { status: 'success'; result: UploadResult['resource'] }
+          | { status: 'error'; error: string }
+        >();
+
+        for (let i = 0; i < files.length; i += BATCH_UPLOAD_LIMIT) {
+          const batch = files.slice(i, i + BATCH_UPLOAD_LIMIT);
+          const batchIndices = targetIndices.slice(i, i + BATCH_UPLOAD_LIMIT);
+          try {
+            const result = await uploadBatch(batch, meta);
+            result.results.forEach((r, j) => {
+              const idx = batchIndices[j];
+              if (r.success) {
+                successCount += 1;
+                resultsByIndex.set(idx, { status: 'success', result: r.resource });
+              } else {
+                failCount += 1;
+                resultsByIndex.set(idx, { status: 'error', error: r.error });
+              }
+            });
+          } catch (e) {
+            // 整批上传失败（如网络错误/后端拒绝），该批所有文件标记失败
+            const msg = e instanceof Error ? e.message : '上传失败';
+            batchIndices.forEach((idx) => {
+              failCount += 1;
+              resultsByIndex.set(idx, { status: 'error', error: msg });
+            });
+          }
+        }
+
+        // 兜底：已发送但未返回结果的文件如实标注，避免卡在“上传中”
+        for (const idx of targetIndices) {
+          if (!resultsByIndex.has(idx)) {
+            failCount += 1;
+            resultsByIndex.set(idx, { status: 'error' as const, error: '服务器未返回处理结果' });
+          }
+        }
+
         setQueue((prev) =>
           prev.map((item, i) => {
-            const r = result.results[i];
-            if (r) {
-              return r.success
-                ? { ...item, status: 'success' as const, result: r.resource }
-                : { ...item, status: 'error' as const, error: r.error };
-            }
-            return { ...item, status: 'error' as const, error: '未知错误' };
+            const r = resultsByIndex.get(i);
+            if (!r) return item;
+            return r.status === 'success'
+              ? { ...item, status: 'success' as const, result: r.result }
+              : { ...item, status: 'error' as const, error: r.error };
           }),
         );
-        const successCount = result.results.filter((r) => r.success).length;
-        const failCount = result.results.filter((r) => !r.success).length;
-        toast.success(`上传完成：${successCount} 成功${failCount > 0 ? `，${failCount} 失败` : ''}`);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : '上传失败';
-        setQueue((prev) => prev.map((item) => ({ ...item, status: 'error' as const, error: msg })));
+        if (failCount === 0) {
+          toast.success(`上传完成：${successCount} 个文件全部成功`);
+        } else {
+          toast.error(`上传完成：${successCount} 成功，${failCount} 失败`);
+        }
       }
+    } finally {
+      uploadingRef.current = false;
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   const reset = () => {
@@ -177,6 +239,11 @@ export default function UploadPage() {
   };
 
   const doneCount = queue.filter((q) => q.status === 'success').length;
+  const pendingCount = queue.filter((q) => q.status === 'pending').length;
+  const errorCount = queue.filter((q) => q.status === 'error').length;
+  const canUpload = pendingCount + errorCount > 0;
+  // 队列已无待上传/失败项且至少成功过一个，视为本轮完成，可清空开始新一批
+  const queueFinished = doneCount > 0 && !canUpload;
 
   const handleCreateFolder = async () => {
     const name = folderName.trim();
@@ -201,7 +268,7 @@ export default function UploadPage() {
   return (
     <div>
       <PageHeader title="上传" description="上传文件到资源库">
-        {doneCount > 0 && (
+        {queueFinished && (
           <Button variant="outline" size="sm" onClick={reset}>
             继续上传
           </Button>
@@ -213,18 +280,27 @@ export default function UploadPage() {
         <div className="lg:col-span-2 space-y-4">
           <div
             ref={dropZoneRef}
-            onDragOver={(e) => { e.preventDefault(); setDragover(true); }}
+            onDragOver={(e) => { e.preventDefault(); if (!uploading) setDragover(true); }}
             onDragLeave={() => setDragover(false)}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => { if (!uploading) fileInputRef.current?.click(); }}
+            aria-disabled={uploading}
             className={cn(
-              'flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-12 transition-colors',
-              dragover ? 'border-primary bg-primary/5' : 'border-muted-foreground/25 hover:border-muted-foreground/50',
+              'flex flex-col items-center justify-center rounded-lg border-2 border-dashed p-12 transition-colors',
+              uploading
+                ? 'cursor-not-allowed border-muted-foreground/20'
+                : 'cursor-pointer border-muted-foreground/25 hover:border-muted-foreground/50',
+              dragover ? 'border-primary bg-primary/5' : '',
             )}
           >
             <Upload className="mb-4 h-12 w-12 text-muted-foreground" />
             <p className="mb-1 text-lg font-medium">拖拽文件到此处</p>
             <p className="text-sm text-muted-foreground">或点击选择文件</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {uploading
+                ? '上传中，暂时无法添加文件'
+                : `支持多选，超过 ${BATCH_UPLOAD_LIMIT} 个文件将自动分批上传`}
+            </p>
             <input
               ref={fileInputRef}
               type="file"
@@ -239,9 +315,10 @@ export default function UploadPage() {
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
                 <CardTitle className="text-base">上传队列 ({queue.length})</CardTitle>
-                {!uploading && doneCount === 0 && (
+                {!uploading && canUpload && (
                   <Button onClick={startUpload} className="gap-1">
-                    <Upload className="h-4 w-4" />开始上传
+                    <Upload className="h-4 w-4" />
+                    {errorCount > 0 ? '重新上传' : '开始上传'}
                   </Button>
                 )}
                 {uploading && (
@@ -276,7 +353,7 @@ export default function UploadPage() {
                       </p>
                     </div>
 
-                    {item.status === 'pending' && (
+                    {(item.status === 'pending' || item.status === 'error') && (
                       <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => removeFile(idx)}>
                         <X className="h-4 w-4" />
                       </Button>

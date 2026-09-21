@@ -4,7 +4,6 @@ import {
   SearchResourceDto,
   ResourceSortField,
   SortOrder,
-  TagFilterMode,
   DateRangeDto,
 } from './dto/search-resource.dto';
 
@@ -29,13 +28,15 @@ export class SearchService {
    * 构建 Prisma ResourceWhereInput
    *
    * 所有筛选条件组合为 AND 关系（keyword 内部为 OR）。
-   * 向后兼容：单值 tagId/categoryId/resourceType 仍可使用。
+   * 向后兼容：单值 categoryId/resourceType 仍可使用。
    */
   buildWhereClause(dto: SearchResourceDto): Prisma.ResourceWhereInput {
     const conditions: Prisma.ResourceWhereInput[] = [];
 
-    // 软删除过滤（默认排除已删除）
-    if (!dto.includeDeleted) {
+    // 软删除过滤（默认排除已删除；deletedOnly=true 时仅返回已删除）
+    if (dto.deletedOnly) {
+      conditions.push({ deletedAt: { not: null } });
+    } else if (!dto.includeDeleted) {
       conditions.push({ deletedAt: null });
     }
 
@@ -75,29 +76,6 @@ export class SearchService {
       conditions.push({ categoryId: { in: dto.categoryIds } });
     } else if (dto.uncategorized) {
       conditions.push({ categoryId: null });
-    }
-
-    // 标签筛选（支持 AND/OR 多标签）
-    const effectiveTagIds = dto.tagIds?.length
-      ? dto.tagIds
-      : dto.tagId
-        ? [dto.tagId]
-        : undefined;
-    if (effectiveTagIds?.length) {
-      const tagMode = dto.tagMode ?? TagFilterMode.and;
-      if (tagMode === TagFilterMode.and) {
-        // AND：资源必须同时拥有所有指定标签
-        conditions.push(
-          ...effectiveTagIds.map((tagId) => ({
-            tags: { some: { tagId } },
-          })),
-        );
-      } else {
-        // OR：资源拥有任一指定标签即可
-        conditions.push({
-          tags: { some: { tagId: { in: effectiveTagIds } } },
-        });
-      }
     }
 
     // 日期范围筛选
@@ -154,9 +132,7 @@ export class SearchService {
   /**
    * 构建日期范围 Prisma filter
    */
-  private buildDateRange(
-    range: DateRangeDto,
-  ): Prisma.DateTimeFilter | undefined {
+  private buildDateRange(range: DateRangeDto): Prisma.DateTimeFilter | undefined {
     const filter: Prisma.DateTimeFilter = {};
     if (range.start) filter.gte = new Date(range.start);
     if (range.end) filter.lte = new Date(range.end);

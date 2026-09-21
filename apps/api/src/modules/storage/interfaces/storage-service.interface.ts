@@ -24,6 +24,9 @@ export interface IStorageService {
   /** 获取文件可读流（用于大文件下载） */
   getStream(key: string): Promise<Readable>;
 
+  /** 获取文件指定字节范围的可读流（用于视频/音频等媒体 Range 请求） */
+  getStreamRange(key: string, start: number, end: number): Promise<Readable>;
+
   /** 删除文件（幂等，文件不存在不报错） */
   delete(key: string): Promise<void>;
 

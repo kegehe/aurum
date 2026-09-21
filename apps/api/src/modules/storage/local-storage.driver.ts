@@ -93,6 +93,16 @@ export class LocalStorageDriver implements IStorageService {
     return createReadStream(filePath);
   }
 
+  async getStreamRange(key: string, start: number, end: number): Promise<Readable> {
+    const filePath = this.resolvePath(key);
+    try {
+      await fs.access(filePath);
+    } catch {
+      throw new NotFoundException(`File not found: ${key}`);
+    }
+    return createReadStream(filePath, { start, end });
+  }
+
   async delete(key: string): Promise<void> {
     const filePath = this.resolvePath(key);
     try {

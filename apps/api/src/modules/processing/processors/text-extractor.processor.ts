@@ -1,6 +1,8 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
+import * as fs from 'node:fs/promises';
 import pdfParse from 'pdf-parse';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
+import { streamStorageToTemp, readTextCapped } from '../temp-file.util';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
 import { ResourceFileRepository } from '../../file/repositories/resource-file.repository';
 import {
@@ -11,6 +13,12 @@ import { FileRole, JobType } from '../../../common/constants/enums';
 
 /** 提取文本最大长度（1MB 字符） */
 const MAX_TEXT = 1_000_000;
+
+/**
+ * 读取上限对应的字节数：UTF-8 单字符最多 4 字节，
+ * 按此上限流式截读可保证在文件足够大时拿到完整的 MAX_TEXT 字符。
+ */
+const MAX_TEXT_BYTES = MAX_TEXT * 4;
 
 /** searchVector 最大长度 */
 const MAX_SEARCH_VECTOR = 10_000;
@@ -42,24 +50,26 @@ export class TextExtractor implements IJobProcessor {
       throw new Error(`Resource ${resourceId} not found`);
     }
 
-    const originalFile = await this.fileRepo.findByResourceAndRole(
-      resourceId,
-      FileRole.original,
-    );
+    const originalFile = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.original);
     if (!originalFile) {
       throw new Error(`No original file for ${resourceId}`);
     }
 
-    // 直接从 storage 读取到内存（pdf-parse 和文本提取都使用内存中的 buffer）
-    const buf = await this.storage.get(originalFile.storagePath);
-
     let extractedText = '';
 
     if (resource.mimeType === 'application/pdf') {
-      extractedText = await this.extractPdf(buf);
+      // PDF：pdf-parse 需要完整 Buffer，先流式落盘再从临时文件读取
+      const tmpPath = await streamStorageToTemp(this.storage, originalFile.storagePath, 'text-in');
+      try {
+        const buf = await fs.readFile(tmpPath);
+        extractedText = await this.extractPdf(buf);
+      } finally {
+        await fs.unlink(tmpPath).catch(() => {});
+      }
     } else {
-      // 纯文本文件
-      extractedText = buf.toString('utf-8');
+      // 纯文本：只读取需要保留的前缀，避免把整个大文本文件读入内存
+      const stream = await this.storage.getStream(originalFile.storagePath);
+      extractedText = await readTextCapped(stream, MAX_TEXT_BYTES);
     }
 
     // 截断至合理大小
@@ -77,20 +87,12 @@ export class TextExtractor implements IJobProcessor {
       throw new Error(`Resource ${resourceId} has no sha256 hash; cannot generate storage key`);
     }
     const hash = resource.sha256;
-    const storageKey = this.storage.generateKey(
-      FileRole.extracted_text,
-      hash,
-      undefined,
-      'txt',
-    );
+    const storageKey = this.storage.generateKey(FileRole.extracted_text, hash, undefined, 'txt');
     const textBuffer = Buffer.from(extractedText, 'utf-8');
     await this.storage.put(storageKey, textBuffer);
 
     // 创建派生文件记录（幂等）
-    const existing = await this.fileRepo.findByResourceAndRole(
-      resourceId,
-      FileRole.extracted_text,
-    );
+    const existing = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.extracted_text);
     if (!existing) {
       await this.fileRepo.create({
         resource: { connect: { id: resourceId } },
@@ -108,9 +110,7 @@ export class TextExtractor implements IJobProcessor {
       searchVector: extractedText.slice(0, MAX_SEARCH_VECTOR),
     });
 
-    this.logger.log(
-      `Text extracted for resource ${resourceId} (${extractedText.length} chars)`,
-    );
+    this.logger.log(`Text extracted for resource ${resourceId} (${extractedText.length} chars)`);
   }
 
   /**

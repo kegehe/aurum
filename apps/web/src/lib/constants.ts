@@ -1,4 +1,4 @@
-import { ResourceType } from '@resource-service/shared-types';
+import { ResourceType } from '@aurum/shared-types';
 
 /** 资源类型中文标签 */
 export const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
@@ -34,13 +34,29 @@ export const RESOURCE_TYPE_COLORS: Record<
   { bg: string; text: string; border: string }
 > = {
   [ResourceType.image]: { bg: 'bg-blue-100', text: 'text-blue-700', border: 'border-blue-300' },
-  [ResourceType.video]: { bg: 'bg-purple-100', text: 'text-purple-700', border: 'border-purple-300' },
+  [ResourceType.video]: {
+    bg: 'bg-purple-100',
+    text: 'text-purple-700',
+    border: 'border-purple-300',
+  },
   [ResourceType.audio]: { bg: 'bg-green-100', text: 'text-green-700', border: 'border-green-300' },
   [ResourceType.text]: { bg: 'bg-gray-100', text: 'text-gray-700', border: 'border-gray-300' },
-  [ResourceType.document]: { bg: 'bg-orange-100', text: 'text-orange-700', border: 'border-orange-300' },
-  [ResourceType.archive]: { bg: 'bg-yellow-100', text: 'text-yellow-700', border: 'border-yellow-300' },
+  [ResourceType.document]: {
+    bg: 'bg-orange-100',
+    text: 'text-orange-700',
+    border: 'border-orange-300',
+  },
+  [ResourceType.archive]: {
+    bg: 'bg-yellow-100',
+    text: 'text-yellow-700',
+    border: 'border-yellow-300',
+  },
   [ResourceType.model3d]: { bg: 'bg-pink-100', text: 'text-pink-700', border: 'border-pink-300' },
-  [ResourceType.font]: { bg: 'bg-indigo-100', text: 'text-indigo-700', border: 'border-indigo-300' },
+  [ResourceType.font]: {
+    bg: 'bg-indigo-100',
+    text: 'text-indigo-700',
+    border: 'border-indigo-300',
+  },
   [ResourceType.game_asset]: { bg: 'bg-red-100', text: 'text-red-700', border: 'border-red-300' },
   [ResourceType.other]: { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-300' },
 };
@@ -67,15 +83,8 @@ export const SOURCE_TYPE_LABELS: Record<string, string> = {
   link_metadata: '链接元数据',
   github: 'GitHub',
   rss: 'RSS',
+  civitai: 'Civitai',
   custom: '自定义',
-};
-
-/** 许可状态中文标签 */
-export const LICENSE_STATUS_LABELS: Record<string, string> = {
-  unknown: '许可未知',
-  verified: '许可已核验',
-  restricted: '许可受限',
-  rejected: '许可不允许',
 };
 
 /** 定位器类型中文标签 */
@@ -92,9 +101,7 @@ export const LOCATOR_TYPE_LABELS: Record<string, string> = {
 export const NAV_ITEMS = [
   {
     group: '概览',
-    items: [
-      { href: '/dashboard', label: '仪表盘', icon: 'LayoutDashboard' },
-    ],
+    items: [{ href: '/dashboard', label: '仪表盘', icon: 'LayoutDashboard' }],
   },
   {
     group: '资源',
@@ -102,22 +109,20 @@ export const NAV_ITEMS = [
       { href: '/resources', label: '资源库', icon: 'FolderOpen' },
       { href: '/upload', label: '上传', icon: 'Upload' },
       { href: '/import-link', label: '添加链接', icon: 'Link' },
+      { href: '/imports', label: '任务中心', icon: 'Download' },
+      { href: '/style-lab', label: '样式实验室', icon: 'Palette' },
+      { href: '/design-library', label: '设计运营台', icon: 'Palette' },
     ],
   },
   {
     group: '管理',
-    items: [
-      { href: '/tags', label: '标签管理', icon: 'Tags' },
-      { href: '/collections', label: '集合管理', icon: 'Layers' },
-      { href: '/sources', label: '来源管理', icon: 'Globe' },
-      { href: '/licenses', label: '许可证管理', icon: 'Scale' },
-    ],
+    items: [{ href: '/sources', label: '来源管理', icon: 'Globe' }],
   },
   {
     group: '系统',
     items: [
-      { href: '/processing', label: '处理任务', icon: 'Cpu' },
       { href: '/trash', label: '回收站', icon: 'Trash2' },
+      { href: '/settings', label: '系统设置', icon: 'Settings' },
     ],
   },
 ] as const;

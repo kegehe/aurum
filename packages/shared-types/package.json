@@ -1,5 +1,5 @@
 {
-  "name": "@resource-service/shared-types",
+  "name": "@aurum/shared-types",
   "version": "0.1.0",
   "private": true,
   "description": "前后端共享类型与枚举",

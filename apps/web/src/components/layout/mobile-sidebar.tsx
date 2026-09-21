@@ -5,10 +5,11 @@ import {
   FolderOpen,
   Upload,
   Link as LinkIcon,
-  Tags,
-  Layers,
+  Download,
   Cpu,
   Trash2,
+  Palette,
+  Settings,
 } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
@@ -20,6 +21,7 @@ import {
 } from '@/components/ui/sheet';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { AurumMark } from '@/components/brand/aurum-mark';
 import { cn } from '@/lib/utils';
 import { NAV_ITEMS } from '@/lib/constants';
 
@@ -28,10 +30,11 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   FolderOpen,
   Upload,
   Link: LinkIcon,
-  Tags,
-  Layers,
+  Download,
   Cpu,
   Trash2,
+  Palette,
+  Settings,
 };
 
 interface MobileSidebarProps {
@@ -52,7 +55,10 @@ export function MobileSidebar({ open, onClose }: MobileSidebarProps) {
     >
       <SheetContent side="left" className="w-64 p-0">
         <SheetHeader className="px-4 pt-4 pb-2">
-          <SheetTitle>资源管理</SheetTitle>
+          <SheetTitle className="flex items-center gap-2">
+            <AurumMark className="h-7 w-7" title="Aurum" />
+            <span>Aurum</span>
+          </SheetTitle>
         </SheetHeader>
         <ScrollArea className="flex-1 px-3 py-2">
           {NAV_ITEMS.map((group, groupIdx) => (

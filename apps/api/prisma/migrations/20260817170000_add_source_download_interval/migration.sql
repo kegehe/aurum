@@ -1,0 +1,1 @@
+ALTER TABLE "sources" ADD COLUMN "downloadIntervalMs" INTEGER NOT NULL DEFAULT 1000;

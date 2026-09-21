@@ -5,6 +5,7 @@ import {
   ConnectorInspectOptions,
   LinkMetadata,
   ResourceConnector,
+  SyncPage,
 } from './resource-connector.interface';
 
 const MAX_URL_LENGTH = 2048;
@@ -24,7 +25,8 @@ export class LinkMetadataConnector implements ResourceConnector {
       validateUrl: async (candidate) => options.validateUrl?.(candidate.toString()),
     });
     const $ = cheerio.load(result.body);
-    const pick = (selector: string, attribute = 'content') => $(selector).first().attr(attribute)?.trim() || null;
+    const pick = (selector: string, attribute = 'content') =>
+      $(selector).first().attr(attribute)?.trim() || null;
     const absoluteHttpUrl = (value: string | null): string | null => {
       if (!value) return null;
       try {
@@ -40,8 +42,11 @@ export class LinkMetadataConnector implements ResourceConnector {
       throw new BadRequestException(`Final URL exceeds ${MAX_URL_LENGTH} character limit`);
     }
     const canonicalUrl = absoluteHttpUrl(pick('link[rel="canonical"]', 'href')) ?? finalUrl;
-    const rawTitle = pick('meta[property="og:title"]') ?? ($('title').first().text().trim() || result.url.hostname);
-    const rawDescription = pick('meta[property="og:description"]') ?? pick('meta[name="description"]');
+    const rawTitle =
+      pick('meta[property="og:title"]') ??
+      ($('title').first().text().trim() || result.url.hostname);
+    const rawDescription =
+      pick('meta[property="og:description"]') ?? pick('meta[name="description"]');
     const rawPublisher = pick('meta[property="og:site_name"]') ?? result.url.hostname;
     const title = truncate(rawTitle, MAX_TITLE_LENGTH);
     const description = rawDescription ? truncate(rawDescription, MAX_DESCRIPTION_LENGTH) : null;
@@ -52,7 +57,9 @@ export class LinkMetadataConnector implements ResourceConnector {
     const declaredContentLength =
       contentLengthHeader && /^\d+$/.test(contentLengthHeader) ? BigInt(contentLengthHeader) : null;
     const contentLength =
-      declaredContentLength !== null && declaredContentLength <= MAX_SQLITE_BIGINT ? declaredContentLength : null;
+      declaredContentLength !== null && declaredContentLength <= MAX_SQLITE_BIGINT
+        ? declaredContentLength
+        : null;
     const contentLengthExceeded = declaredContentLength !== null && contentLength === null;
     const lastModified = result.headers.get('last-modified');
 
@@ -69,7 +76,8 @@ export class LinkMetadataConnector implements ResourceConnector {
       contentType: result.headers.get('content-type'),
       contentLength,
       etag: result.headers.get('etag'),
-      lastModified: lastModified && !Number.isNaN(Date.parse(lastModified)) ? new Date(lastModified) : null,
+      lastModified:
+        lastModified && !Number.isNaN(Date.parse(lastModified)) ? new Date(lastModified) : null,
       rawMetadata: {
         title,
         canonicalUrl,
@@ -82,5 +90,9 @@ export class LinkMetadataConnector implements ResourceConnector {
           rawPublisher.length > MAX_PUBLISHER_LENGTH,
       },
     };
+  }
+
+  async sync(): Promise<SyncPage> {
+    throw new BadRequestException('LinkMetadataConnector does not support sync operations');
   }
 }

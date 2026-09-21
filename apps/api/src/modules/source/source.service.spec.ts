@@ -4,17 +4,27 @@ import { describe, expect, it, vi } from 'vitest';
 import { SourceType } from '../../common/constants/enums';
 import { SourceService } from './source.service';
 
-function createService() {
+/** 可控的 fs.readdir mock，供 listDownloadDirectories 测试注入目录/抛错 */
+const { readdirMock } = vi.hoisted(() => ({ readdirMock: vi.fn() }));
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  return { ...actual, readdir: readdirMock };
+});
+
+function createService(repoOverrides: Record<string, unknown> = {}) {
   const sourceRepo = {
     findById: vi.fn(),
     findBySlug: vi.fn(),
     findMany: vi.fn(),
+    findDownloadDirectories: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
+    ...repoOverrides,
   };
-  const service = new SourceService(sourceRepo as never);
-  return { service, sourceRepo };
+  const config = { get: vi.fn(() => './storage') };
+  const service = new SourceService(sourceRepo as never, config as never);
+  return { service, sourceRepo, config };
 }
 
 describe('SourceService', () => {
@@ -63,11 +73,28 @@ describe('SourceService', () => {
           slug: 'test-source',
           sourceType: SourceType.link_metadata,
           enabled: true,
-          allowedModes: 'link_only,metadata_only',
+          allowedModes: 'link_only,mirror_file',
           rateLimitPerMinute: 30,
           maxConcurrency: 1,
           requiresReview: false,
         }),
+      );
+    });
+
+    it('passes autoSyncIntervalHours to the repository', async () => {
+      const { service, sourceRepo } = createService();
+      sourceRepo.findBySlug.mockResolvedValue(null);
+      sourceRepo.create.mockResolvedValue({ id: 'new-source' });
+
+      await service.createSource({
+        name: 'Test',
+        slug: 'test-source',
+        sourceType: SourceType.link_metadata,
+        autoSyncIntervalHours: 24,
+      });
+
+      expect(sourceRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ autoSyncIntervalHours: 24 }),
       );
     });
 
@@ -96,9 +123,9 @@ describe('SourceService', () => {
       const { service, sourceRepo } = createService();
       sourceRepo.findById.mockResolvedValue(null);
 
-      await expect(
-        service.updateSource('missing', { name: 'Updated' }),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.updateSource('missing', { name: 'Updated' })).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
     });
 
     it('rejects updating slug to an already-taken value', async () => {
@@ -106,9 +133,9 @@ describe('SourceService', () => {
       sourceRepo.findById.mockResolvedValue({ id: 'source-1', slug: 'old-slug' });
       sourceRepo.findBySlug.mockResolvedValue({ id: 'source-2', slug: 'taken-slug' });
 
-      await expect(
-        service.updateSource('source-1', { slug: 'taken-slug' }),
-      ).rejects.toBeInstanceOf(ConflictException);
+      await expect(service.updateSource('source-1', { slug: 'taken-slug' })).rejects.toBeInstanceOf(
+        ConflictException,
+      );
     });
 
     it('allows updating slug to its own current value', async () => {
@@ -119,25 +146,51 @@ describe('SourceService', () => {
       const _result = await service.updateSource('source-1', { slug: 'same-slug' });
       expect(sourceRepo.update).toHaveBeenCalled();
     });
+
+    it('clears autoSyncIntervalHours when null is passed', async () => {
+      const { service, sourceRepo } = createService();
+      sourceRepo.findById.mockResolvedValue({ id: 'source-1', slug: 'same-slug' });
+      sourceRepo.update.mockResolvedValue({ id: 'source-1' });
+
+      await service.updateSource('source-1', { autoSyncIntervalHours: null });
+
+      expect(sourceRepo.update).toHaveBeenCalledWith(
+        'source-1',
+        expect.objectContaining({ autoSyncIntervalHours: null }),
+      );
+    });
+
+    it('updates autoSyncIntervalHours to the given value', async () => {
+      const { service, sourceRepo } = createService();
+      sourceRepo.findById.mockResolvedValue({ id: 'source-1', slug: 'same-slug' });
+      sourceRepo.update.mockResolvedValue({ id: 'source-1' });
+
+      await service.updateSource('source-1', { autoSyncIntervalHours: 6 });
+
+      expect(sourceRepo.update).toHaveBeenCalledWith(
+        'source-1',
+        expect.objectContaining({ autoSyncIntervalHours: 6 }),
+      );
+    });
   });
 
   describe('deleteSource', () => {
-    it('rejects deleting a source with associated resources', async () => {
+    it('deletes a source even when it has associated resources', async () => {
       const { service, sourceRepo } = createService();
-      sourceRepo.delete.mockResolvedValue({ deleted: false, reason: 'has_resources' });
+      // 方案 B：有关联资源的来源也可删除，repo 直接返回 deleted: true
+      sourceRepo.delete.mockResolvedValue({ deleted: true });
 
-      await expect(
-        service.deleteSource('source-1'),
-      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(service.deleteSource('source-1')).resolves.toEqual({
+        id: 'source-1',
+        deleted: true,
+      });
     });
 
     it('rejects deleting a non-existent source', async () => {
       const { service, sourceRepo } = createService();
       sourceRepo.delete.mockResolvedValue({ deleted: false, reason: 'not_found' });
 
-      await expect(
-        service.deleteSource('missing'),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.deleteSource('missing')).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('deletes a source with no associations', async () => {
@@ -154,9 +207,7 @@ describe('SourceService', () => {
       const { service, sourceRepo } = createService();
       sourceRepo.findById.mockResolvedValue(null);
 
-      await expect(
-        service.getSource('missing'),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.getSource('missing')).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 
@@ -188,6 +239,44 @@ describe('SourceService', () => {
           allowedModes: 'link_only,invalid_mode',
         }),
       ).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  describe('listDownloadDirectories', () => {
+    it('unions DB directories with existing top-level custom dirs, excluding system role dirs', async () => {
+      const { service, sourceRepo } = createService({
+        findDownloadDirectories: vi.fn().mockResolvedValue([
+          { downloadDirectory: 'civitai/anime' },
+          { downloadDirectory: 'civitai/real' },
+          { downloadDirectory: null },
+        ]),
+      });
+      readdirMock.mockResolvedValue([
+        { name: 'originals', isDirectory: () => true },
+        { name: 'temp', isDirectory: () => true },
+        { name: 'civitai', isDirectory: () => true },
+        { name: 'my-dir', isDirectory: () => true },
+        { name: 'file.txt', isDirectory: () => false },
+        { name: '_internal', isDirectory: () => true },
+        { name: '.hidden', isDirectory: () => true },
+      ]);
+
+      const dirs = await service.listDownloadDirectories();
+
+      expect(dirs).toEqual(['civitai', 'civitai/anime', 'civitai/real', 'my-dir']);
+    });
+
+    it('returns only DB directories when the storage root does not exist', async () => {
+      const { service, sourceRepo } = createService({
+        findDownloadDirectories: vi.fn().mockResolvedValue([
+          { downloadDirectory: 'civitai/anime' },
+        ]),
+      });
+      readdirMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const dirs = await service.listDownloadDirectories();
+
+      expect(dirs).toEqual(['civitai/anime']);
     });
   });
 });

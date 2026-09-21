@@ -1,17 +1,19 @@
-import { ArrayMinSize, IsArray, IsBoolean, IsNotEmpty, IsOptional, IsString, IsUUID, ValidateIf } from 'class-validator';
+import {
+  ArrayMinSize,
+  IsArray,
+  IsBoolean,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  IsUUID,
+  ValidateIf,
+} from 'class-validator';
 
 export class BatchResourceIdsDto {
   @IsArray()
   @ArrayMinSize(1)
   @IsString({ each: true })
   resourceIds!: string[];
-}
-
-export class BatchTagResourcesDto extends BatchResourceIdsDto {
-  @IsArray()
-  @ArrayMinSize(1)
-  @IsString({ each: true })
-  tagIds!: string[];
 }
 
 export class BatchCategoryResourcesDto extends BatchResourceIdsDto {

@@ -5,7 +5,6 @@ import {
   BatchCategoryResourcesDto,
   BatchFavoriteResourcesDto,
   BatchResourceIdsDto,
-  BatchTagResourcesDto,
 } from './batch-resource.dto';
 
 describe('batch resource DTOs', () => {
@@ -16,16 +15,6 @@ describe('batch resource DTOs', () => {
 
     expect(errors).toHaveLength(1);
     expect(errors[0].constraints).toHaveProperty('arrayMinSize');
-  });
-
-  it('rejects empty tag id arrays', async () => {
-    const dto = plainToInstance(BatchTagResourcesDto, {
-      resourceIds: ['r1'],
-      tagIds: [],
-    });
-
-    const errors = await validate(dto);
-    expect(errors.some((error) => error.property === 'tagIds')).toBe(true);
   });
 
   it('accepts valid favorite batch payloads', async () => {

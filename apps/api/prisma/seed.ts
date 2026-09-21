@@ -17,18 +17,6 @@ const DEFAULT_CATEGORIES = [
   { name: '其他', sortOrder: 9 },
 ];
 
-/**
- * 测试标签（与方案文档 6.4 节示例一致）
- */
-const DEFAULT_TAGS = [
-  { name: 'UI', color: '#3B82F6' },
-  { name: '角色', color: '#10B981' },
-  { name: '场景', color: '#F59E0B' },
-  { name: '音效', color: '#8B5CF6' },
-  { name: 'BGM', color: '#EC4899' },
-  { name: '像素风', color: '#6366F1' },
-];
-
 async function seedCategories() {
   let count = 0;
   for (const cat of DEFAULT_CATEGORIES) {
@@ -50,27 +38,9 @@ async function seedCategories() {
   console.log(`分类处理完成（新增 ${count}，共 ${DEFAULT_CATEGORIES.length}）`);
 }
 
-async function seedTags() {
-  let count = 0;
-  for (const tag of DEFAULT_TAGS) {
-    const existing = await prisma.tag.findUnique({ where: { name: tag.name } });
-    if (existing) {
-      await prisma.tag.update({
-        where: { id: existing.id },
-        data: { color: tag.color },
-      });
-    } else {
-      await prisma.tag.create({ data: tag });
-      count++;
-    }
-  }
-  console.log(`标签处理完成（新增 ${count}，共 ${DEFAULT_TAGS.length}）`);
-}
-
 async function main() {
   console.log('开始填充种子数据...');
   await seedCategories();
-  await seedTags();
   console.log('种子数据填充完成');
 }
 

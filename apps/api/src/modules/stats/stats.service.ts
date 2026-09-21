@@ -10,7 +10,6 @@ export interface ResourceTypeStatsItem {
 
 export interface DashboardStats {
   resourceTotal: number;
-  collectionTotal: number;
   totalStorageBytes: string;
   processingStats: {
     pending: number;
@@ -20,12 +19,6 @@ export interface DashboardStats {
     canceled: number;
   };
   resourceTypes: ResourceTypeStatsItem[];
-  popularTags: Array<{
-    id: string;
-    name: string;
-    color: string | null;
-    usageCount: number;
-  }>;
   recentFailedJobs: Array<{
     id: string;
     resourceId: string;
@@ -71,28 +64,17 @@ export class StatsService {
   }
 
   async getDashboardStats(): Promise<DashboardStats> {
-    const [
-      resourceTotal,
-      collectionTotal,
-      totalStorageBytes,
-      processingStats,
-      resourceTypes,
-      popularTags,
-      recentFailedJobs,
-    ] =
+    const [resourceTotal, totalStorageBytes, processingStats, resourceTypes, recentFailedJobs] =
       await Promise.all([
         this.statsRepo.countResources(),
-        this.statsRepo.countCollections(),
         this.statsRepo.totalStorageBytes(),
         this.statsRepo.processingStats(),
         this.getResourceTypeStats(),
-        this.statsRepo.popularTags(),
         this.statsRepo.recentFailedJobs(),
       ]);
 
     return {
       resourceTotal,
-      collectionTotal,
       totalStorageBytes: totalStorageBytes.toString(),
       processingStats: {
         pending: processingStats.pending ?? 0,
@@ -102,7 +84,6 @@ export class StatsService {
         canceled: processingStats.canceled ?? 0,
       },
       resourceTypes,
-      popularTags,
       recentFailedJobs,
     };
   }

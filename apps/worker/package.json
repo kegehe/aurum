@@ -1,5 +1,5 @@
 {
-  "name": "@resource-service/worker",
+  "name": "@aurum/worker",
   "version": "0.1.0",
   "private": true,
   "description": "异步处理 Worker（阶段6实现）",

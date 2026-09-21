@@ -1,4 +1,4 @@
-import type { ResourceType } from '@resource-service/shared-types';
+import type { ResourceType } from '@aurum/shared-types';
 import { Badge } from '@/components/ui/badge';
 import { RESOURCE_TYPE_LABELS } from '@/lib/constants';
 

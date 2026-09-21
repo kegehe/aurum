@@ -78,7 +78,11 @@ export class CategoryRepository {
   }
 
   /** 创建分类 */
-  async create(data: { name: string; parentId?: string | null; sortOrder?: number }): Promise<Category> {
+  async create(data: {
+    name: string;
+    parentId?: string | null;
+    sortOrder?: number;
+  }): Promise<Category> {
     // 检查名称+父级唯一性
     const parentId = data.parentId ?? null;
     const existing = await this.findByName(data.name, parentId);
@@ -98,7 +102,10 @@ export class CategoryRepository {
   }
 
   /** 更新分类 */
-  async update(id: string, data: { name?: string; parentId?: string | null; sortOrder?: number }): Promise<Category> {
+  async update(
+    id: string,
+    data: { name?: string; parentId?: string | null; sortOrder?: number },
+  ): Promise<Category> {
     const existing = await this.findById(id);
     if (!existing) throw new NotFoundException(`Category ${id} not found`);
 
@@ -147,7 +154,10 @@ export class CategoryRepository {
   }
 
   /** 批量更新资源的分类 */
-  async batchSetResourceCategory(resourceIds: string[], categoryId: string | null): Promise<number> {
+  async batchSetResourceCategory(
+    resourceIds: string[],
+    categoryId: string | null,
+  ): Promise<number> {
     const result = await this.prisma.resource.updateMany({
       where: { id: { in: resourceIds }, deletedAt: null },
       data: { categoryId },

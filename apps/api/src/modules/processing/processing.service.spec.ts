@@ -9,6 +9,8 @@ function createService() {
     stats: vi.fn(),
     findById: vi.fn(),
     updateStatus: vi.fn(),
+    deleteTerminal: vi.fn(),
+    clearTerminal: vi.fn(),
   };
   const resourceRepo = {
     updateProcessingStatus: vi.fn(),
@@ -80,5 +82,33 @@ describe('ProcessingService', () => {
     jobRepo.findById.mockResolvedValueOnce({ id: 'running', status: JobStatus.processing });
     await expect(service.retryJob('running')).rejects.toBeInstanceOf(BadRequestException);
     expect(resourceRepo.updateProcessingStatus).not.toHaveBeenCalled();
+  });
+
+  it('deletes a terminal job record', async () => {
+    const { service, jobRepo } = createService();
+    jobRepo.findById.mockResolvedValue({ id: 'job-1', status: JobStatus.completed });
+    jobRepo.deleteTerminal.mockResolvedValue(true);
+
+    await expect(service.deleteJob('job-1')).resolves.toEqual({ id: 'job-1', deleted: true });
+    expect(jobRepo.deleteTerminal).toHaveBeenCalledWith('job-1');
+  });
+
+  it('rejects deleting an active job', async () => {
+    const { service, jobRepo } = createService();
+    jobRepo.findById.mockResolvedValueOnce({ id: 'running', status: JobStatus.processing });
+    await expect(service.deleteJob('running')).rejects.toBeInstanceOf(BadRequestException);
+    expect(jobRepo.deleteTerminal).not.toHaveBeenCalled();
+  });
+
+  it('rejects deleting a missing job', async () => {
+    const { service, jobRepo } = createService();
+    jobRepo.findById.mockResolvedValue(null);
+    await expect(service.deleteJob('missing')).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('clears all terminal job records and returns the deleted count', async () => {
+    const { service, jobRepo } = createService();
+    jobRepo.clearTerminal.mockResolvedValue(5);
+    await expect(service.clearJobs()).resolves.toEqual({ deleted: 5 });
   });
 });

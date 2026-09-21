@@ -1,11 +1,15 @@
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsUUID, Max, Min } from 'class-validator';
-import { IngestionJobStatus } from '../../../common/constants/enums';
+import { IngestionJobStatus, IngestionJobType } from '../../../common/constants/enums';
 
 export class QueryIngestionJobsDto {
   @IsOptional()
   @IsIn(Object.values(IngestionJobStatus))
   status?: IngestionJobStatus;
+
+  @IsOptional()
+  @IsIn(Object.values(IngestionJobType))
+  jobType?: IngestionJobType;
 
   @IsOptional()
   @IsUUID()

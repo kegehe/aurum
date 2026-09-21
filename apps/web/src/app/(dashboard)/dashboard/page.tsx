@@ -10,9 +10,8 @@ import {
   ArrowRight,
   Database,
   ExternalLink,
-  Layers,
+  Globe,
   RotateCcw,
-  Tags,
 } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
 import { LoadingState } from '@/components/shared/loading-state';
@@ -21,7 +20,6 @@ import { ResourceTypeIcon } from '@/components/shared/resource-type-icon';
 import { ResourceTypeBadge } from '@/components/shared/resource-type-badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { listResources } from '@/lib/api/resources';
 import { retryJob } from '@/lib/api/processing';
@@ -89,9 +87,9 @@ export default function DashboardPage() {
     );
   }
 
-  const visibleTypeStats = overview?.resourceTypes.filter((item) => item.count > 0).slice(0, 6) ?? [];
+  const visibleTypeStats =
+    overview?.resourceTypes.filter((item) => item.count > 0).slice(0, 6) ?? [];
   const recentFailedJobs = overview?.recentFailedJobs ?? [];
-  const popularTags = overview?.popularTags ?? [];
 
   const handleRetryJob = async (jobId: string) => {
     try {
@@ -134,7 +132,9 @@ export default function DashboardPage() {
               <Database className="h-6 w-6 text-amber-600" />
             </div>
             <div>
-              <p className="text-2xl font-bold">{formatByteString(overview?.totalStorageBytes ?? '0')}</p>
+              <p className="text-2xl font-bold">
+                {formatByteString(overview?.totalStorageBytes ?? '0')}
+              </p>
               <p className="text-sm text-muted-foreground">存储占用</p>
             </div>
           </CardContent>
@@ -148,18 +148,6 @@ export default function DashboardPage() {
             <div>
               <p className="text-2xl font-bold">{overview?.processingStats.failed ?? 0}</p>
               <p className="text-sm text-muted-foreground">处理失败</p>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="flex items-center gap-4 pt-6">
-            <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-green-100">
-              <Layers className="h-6 w-6 text-green-600" />
-            </div>
-            <div>
-              <p className="text-2xl font-bold">{overview?.collectionTotal ?? 0}</p>
-              <p className="text-sm text-muted-foreground">集合数量</p>
             </div>
           </CardContent>
         </Card>
@@ -193,6 +181,8 @@ export default function DashboardPage() {
                     >
                       {r.acquisitionMode === 'link_only' ? (
                         <ExternalLink className="h-8 w-8 text-primary" />
+                      ) : r.acquisitionMode === 'metadata_only' ? (
+                        <Globe className="h-8 w-8 text-blue-500" />
                       ) : (
                         <ResourceTypeIcon
                           type={r.resourceType}
@@ -200,9 +190,16 @@ export default function DashboardPage() {
                         />
                       )}
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{r.title || r.originalFilename}</p>
+                        <p className="truncate text-sm font-medium">
+                          {r.title || r.originalFilename}
+                        </p>
                         <p className="text-xs text-muted-foreground">
-                          {r.acquisitionMode === 'link_only' ? '链接' : formatByteString(r.sizeBytes)} · {formatDateTime(r.createdAt)}
+                          {r.acquisitionMode === 'link_only'
+                            ? '链接'
+                            : r.acquisitionMode === 'metadata_only'
+                              ? '远程资源'
+                              : formatByteString(r.sizeBytes)}{' '}
+                          · {formatDateTime(r.createdAt)}
                         </p>
                       </div>
                       <ResourceTypeBadge type={r.resourceType} />
@@ -217,7 +214,7 @@ export default function DashboardPage() {
             <CardHeader className="flex flex-row items-center justify-between">
               <CardTitle className="text-base">最近失败任务</CardTitle>
               <Button variant="ghost" size="sm" asChild>
-                <Link href="/processing?status=failed" className="gap-1">
+                <Link href="/imports?tab=processing&status=failed" className="gap-1">
                   查看全部
                   <ArrowRight className="h-4 w-4" />
                 </Link>
@@ -242,10 +239,16 @@ export default function DashboardPage() {
                           {job.resource.title || job.resource.originalFilename}
                         </Link>
                         <p className="truncate text-xs text-muted-foreground">
-                          {job.jobType} · {job.errorMessage || '未记录错误'} · {formatDateTime(job.updatedAt)}
+                          {job.jobType} · {job.errorMessage || '未记录错误'} ·{' '}
+                          {formatDateTime(job.updatedAt)}
                         </p>
                       </div>
-                      <Button variant="outline" size="sm" className="gap-1" onClick={() => handleRetryJob(job.id)}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-1"
+                        onClick={() => handleRetryJob(job.id)}
+                      >
                         <RotateCcw className="h-3.5 w-3.5" />
                         重试
                       </Button>
@@ -271,9 +274,7 @@ export default function DashboardPage() {
             </CardHeader>
             <CardContent>
               {visibleTypeStats.length === 0 ? (
-                <p className="py-8 text-center text-sm text-muted-foreground">
-                  暂无资源类型数据
-                </p>
+                <p className="py-8 text-center text-sm text-muted-foreground">暂无资源类型数据</p>
               ) : (
                 <div className="space-y-4">
                   {visibleTypeStats.map((item) => (
@@ -303,30 +304,6 @@ export default function DashboardPage() {
                         </div>
                       </div>
                     </Link>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle className="text-base">常用标签</CardTitle>
-              <Tags className="h-4 w-4 text-muted-foreground" />
-            </CardHeader>
-            <CardContent>
-              {popularTags.length === 0 ? (
-                <p className="py-8 text-center text-sm text-muted-foreground">暂无标签使用数据</p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {popularTags.map((tag) => (
-                    <Badge key={tag.id} variant="secondary" className="gap-1.5">
-                      {tag.color && (
-                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: tag.color }} />
-                      )}
-                      {tag.name}
-                      <span className="text-muted-foreground">{tag.usageCount}</span>
-                    </Badge>
                   ))}
                 </div>
               )}

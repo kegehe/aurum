@@ -15,11 +15,15 @@ import {
   FileRole,
   JobStatus,
   JobType,
-  LicenseStatus,
   ProcessingStatus,
 } from '../../common/constants/enums';
 import { inferResourceType } from './resource-type.util';
 import { UploadResourceDto } from './dto/upload-resource.dto';
+import {
+  assertCategoryExists,
+  categoryDoesNotExistError,
+  isCategoryConnectError,
+} from '../../common/utils/category.validation';
 
 export interface UploadResult {
   resource: {
@@ -80,6 +84,22 @@ export class UploadService {
       );
     }
 
+    // 校验分类存在（分类可能已被并发删除）。
+    // 放在文件写入存储之前：若分类无效，既避免事务中 connect 抛数据库外键错误变成 500，
+    // 也避免在存储里留下孤儿文件。
+    if (body.categoryId) {
+      try {
+        await assertCategoryExists(
+          (categoryId) => this.prisma.category.findUnique({ where: { id: categoryId } }),
+          body.categoryId,
+        );
+      } catch (error) {
+        // 分类无效：清理 multer 临时文件，避免残留磁盘
+        await this.cleanupTemp(file.path);
+        throw error;
+      }
+    }
+
     // 2. 计算 SHA-256
     const sha256 = await this.computeSha256(file.path);
 
@@ -95,71 +115,82 @@ export class UploadService {
     await this.moveTempToStorage(file.path, storageKey);
 
     // 5. 数据库事务
-    const result = await this.prisma.$transaction(async (tx) => {
-      // 查重：已存在相同 sha256 的资源
-      const existing = await this.resourceRepo.findBySha256(sha256, tx);
+    let result: UploadResult;
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        // 查重：已存在相同 sha256 的资源
+        const existing = await this.resourceRepo.findBySha256(sha256, tx);
 
-      // 创建资源记录
-      const resource = await this.resourceRepo.create(
-        {
-          title: body.title || file.originalname,
-          description: body.description,
-          originalFilename: file.originalname,
-          resourceType,
-          mimeType,
-          extension,
-          sizeBytes: BigInt(file.size),
-          sha256,
-          category: body.categoryId ? { connect: { id: body.categoryId } } : undefined,
-          source: body.source,
-          author: body.author,
-          licenseNote: body.licenseNote,
-          acquisitionMode: AcquisitionMode.local_upload,
-          licenseStatus: LicenseStatus.unknown,
-          processingStatus: ProcessingStatus.pending,
-          duplicateOf: existing ? { connect: { id: existing.id } } : undefined,
-        },
-        tx,
-      );
+        // 创建资源记录
+        const resource = await this.resourceRepo.create(
+          {
+            title: body.title || file.originalname,
+            description: body.description,
+            originalFilename: file.originalname,
+            resourceType,
+            mimeType,
+            extension,
+            sizeBytes: BigInt(file.size),
+            sha256,
+            category: body.categoryId ? { connect: { id: body.categoryId } } : undefined,
+            source: body.source,
+            author: body.author,
+            acquisitionMode: AcquisitionMode.local_upload,
+            processingStatus: ProcessingStatus.pending,
+            duplicateOf: existing ? { connect: { id: existing.id } } : undefined,
+          },
+          tx,
+        );
 
-      // 创建原文件记录
-      await this.fileRepo.create(
-        {
-          resource: { connect: { id: resource.id } },
-          fileRole: FileRole.original,
-          variant: '',
-          storagePath: storageKey,
-          mimeType,
-          extension,
-          sizeBytes: BigInt(file.size),
-        },
-        tx,
-      );
+        // 创建原文件记录
+        await this.fileRepo.create(
+          {
+            resource: { connect: { id: resource.id } },
+            fileRole: FileRole.original,
+            variant: '',
+            storagePath: storageKey,
+            mimeType,
+            extension,
+            sizeBytes: BigInt(file.size),
+          },
+          tx,
+        );
 
-      // 创建处理任务（仅记录，不执行 —— 阶段6接 Worker）
-      await this.jobRepo.create(
-        {
-          resource: { connect: { id: resource.id } },
-          jobType: JobType.detect_metadata,
-          status: JobStatus.pending,
-        },
-        tx,
-      );
+        // 创建处理任务（仅记录，不执行 —— 阶段6接 Worker）
+        await this.jobRepo.create(
+          {
+            resource: { connect: { id: resource.id } },
+            jobType: JobType.detect_metadata,
+            status: JobStatus.pending,
+          },
+          tx,
+        );
 
-      return {
-        resource: {
-          id: resource.id,
-          title: resource.title,
-          resourceType: resource.resourceType,
-          mimeType: resource.mimeType,
-          sizeBytes: resource.sizeBytes.toString(),
-          sha256: resource.sha256,
-          processingStatus: resource.processingStatus,
-          isDuplicate: !!existing,
-          duplicateOfId: existing?.id ?? null,
-        },
-      };
-    });
+        return {
+          resource: {
+            id: resource.id,
+            title: resource.title,
+            resourceType: resource.resourceType,
+            mimeType: resource.mimeType,
+            sizeBytes: resource.sizeBytes.toString(),
+            sha256: resource.sha256,
+            processingStatus: resource.processingStatus,
+            isDuplicate: !!existing,
+            duplicateOfId: existing?.id ?? null,
+          },
+        };
+      });
+    } catch (error) {
+      // 兜底：分类在"校验"与"写入"之间被并发删除时，把 connect 的 P2025 转成可读的 400，
+      // 并清理已移入正式存储的孤儿文件。这里只用 isCategoryConnectError：
+      // 上传事务里 category 通过 connect 写入（P2025），避免把极罕见的 duplicateOf 外键
+      // P2003 误判为分类问题。
+      if (isCategoryConnectError(error)) {
+        await this.storage.delete(storageKey).catch(() => undefined);
+        throw categoryDoesNotExistError(body.categoryId ?? null);
+      }
+      throw error;
+    }
 
     this.logger.log(
       `Uploaded resource ${result.resource.id} (${resourceType}, ${file.size} bytes, dup=${result.resource.isDuplicate})`,

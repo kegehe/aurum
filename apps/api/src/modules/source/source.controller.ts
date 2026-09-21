@@ -14,6 +14,12 @@ export class SourceController {
     return this.sourceService.listSources(query);
   }
 
+  /** 获取可选的下载目录列表（供前端“选择目录”） */
+  @Get('directories')
+  directories() {
+    return this.sourceService.listDownloadDirectories();
+  }
+
   /** 获取单个来源 */
   @Get(':id')
   get(@Param('id') id: string) {
@@ -32,7 +38,7 @@ export class SourceController {
     return this.sourceService.updateSource(id, dto);
   }
 
-  /** 删除来源（仅允许删除无关联资源的来源） */
+  /** 删除来源（关联记录经外键 SetNull/Cascade 自动处理，资源保留） */
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.sourceService.deleteSource(id);

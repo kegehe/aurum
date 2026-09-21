@@ -1,8 +1,4 @@
-import {
-  Injectable,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { ProcessingJobRepository } from './repositories/processing-job.repository';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
 import { JobStatus, ProcessingStatus } from '../../common/constants/enums';
@@ -61,5 +57,26 @@ export class ProcessingService {
     await this.jobRepo.updateStatus(jobId, JobStatus.pending, null);
     await this.resourceRepo.updateProcessingStatus(job.resourceId, ProcessingStatus.processing);
     return { id: jobId, status: JobStatus.pending };
+  }
+
+  /** 删除指定已结束（terminal）的任务记录；活跃任务需先取消 */
+  async deleteJob(jobId: string) {
+    const job = await this.jobRepo.findById(jobId);
+    if (!job) {
+      throw new NotFoundException(`Job ${jobId} not found`);
+    }
+    if (job.status === JobStatus.pending || job.status === JobStatus.processing) {
+      throw new BadRequestException('Cannot delete an active job');
+    }
+    if (!(await this.jobRepo.deleteTerminal(jobId))) {
+      throw new BadRequestException('Job is no longer terminal');
+    }
+    return { id: jobId, deleted: true };
+  }
+
+  /** 清空所有已结束（terminal）的任务记录 */
+  async clearJobs() {
+    const deleted = await this.jobRepo.clearTerminal();
+    return { deleted };
   }
 }

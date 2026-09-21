@@ -155,4 +155,25 @@ export class ProcessingJobRepository {
     }
     return result;
   }
+
+  /** 删除一条已结束（terminal）的任务记录；活跃任务（pending/processing）不可删除，返回 false */
+  async deleteTerminal(id: string): Promise<boolean> {
+    const result = await this.prisma.processingJob.deleteMany({
+      where: {
+        id,
+        status: { in: [JobStatus.completed, JobStatus.failed, JobStatus.canceled] },
+      },
+    });
+    return result.count === 1;
+  }
+
+  /** 清空所有已结束（terminal）的任务记录，返回删除数量 */
+  async clearTerminal(): Promise<number> {
+    const result = await this.prisma.processingJob.deleteMany({
+      where: {
+        status: { in: [JobStatus.completed, JobStatus.failed, JobStatus.canceled] },
+      },
+    });
+    return result.count;
+  }
 }

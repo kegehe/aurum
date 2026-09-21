@@ -36,17 +36,15 @@ export class ResourceRepository {
   }
 
   /**
-   * 查询详情：含文件、标签、重复源资源
+   * 查询详情：含文件、重复源资源
    */
   findByIdWithRelations(id: string) {
     return this.prisma.resource.findUnique({
       where: { id },
       include: {
         files: { orderBy: { createdAt: 'asc' } },
-        tags: { include: { tag: true } },
         duplicateOf: { select: { id: true, title: true } },
         sourceRecord: { select: { id: true, name: true, slug: true } },
-        license: { select: { id: true, spdxId: true, name: true, url: true } },
         locators: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }] },
         provenance: { orderBy: { capturedAt: 'desc' }, take: 1 },
       },
@@ -87,7 +85,7 @@ export class ResourceRepository {
 
   /**
    * 分页查询资源列表
-   * 默认排除已软删除资源（includeDeleted=true 时包含，用于回收站）
+   * 默认排除已软删除资源（includeDeleted=true 时包含，deletedOnly=true 时仅返回已删除）
    */
   findMany(params: {
     where?: Prisma.ResourceWhereInput;
@@ -104,11 +102,43 @@ export class ResourceRepository {
       orderBy,
       skip,
       take,
+      include: {
+        locators: {
+          where: { locatorType: { in: ['preview', 'download'] } },
+          orderBy: [{ locatorType: 'asc' }, { isPrimary: 'desc' }],
+          select: { locatorType: true, url: true },
+        },
+      },
     });
   }
 
   count(where?: Prisma.ResourceWhereInput): Promise<number> {
     return this.prisma.resource.count({ where });
+  }
+
+  /**
+   * 读取筛选范围内的排序键清单（仅 id + 指定的排序字段）。
+   * 供相邻资源导航使用：service 侧据此在 (排序字段, id) 全序中定位当前资源的前后邻居。
+   * 相比 keyset 游标，本方法天然处理 NULL 排序值与并列值，代码更简单、结果与列表顺序一致。
+   */
+  async findSortKeys(params: {
+    where?: Prisma.ResourceWhereInput;
+    field: 'createdAt' | 'updatedAt' | 'sizeBytes' | 'title';
+  }): Promise<Array<{ id: string; sortKey: Date | bigint | string | null }>> {
+    const { where, field } = params;
+    const rows = await this.prisma.resource.findMany({
+      where,
+      orderBy: { id: 'asc' },
+      select: { id: true, [field]: true } as Prisma.ResourceSelect,
+    });
+    // 动态字段 key 会返回联合类型，此处统一以行记录读取并窄化到具体标量类型
+    return rows.map((row) => {
+      const record = row as unknown as Record<string, unknown>;
+      return {
+        id: record.id as string,
+        sortKey: record[field] as Date | bigint | string | null,
+      };
+    });
   }
 
   async create(data: Prisma.ResourceCreateInput, tx?: Prisma.TransactionClient): Promise<Resource> {
@@ -166,6 +196,36 @@ export class ResourceRepository {
       where: { id },
       data: { deletedAt: null },
     });
+  }
+
+  /**
+   * 批量恢复（仅限回收站内资源）
+   * 返回实际恢复数量与未恢复成功的资源 ID（不在回收站中 / 已不存在）
+   */
+  async batchRestore(ids: string[]): Promise<{ restored: number; failedIds: string[] }> {
+    const existing = await this.prisma.resource.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, deletedAt: true },
+    });
+    const restorableIds = existing
+      .filter((resource) => resource.deletedAt !== null)
+      .map((resource) => resource.id);
+    const restorableSet = new Set(restorableIds);
+
+    // 没有可恢复的资源时直接返回，避免发一次无意义的 updateMany
+    if (restorableIds.length === 0) {
+      return { restored: 0, failedIds: ids };
+    }
+
+    const result = await this.prisma.resource.updateMany({
+      where: { id: { in: restorableIds }, deletedAt: { not: null } },
+      data: { deletedAt: null },
+    });
+
+    return {
+      restored: result.count,
+      failedIds: ids.filter((id) => !restorableSet.has(id)),
+    };
   }
 
   /**

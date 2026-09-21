@@ -1,43 +1,70 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
-import { Undo2, Trash2, RotateCcw, ExternalLink } from 'lucide-react';
+import { Trash2, RotateCcw } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
-import { DataTable, type Column } from '@/components/shared/data-table';
+import { ResourceGrid } from '@/components/shared/resource-grid';
+import { LoadingState } from '@/components/shared/loading-state';
+import { ErrorState } from '@/components/shared/error-state';
+import { EmptyState } from '@/components/shared/empty-state';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
-import { ResourceTypeIcon } from '@/components/shared/resource-type-icon';
-import { ResourceTypeBadge } from '@/components/shared/resource-type-badge';
 import { Button } from '@/components/ui/button';
-import { emptyTrash, listResources, permanentDeleteResource, restoreResource } from '@/lib/api/resources';
-import { formatByteString, formatDateTime } from '@/lib/format';
+import {
+  emptyTrash,
+  listResources,
+  permanentDeleteResource,
+  restoreResource,
+  batchRestoreResources,
+} from '@/lib/api/resources';
 import type { ResourceListItem } from '@/lib/types';
+
+const PAGE_SIZE = 100;
 
 export default function TrashPage() {
   const [resources, setResources] = useState<ResourceListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [restoring, setRestoring] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ResourceListItem | null>(null);
   const [emptyConfirmOpen, setEmptyConfirmOpen] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(0);
+
+  /** 请求序号：用于丢弃过期响应，避免快速翻页/操作后旧数据覆盖新数据 */
+  const requestSeqRef = useRef(0);
 
   const fetchTrash = useCallback(async () => {
+    const seq = ++requestSeqRef.current;
     setLoading(true);
     setError(null);
+    let redirecting = false;
     try {
-      const data = await listResources({ includeDeleted: true, pageSize: 100 });
-      const trashedResources = data.items.filter((r) => r.deletedAt !== null);
-      const trashedIds = new Set(trashedResources.map((resource) => resource.id));
-      setResources(trashedResources);
-      setSelectedIds((prev) => new Set([...prev].filter((id) => trashedIds.has(id))));
+      const data = await listResources({ deletedOnly: true, page, pageSize: PAGE_SIZE });
+      if (seq !== requestSeqRef.current) return;
+      // 当前页越界（如删除了最后一页的唯一一项）时回退到最后一页
+      if (data.items.length === 0 && data.total > 0 && page > data.totalPages) {
+        redirecting = true;
+        setPage(data.totalPages);
+        return;
+      }
+      setResources(data.items);
+      setTotal(data.total);
+      setTotalPages(data.totalPages);
     } catch (e) {
+      if (seq !== requestSeqRef.current) return;
       setError(e instanceof Error ? e.message : '加载失败');
     } finally {
-      setLoading(false);
+      // 正在回退页码时不结束 loading，避免旧页数据一闪而过；由回退后的新请求负责收尾
+      if (!redirecting && seq === requestSeqRef.current) setLoading(false);
     }
-  }, []);
+  }, [page]);
 
-  useEffect(() => { fetchTrash(); }, [fetchTrash]);
+  useEffect(() => {
+    fetchTrash();
+  }, [fetchTrash]);
 
   const handleRestore = async (id: string) => {
     try {
@@ -77,87 +104,69 @@ export default function TrashPage() {
       toast.success(`已清空回收站，删除 ${result.deletedResources} 个资源`);
       setSelectedIds(new Set());
       setEmptyConfirmOpen(false);
-      await fetchTrash();
+      // 使在途请求失效并直接置空列表，避免旧分页数据覆盖空结果；page 回到第 1 页（若已在第 1 页则无需重新拉取）。
+      // 必须同时结束 loading：被失效的在途请求会在 finally 中跳过 setLoading(false)，而 page 未变化时不会有新请求接手。
+      requestSeqRef.current++;
+      setLoading(false);
+      setPage(1);
+      setResources([]);
+      setTotal(0);
+      setTotalPages(0);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '清空回收站失败');
     }
   };
 
   const handleBatchRestore = async () => {
-    let count = 0;
-    for (const id of selectedIds) {
-      try {
-        await restoreResource(id);
-        count++;
-      } catch { /* skip failures */ }
+    // 防止快速双击/重复点击：第二次请求会因资源已被恢复而误报"恢复失败"
+    if (restoring) return;
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setRestoring(true);
+    try {
+      const result = await batchRestoreResources(ids);
+      // 恢复成功的从选中中移除；失败项保留选中，便于用户定位/重试
+      const failedSet = new Set(result.failedResourceIds);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) {
+          if (!failedSet.has(id)) next.delete(id);
+        }
+        return next;
+      });
+      if (result.failed > 0) {
+        if (result.restored === 0) {
+          toast.error(`批量恢复失败：${result.failed} 个资源未恢复（已保留选中）`);
+        } else {
+          toast.warning(
+            `已恢复 ${result.restored} 个资源，${result.failed} 个恢复失败（已保留选中）`,
+          );
+        }
+      } else {
+        toast.success(`已恢复 ${result.restored} 个资源`);
+      }
+      await fetchTrash();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '批量恢复失败');
+    } finally {
+      setRestoring(false);
     }
-    toast.success(`已恢复 ${count} 个资源`);
-    setSelectedIds(new Set());
-    await fetchTrash();
   };
-
-  const columns: Column<ResourceListItem>[] = [
-    {
-      key: 'title',
-      header: '资源名称',
-      render: (r) => (
-        <div className="flex items-center gap-2">
-          {r.acquisitionMode === 'link_only' ? (
-            <ExternalLink className="h-5 w-5 text-primary" />
-          ) : (
-            <ResourceTypeIcon type={r.resourceType} className="h-5 w-5 text-muted-foreground" />
-          )}
-          <span className="font-medium">{r.title || r.originalFilename}</span>
-        </div>
-      ),
-    },
-    {
-      key: 'resourceType',
-      header: '类型',
-      className: 'w-24',
-      render: (r) => <ResourceTypeBadge type={r.resourceType} />,
-    },
-    {
-      key: 'sizeBytes',
-      header: '大小',
-      className: 'w-20 text-right',
-      render: (r) => (
-        <span className="text-muted-foreground">{r.acquisitionMode === 'link_only' ? '链接' : formatByteString(r.sizeBytes)}</span>
-      ),
-    },
-    {
-      key: 'deletedAt',
-      header: '删除时间',
-      className: 'w-44',
-      render: (r) => (
-        <span className="text-muted-foreground">{r.deletedAt ? formatDateTime(r.deletedAt) : '-'}</span>
-      ),
-    },
-    {
-      key: 'actions',
-      header: '操作',
-      className: 'w-28 text-right',
-      render: (r) => (
-        <div className="flex justify-end gap-1">
-          <Button variant="ghost" size="sm" onClick={() => handleRestore(r.id)}>
-            <Undo2 className="h-3 w-3" />
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(r)}>
-            <Trash2 className="h-3 w-3 text-destructive" />
-          </Button>
-        </div>
-      ),
-    },
-  ];
 
   return (
     <div>
       <PageHeader title="回收站" description="已删除的资源">
         <div className="flex flex-wrap gap-2">
           {selectedIds.size > 0 && (
-            <Button variant="outline" size="sm" className="gap-1" onClick={handleBatchRestore}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={handleBatchRestore}
+              disabled={restoring}
+            >
               <RotateCcw className="h-4 w-4" />
-              批量恢复 ({selectedIds.size})
+              {restoring ? '恢复中…' : `批量恢复 (${selectedIds.size})`}
             </Button>
           )}
           {resources.length > 0 && (
@@ -174,22 +183,58 @@ export default function TrashPage() {
         </div>
       </PageHeader>
 
-      <DataTable
-        columns={columns}
-        data={resources}
-        loading={loading}
-        error={error ?? undefined}
-        onRetry={fetchTrash}
-        emptyTitle="回收站为空"
-        emptyDescription="删除的资源将在这里显示"
-        keyExtractor={(r) => r.id}
-        selectedIds={selectedIds}
-        onSelectionChange={setSelectedIds}
-      />
+      {/* 加载/错误/列表：回收站的已删除资源不可再跳转详情，故固定为卡片视图。
+          点击卡片仅用于多选，右上角提供“恢复 / 彻底删除”操作。 */}
+      {loading ? (
+        <LoadingState variant="card" count={8} />
+      ) : error ? (
+        <ErrorState message={error} onRetry={fetchTrash} />
+      ) : resources.length === 0 ? (
+        <EmptyState title="回收站为空" description="删除的资源将在这里显示" />
+      ) : (
+        <ResourceGrid
+          resources={resources}
+          selectedIds={selectedIds}
+          onSelectionChange={setSelectedIds}
+          selectMode
+          onRestore={handleRestore}
+          onDelete={(id) => {
+            const target = resources.find((r) => r.id === id);
+            if (target) setDeleteTarget(target);
+          }}
+        />
+      )}
+
+      {/* 分页：回收站数量超过一页时可翻页访问全部记录 */}
+      {totalPages > 1 && !loading && !error && (
+        <div className="mt-4 flex items-center justify-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+          >
+            上一页
+          </Button>
+          <span className="text-sm text-muted-foreground">
+            {page} / {totalPages}（共 {total} 项）
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page >= totalPages}
+            onClick={() => setPage((p) => p + 1)}
+          >
+            下一页
+          </Button>
+        </div>
+      )}
 
       <ConfirmDialog
         open={!!deleteTarget}
-        onOpenChange={(v) => { if (!v) setDeleteTarget(null); }}
+        onOpenChange={(v) => {
+          if (!v) setDeleteTarget(null);
+        }}
         title="彻底删除"
         description={`确定要彻底删除 "${deleteTarget?.title || deleteTarget?.originalFilename}" 吗？此操作不可撤销。`}
         variant="destructive"

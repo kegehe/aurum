@@ -6,13 +6,6 @@ export interface ResourceTypeCount {
   count: number;
 }
 
-export interface PopularTagRow {
-  id: string;
-  name: string;
-  color: string | null;
-  usageCount: number;
-}
-
 /**
  * 统计仓储
  * 封装 dashboard 需要的聚合查询。
@@ -47,10 +40,6 @@ export class StatsRepository {
     return result._sum.sizeBytes ?? BigInt(0);
   }
 
-  countCollections(): Promise<number> {
-    return this.prisma.collection.count({ where: { deletedAt: null } });
-  }
-
   async processingStats(): Promise<Record<string, number>> {
     const jobs = await this.prisma.processingJob.groupBy({
       by: ['status'],
@@ -68,28 +57,6 @@ export class StatsRepository {
       result[job.status] = job._count.status;
     }
     return result;
-  }
-
-  async popularTags(limit: number = 8): Promise<PopularTagRow[]> {
-    const tags = await this.prisma.tag.findMany({
-      include: {
-        resources: {
-          where: { resource: { deletedAt: null } },
-          select: { resourceId: true },
-        },
-      },
-    });
-
-    return tags
-      .map((tag) => ({
-        id: tag.id,
-        name: tag.name,
-        color: tag.color,
-        usageCount: tag.resources.length,
-      }))
-      .filter((tag) => tag.usageCount > 0)
-      .sort((a, b) => b.usageCount - a.usageCount || a.name.localeCompare(b.name))
-      .slice(0, limit);
   }
 
   recentFailedJobs(limit: number = 5) {

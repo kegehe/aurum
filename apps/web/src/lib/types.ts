@@ -13,7 +13,7 @@ import type {
   ProcessingStatus,
   JobStatus,
   JobType,
-} from '@resource-service/shared-types';
+} from '@aurum/shared-types';
 
 // ==================== 资源 ====================
 
@@ -30,11 +30,8 @@ export interface ResourceListItem {
   categoryId: string | null;
   source: string | null;
   author: string | null;
-  licenseNote: string | null;
   acquisitionMode?: AcquisitionMode;
   sourceId?: string | null;
-  licenseId?: string | null;
-  licenseStatus?: string;
   externalCreatedAt?: string | null;
   externalUpdatedAt?: string | null;
   isFavorite: boolean;
@@ -43,7 +40,10 @@ export interface ResourceListItem {
   width: number | null;
   height: number | null;
   durationSeconds: string | null;
-  searchVector: string | null;
+  /** Remote preview image/video URL for resources without a local thumbnail. */
+  previewUrl?: string | null;
+  /** 搜索用全文（仅详情/列表接口提供） */
+  searchVector?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
@@ -64,21 +64,11 @@ export interface ResourceFile {
   createdAt: string;
 }
 
-export interface TagItem {
-  id: string;
-  name: string;
-  color: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface ResourceDetail extends ResourceListItem {
   files: ResourceFile[];
   locators?: ResourceLocator[];
   sourceRecord?: { id: string; name: string; slug: string } | null;
-  license?: { id: string; spdxId: string | null; name: string; url: string | null } | null;
   provenance?: ResourceProvenance[];
-  tags: TagItem[];
   isDuplicate: boolean;
   duplicateOf: ResourceListItem | null;
 }
@@ -105,8 +95,6 @@ export interface ResourceProvenance {
   publisher: string | null;
   authorName: string | null;
   authorUrl: string | null;
-  licenseText: string | null;
-  licenseUrl: string | null;
   attributionText: string | null;
   capturedAt: string;
 }
@@ -117,7 +105,6 @@ export interface UpdateResourceData {
   categoryId?: string | null;
   source?: string | null;
   author?: string | null;
-  licenseNote?: string | null;
 }
 
 export interface SearchResourcesParams {
@@ -131,9 +118,6 @@ export interface SearchResourcesParams {
   categoryId?: string;
   categoryIds?: string[];
   uncategorized?: boolean;
-  tagId?: string;
-  tagIds?: string[];
-  tagMode?: 'and' | 'or';
   acquisitionMode?: string;
   createdAtRange?: { start?: string; end?: string };
   updatedAtRange?: { start?: string; end?: string };
@@ -141,6 +125,8 @@ export interface SearchResourcesParams {
   isFavorite?: boolean;
   processingStatus?: ProcessingStatus;
   includeDeleted?: boolean;
+  /** 仅返回回收站中的资源（deletedAt 非空） */
+  deletedOnly?: boolean;
   sortBy?: 'createdAt' | 'updatedAt' | 'sizeBytes' | 'title';
   sortOrder?: 'asc' | 'desc';
 }
@@ -166,22 +152,6 @@ export interface BatchUploadResult {
     | { success: true; resource: UploadResult['resource'] }
     | { success: false; filename: string; error: string }
   >;
-}
-
-// ==================== 标签 ====================
-
-export interface TagWithUsage extends TagItem {
-  usageCount: number;
-}
-
-export interface CreateTagData {
-  name: string;
-  color?: string;
-}
-
-export interface UpdateTagData {
-  name?: string;
-  color?: string;
 }
 
 // ==================== 分类 ====================
@@ -210,36 +180,6 @@ export interface UpdateCategoryData {
   name?: string;
   parentId?: string | null;
   sortOrder?: number;
-}
-
-// ==================== 集合 ====================
-
-export interface CollectionItem {
-  id: string;
-  name: string;
-  description: string | null;
-  coverResourceId: string | null;
-  createdAt: string;
-  updatedAt: string;
-  deletedAt: string | null;
-  resourceCount: number;
-  coverResource: Pick<ResourceListItem, 'id' | 'title' | 'resourceType'> | null;
-}
-
-export interface CollectionDetail extends CollectionItem {
-  resources: Array<ResourceListItem & { sortOrder: number }>;
-}
-
-export interface CreateCollectionData {
-  name: string;
-  description?: string;
-  coverResourceId?: string;
-}
-
-export interface UpdateCollectionData {
-  name?: string;
-  description?: string;
-  coverResourceId?: string | null;
 }
 
 // ==================== 处理任务 ====================
@@ -272,7 +212,6 @@ export interface CreateLinkImportData {
   sourceId?: string;
   categoryId?: string;
   title?: string;
-  tagIds?: string[];
 }
 
 export interface IngestionJobItem {
@@ -286,10 +225,29 @@ export interface IngestionJobItem {
   retryCount: number;
   errorCode: string | null;
   errorMessage: string | null;
+  startedAt: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
   resource: { id: string; title: string } | null;
+  source: { id: string; name: string } | null;
+}
+
+export interface ListIngestionJobsParams {
+  status?: IngestionJobStatus;
+  jobType?: IngestionJobType;
+  sourceId?: string;
+  resourceId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface IngestionJobStats {
+  pending: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  canceled: number;
 }
 
 // ==================== 统计 ====================
@@ -302,23 +260,18 @@ export interface ResourceTypeStatsItem {
 
 export interface DashboardOverview {
   resourceTotal: number;
-  collectionTotal: number;
   totalStorageBytes: string;
   processingStats: ProcessingJobStats;
   resourceTypes: ResourceTypeStatsItem[];
-  popularTags: Array<{
-    id: string;
-    name: string;
-    color: string | null;
-    usageCount: number;
-  }>;
-  recentFailedJobs: Array<ProcessingJobItem & {
-    resource: {
-      id: string;
-      title: string;
-      originalFilename: string;
-    };
-  }>;
+  recentFailedJobs: Array<
+    ProcessingJobItem & {
+      resource: {
+        id: string;
+        title: string;
+        originalFilename: string;
+      };
+    }
+  >;
 }
 
 // ==================== 来源 ====================
@@ -333,12 +286,16 @@ export interface SourceItem {
   allowedModes: string;
   termsUrl: string | null;
   robotsUrl: string | null;
-  defaultLicenseId: string | null;
-  defaultLicense: { id: string; spdxId: string | null; name: string } | null;
   rateLimitPerMinute: number;
+  downloadIntervalMs: number;
   maxConcurrency: number;
   requiresReview: boolean;
+  config: string | null;
+  autoSyncIntervalHours: number | null;
+  downloadDirectory: string | null;
   lastSyncedAt: string | null;
+  lastSyncStatus: string | null;
+  lastSyncError: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -354,11 +311,13 @@ export interface CreateSourceData {
   allowedModes?: string;
   termsUrl?: string;
   robotsUrl?: string;
-  defaultLicenseId?: string;
   rateLimitPerMinute?: number;
+  downloadIntervalMs?: number;
   maxConcurrency?: number;
   requiresReview?: boolean;
   config?: string;
+  autoSyncIntervalHours?: number | null;
+  downloadDirectory?: string;
 }
 
 export interface UpdateSourceData {
@@ -370,52 +329,177 @@ export interface UpdateSourceData {
   allowedModes?: string;
   termsUrl?: string | null;
   robotsUrl?: string | null;
-  defaultLicenseId?: string | null;
   rateLimitPerMinute?: number;
+  downloadIntervalMs?: number;
   maxConcurrency?: number;
   requiresReview?: boolean;
   config?: string | null;
+  autoSyncIntervalHours?: number | null;
+  downloadDirectory?: string | null;
 }
 
-// ==================== 许可证 ====================
+// ==================== 样式实验室 ====================
 
-export interface LicenseItem {
+export interface StyleColor {
+  hex: string;
+  role: string;
+  approxName?: string;
+}
+
+export interface StyleColorPalette {
+  primary: StyleColor;
+  background: StyleColor;
+  accent: StyleColor;
+  scale: string[];
+  mood: string;
+}
+
+export interface StyleTypeHierarchy {
+  role: string;
+  sizePx: number;
+  weight: number;
+  letterSpacing?: string;
+}
+
+export interface StyleTypography {
+  familyTrait: string;
+  suggestedFont?: string;
+  weights: number[];
+  hierarchy: StyleTypeHierarchy[];
+  lineHeight: number;
+}
+
+export interface StyleSpacing {
+  unit: number;
+  scale: number[];
+  density: 'compact' | 'comfortable' | 'loose';
+}
+
+export interface StyleLayout {
+  composition: string;
+  regions: string[];
+  grid: { columns: number; gutterPx: number } | null;
+  balance: string;
+}
+
+export interface StyleTextureMood {
+  radius: string;
+  shadow: string;
+  gradient: string | null;
+  density: string;
+  keywords: string[];
+}
+
+export interface StyleProfile {
+  colorPalette: StyleColorPalette;
+  typography: StyleTypography;
+  spacing: StyleSpacing;
+  layout: StyleLayout;
+  textureMood: StyleTextureMood;
+  styleGuideText: string;
+}
+
+export interface StyleImagePrompt {
+  midjourney: string;
+  stableDiffusion: string;
+  flux: string;
+  referenceNote: string;
+}
+
+export interface StyleVariation {
   id: string;
-  spdxId: string | null;
   name: string;
-  url: string | null;
-  text: string | null;
-  allowsCommercialUse: boolean | null;
-  allowsRedistribution: boolean | null;
-  allowsDerivatives: boolean | null;
-  requiresAttribution: boolean;
-  shareAlike: boolean;
+  description: string;
+  composition: string;
+  html: string;
+  imagePrompt: StyleImagePrompt;
+}
+
+export interface StyleExports {
+  cssTokens: string;
+  styleGuide: string;
+}
+
+export interface StyleAnalyzeResult {
+  /** 分析来源：ai = 视觉 AI；local = 本地确定性分析（AI 未配置/失败时自动降级） */
+  source: 'ai' | 'local';
+  image: { width: number; height: number; format: string };
+  detectedColors: string[];
+  profile: StyleProfile;
+  variations: StyleVariation[];
+  exports: StyleExports;
+}
+
+export interface StyleHealth {
+  /** 功能可用性：样式实验室始终可用（AI 或本地），此字段恒为 true */
+  available: boolean;
+  /** 当前分析来源：ai / local */
+  source: 'ai' | 'local';
+  model: string;
+}
+
+// ==================== AI 配置（设置 → AI 配置） ====================
+
+export interface AiProviderItem {
+  id: string;
+  name: string;
+  provider: string;
+  baseUrl: string | null;
+  /** 掩码后的密钥（仅展示前后少量字符） */
+  apiKey: string;
+  hasApiKey: boolean;
+  model: string;
+  isActive: boolean;
+  enabled: boolean;
+  lastTestedAt: string | null;
+  lastTestStatus: 'ok' | 'error' | null;
+  lastTestError: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
-export type LicenseDetail = LicenseItem;
-
-export interface CreateLicenseData {
-  spdxId?: string;
-  name: string;
-  url?: string;
-  text?: string;
-  allowsCommercialUse?: boolean;
-  allowsRedistribution?: boolean;
-  allowsDerivatives?: boolean;
-  requiresAttribution?: boolean;
-  shareAlike?: boolean;
+export interface AiProviderSummary {
+  available: boolean;
+  model: string;
+  provider: string | null;
+  name: string | null;
+  /** db = 数据库生效配置；env = 回退到环境变量；null = 未配置 */
+  source: 'db' | 'env' | null;
 }
 
-export interface UpdateLicenseData {
-  spdxId?: string | null;
+export interface AiTestResult {
+  success: boolean;
+  latencyMs?: number;
+  model?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface CreateAiProviderData {
+  name: string;
+  provider?: string;
+  baseUrl?: string;
+  apiKey: string;
+  model?: string;
+  enabled?: boolean;
+  isActive?: boolean;
+}
+
+export interface UpdateAiProviderData {
   name?: string;
-  url?: string | null;
-  text?: string | null;
-  allowsCommercialUse?: boolean | null;
-  allowsRedistribution?: boolean | null;
-  allowsDerivatives?: boolean | null;
-  requiresAttribution?: boolean;
-  shareAlike?: boolean;
+  provider?: string;
+  baseUrl?: string | null;
+  /** 留空 / 掩码值表示不修改现有密钥 */
+  apiKey?: string;
+  model?: string;
+  enabled?: boolean;
+  isActive?: boolean;
+}
+
+export interface TestAiProviderData {
+  provider?: string;
+  baseUrl?: string;
+  apiKey: string;
+  model?: string;
+  name?: string;
 }

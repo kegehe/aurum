@@ -13,7 +13,6 @@ import {
 import { Type, Transform } from 'class-transformer';
 import { ResourceType, ProcessingStatus } from '../../../common/constants/enums';
 
-
 /**
  * 资源排序字段
  */
@@ -27,16 +26,6 @@ export enum ResourceSortField {
 export enum SortOrder {
   asc = 'asc',
   desc = 'desc',
-}
-
-/**
- * 多标签筛选逻辑
- * - and：资源必须同时拥有所有指定标签
- * - or：资源拥有任一指定标签即可
- */
-export enum TagFilterMode {
-  and = 'and',
-  or = 'or',
 }
 
 /**
@@ -76,9 +65,8 @@ export class SizeRangeDto {
  * - keyword 搜索范围扩展到 source、author、searchVector（提取文本）
  * - 新增日期范围筛选（createdAtRange、updatedAtRange）
  * - 新增文件大小范围筛选（sizeRange）
- * - 新增多标签筛选（tagIds + tagMode）
  * - 新增多类型/多分类筛选（resourceTypes、categoryIds）
- * - 保留单值字段（resourceType、categoryId、tagId）向后兼容
+ * - 保留单值字段（resourceType、categoryId）向后兼容
  */
 export class SearchResourceDto extends PaginationDto {
   // ==================== 关键词搜索 ====================
@@ -145,29 +133,6 @@ export class SearchResourceDto extends PaginationDto {
   @IsBoolean()
   uncategorized?: boolean;
 
-  // ==================== 标签筛选 ====================
-
-  /** 单标签筛选（向后兼容） */
-  @IsOptional()
-  @IsString()
-  tagId?: string;
-
-  /** 多标签筛选 */
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  @Transform(({ value }) => {
-    if (typeof value === 'string') return [value];
-    if (Array.isArray(value)) return value;
-    return value;
-  })
-  tagIds?: string[];
-
-  /** 多标签逻辑：and（默认）= 必须同时拥有所有标签，or = 拥有任一即可 */
-  @IsOptional()
-  @IsEnum(TagFilterMode)
-  tagMode?: TagFilterMode;
-
   // ==================== 日期范围 ====================
 
   /** 创建时间范围 */
@@ -213,6 +178,16 @@ export class SearchResourceDto extends PaginationDto {
   })
   @IsBoolean()
   includeDeleted?: boolean;
+
+  /** 仅返回回收站中的资源（deletedAt 非空） */
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  deletedOnly?: boolean;
 
   // ==================== 获取模式筛选 ====================
 

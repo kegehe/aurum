@@ -1,6 +1,6 @@
-# 资源管理平台
+# Aurum
 
-面向个人、工作室或小团队的多类型资源管理平台。系统支持上传、管理、预览、搜索、批量操作、回收站、处理任务和统计看板，当前以本地 SQLite + 本地磁盘存储为开发运行方式。
+Aurum 是面向个人、工作室或小团队的多类型资源管理平台。系统支持上传、管理、预览、搜索、批量操作、回收站、处理任务和统计看板，当前以本地 SQLite + 本地磁盘存储为开发运行方式。
 
 ## 当前状态
 
@@ -9,18 +9,19 @@
 | 模块           | 能力                                                                                |
 | -------------- | ----------------------------------------------------------------------------------- |
 | 后端 API       | NestJS API、全局配置校验、统一错误响应、请求日志                                    |
-| 数据模型       | Prisma + SQLite，资源、文件、标签、分类、集合、处理任务等核心表                     |
+| 数据模型       | Prisma + SQLite，资源、文件、分类、处理任务等核心表                           |
 | 存储           | 本地磁盘存储、hash 分片路径、路径穿越防护                                           |
 | 上传           | 单文件/批量上传、MIME 识别、SHA-256 去重、上传限制                                  |
 | 资源管理       | 列表、详情、元数据更新、下载、预览、缩略图入口、重新处理                            |
-| 搜索筛选       | 关键词、类型、分类、标签 AND/OR、收藏、处理状态、时间/大小范围、排序                |
-| 标签/分类/集合 | CRUD、树形分类、集合详情、资源加入/移除集合                                         |
-| 批量操作       | 批量移动分类、收藏/取消收藏、软删除、标签添加/移除、加入集合、ZIP 下载              |
+| 搜索筛选       | 关键词、类型、分类、收藏、处理状态、时间/大小范围、排序                         |
+| 分类           | 树形分类                                                                           |
+| 批量操作       | 批量移动分类、收藏/取消收藏、软删除、ZIP 下载                                    |
 | 回收站         | 软删除、恢复、彻底删除、清空回收站                                                  |
 | 处理任务       | 进程内轮询调度、任务列表、统计、失败重试、临时文件清理                              |
 | 统计与一致性   | 概览统计、资源类型统计、存储文件一致性检查                                          |
-| 外部资源接入   | 来源配置、许可证管理、链接导入、SSRF 防护、幂等任务、元数据提取（P1-P3 已完成）      |
-| 前端           | Next.js 15 管理界面：上传、资源库、详情、分类、标签、集合、回收站、处理任务、仪表盘 |
+| 外部资源接入   | 来源配置、链接导入、SSRF 防护、幂等任务、元数据提取、Civitai 定时自动同步               |
+| 样式实验室     | AI 视觉样式分析（配色/字体/排版/布局）、多种布局变体、生图提示词 / CSS Tokens 导出   |
+| 前端           | Next.js 15 管理界面：上传、资源库、详情、分类、回收站、处理任务、仪表盘、样式实验室 |
 | 测试验收       | API 单元测试、类型检查、lint、API/Web 生产构建                                      |
 
 ## 技术栈
@@ -101,7 +102,7 @@ pnpm dev:web
 | `pnpm build:api`   | 构建 API               |
 | `pnpm build:web`   | 构建 Web               |
 | `pnpm db:migrate`  | 执行 Prisma 迁移       |
-| `pnpm db:seed`     | 写入默认分类和标签     |
+| `pnpm db:seed`     | 写入默认分类     |
 | `pnpm db:studio`   | 打开 Prisma Studio     |
 | `pnpm db:generate` | 重新生成 Prisma Client |
 
@@ -136,8 +137,14 @@ pnpm build:web
 | `WORKER_CONCURRENCY`       | 任务并发数        | `2`                         |
 | `INGESTION_POLL_INTERVAL_MS` | 导入任务轮询间隔 | `3000`                    |
 | `INGESTION_STALE_JOB_TIMEOUT_MS` | 导入任务超时 | `60000`                |
+| `INGESTION_AUTO_SYNC_CHECK_INTERVAL_MS` | 来源定时自动同步检查间隔 | `60000`      |
+| `INGESTION_AUTO_SYNC_BATCH_SIZE` | 每轮自动同步最多创建的任务数 | `10`            |
 | `THUMBNAIL_MAX_WIDTH`      | 缩略图最大宽度    | `400`                       |
 | `THUMBNAIL_MAX_HEIGHT`     | 缩略图最大高度    | `400`                       |
+| `ANTHROPIC_API_KEY`        | AI Key 环境变量回退（页面「设置 → AI 配置」优先；数据库无生效配置时使用） | （空）   |
+| `ANTHROPIC_BASE_URL`       | AI 自定义接口地址（可选，官方留空；SDK 自动追加 `/v1/messages`） | （空）   |
+| `AI_STYLE_MODEL`           | 样式分析模型      | `claude-sonnet-5`           |
+| `MAX_STYLE_IMAGE_SIZE_MB`  | 单张分析图片上限  | `20`                        |
 | `NEXT_PUBLIC_API_URL`      | Web 调用 API 地址 | `http://localhost:3000/api` |
 
 ## API 概览
@@ -151,7 +158,7 @@ pnpm build:web
 | `POST` | `/api/upload`       | 单文件上传，字段名 `file` |
 | `POST` | `/api/upload/batch` | 批量上传，字段名 `files`  |
 
-上传可附带 `title`、`description`、`categoryId`、`source`、`author`、`licenseNote`。
+上传可附带 `title`、`description`、`categoryId`、`source`、`author`。
 
 ### 资源
 
@@ -167,11 +174,9 @@ pnpm build:web
 | `POST`   | `/api/resources/:id/restore`     | 恢复           |
 | `DELETE` | `/api/resources/:id/permanent`   | 彻底删除       |
 | `POST`   | `/api/resources/:id/reprocess`   | 重新处理       |
-| `POST`   | `/api/resources/:id/tags/:tagId` | 添加标签       |
-| `DELETE` | `/api/resources/:id/tags/:tagId` | 移除标签       |
 | `DELETE` | `/api/resources/trash/empty`     | 清空回收站     |
 
-资源列表支持 `page`、`pageSize`、`keyword`、`resourceType`、`resourceTypes`、`categoryId`、`categoryIds`、`tagId`、`tagIds`、`tagMode`、`source`、`author`、`isFavorite`、`processingStatus`、`includeDeleted`、`sortBy`、`sortOrder` 等查询参数。
+资源列表支持 `page`、`pageSize`、`keyword`、`resourceType`、`resourceTypes`、`categoryId`、`categoryIds`、`source`、`author`、`isFavorite`、`processingStatus`、`includeDeleted`、`deletedOnly`、`sortBy`、`sortOrder` 等查询参数。
 
 ### 批量资源操作
 
@@ -181,17 +186,12 @@ pnpm build:web
 | `POST` | `/api/resources/batch/category`    | 批量移动分类      |
 | `POST` | `/api/resources/batch/favorite`    | 批量收藏/取消收藏 |
 | `POST` | `/api/resources/batch/delete`      | 批量软删除        |
-| `POST` | `/api/resources/batch/tags/add`    | 批量添加标签      |
-| `POST` | `/api/resources/batch/tags/remove` | 批量移除标签      |
 
-### 标签、分类、集合
+### 分类
 
 | 模块     | 路径                             |
 | -------- | -------------------------------- |
-| 标签     | `/api/tags`                      |
 | 分类     | `/api/categories`                |
-| 集合     | `/api/collections`               |
-| 集合资源 | `/api/collections/:id/resources` |
 
 ### 处理任务、统计、一致性
 
@@ -204,7 +204,7 @@ pnpm build:web
 | `GET`  | `/api/stats/resource-types`         | 资源类型统计   |
 | `GET`  | `/api/consistency/check`            | 存储一致性检查 |
 
-### 来源与许可证
+### 来源
 
 | 方法     | 路径                      | 说明                   |
 | -------- | ------------------------- | ---------------------- |
@@ -212,12 +212,7 @@ pnpm build:web
 | `GET`    | `/api/sources/:id`        | 来源详情               |
 | `POST`   | `/api/sources`            | 创建来源配置           |
 | `PATCH`  | `/api/sources/:id`        | 更新来源配置           |
-| `DELETE` | `/api/sources/:id`        | 删除来源（无关联时）   |
-| `GET`    | `/api/licenses`           | 许可证列表             |
-| `GET`    | `/api/licenses/:id`       | 许可证详情             |
-| `POST`   | `/api/licenses`           | 创建许可证             |
-| `PATCH`  | `/api/licenses/:id`       | 更新许可证             |
-| `DELETE` | `/api/licenses/:id`       | 删除许可证（无关联时） |
+| `DELETE` | `/api/sources/:id`        | 删除来源（资源保留，关联来源信息经外键置空/级联） |
 
 ### 外部资源导入
 
@@ -228,10 +223,33 @@ pnpm build:web
 | `GET`  | `/api/ingestion/jobs/:id`         | 导入任务详情       |
 | `POST` | `/api/ingestion/jobs/:id/retry`   | 重试导入任务       |
 
+### 样式实验室（AI）
+
+| 方法   | 路径                  | 说明                                                       |
+| ------ | --------------------- | ---------------------------------------------------------- |
+| `GET`  | `/api/style/health`   | 样式实验室可用性（恒可用）与当前来源 `ai` / `local`、模型名       |
+| `POST` | `/api/style/analyze`  | 上传图片（multipart 字段 `image`）→ 样式档案 + 布局变体 + 导出包（AI 优先，失败/未配置自动降级本地，结果带 `source`） |
+
+### AI 配置（设置 → AI 配置）
+
+API Key / Base URL / 模型可在页面运行时管理，支持多个配置并切换生效项，无需改 `.env` 或重启 API。
+
+| 方法     | 路径                          | 说明                                               |
+| -------- | ----------------------------- | -------------------------------------------------- |
+| `GET`    | `/api/ai-settings/summary`    | 当前生效配置摘要（含环境变量回退状态）             |
+| `GET`    | `/api/ai-settings`            | 配置列表（密钥已掩码）                             |
+| `GET`    | `/api/ai-settings/:id`        | 单个配置                                           |
+| `POST`   | `/api/ai-settings`            | 创建配置（首个自动生效）                           |
+| `PATCH`  | `/api/ai-settings/:id`        | 更新配置（`apiKey` 留空/掩码值表示不修改）         |
+| `DELETE` | `/api/ai-settings/:id`        | 删除配置（生效项删除后自动提升其它启用配置）       |
+| `POST`   | `/api/ai-settings/:id/activate` | 设为当前生效                                     |
+| `POST`   | `/api/ai-settings/:id/test`   | 测试已保存配置并记录结果                           |
+| `POST`   | `/api/ai-settings/test`       | 测试未保存的临时配置                               |
+
 ## 项目结构
 
 ```text
-resource_service/
+aurum/
 ├── apps/
 │   ├── api/                 # NestJS API
 │   │   ├── prisma/          # Prisma schema、迁移、seed
@@ -255,10 +273,13 @@ resource_service/
 - 本地存储 key 会经过路径穿越校验，禁止绝对路径、反斜杠、冒号、空字节和 `.`/`..` 段。
 - 永久删除和清空回收站会先删除存储文件，再删除数据库记录；文件删除失败时记录保留，可重试。
 - `pnpm lint` 会运行 API ESLint `--fix`，可能产生格式化改动。
+- 样式实验室（`apps/api/src/modules/style`）是**精益版**：不落库、不走任务队列，`POST /style/analyze` 同步返回结果；颜色 HEX 由 sharp 确定性提取，大模型只做语义命名。**AI 未配置或调用失败时自动降级为本地确定性分析**（色板仍取自像素、布局用预置模板渲染，零费用），前端通过结果 `source: 'ai' | 'local'` 标识来源。
+- AI Key 建议在「系统设置 → AI 配置」页面管理：支持多个配置、运行时切换生效项、连通性测试，立即生效。未配置任何数据库项时回退到环境变量 `ANTHROPIC_API_KEY`。
 
 ## 已知限制
 
 - 前端 E2E、真实 multipart 集成测试、真实媒体处理链路测试尚未自动化。
+- 样式实验室的 AI 模式依赖外部 API（单次分析会产生费用）；AI 未配置或失败时自动降级为本地确定性分析，因此功能始终可用。AI 管线已用 mock 覆盖单元测试，未做真实 Claude API 集成测试。
 - Web lint 当前使用 `next lint`，Next.js 15 会提示该命令将在 Next 16 移除。
 - Web lint/build 会提示未检测到 Next ESLint plugin；目前不阻断构建。
 - Docker Compose、生产备份和独立 Worker 部署仍需要后续整理。

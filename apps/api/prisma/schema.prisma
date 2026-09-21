@@ -1,4 +1,4 @@
-// Prisma Schema for 资源管理平台
+// Prisma Schema for Aurum
 //
 // 数据源：开发阶段使用 SQLite。SQLite connector 不支持 enum，因此枚举字段
 // 暂用 String 存储，值由应用层（shared-types 中的常量）约束。
@@ -24,55 +24,49 @@ datasource db {
 // ==================== 模型 ====================
 
 model Resource {
-  id               String   @id @default(uuid())
-  title            String
-  description      String?
-  originalFilename String
+  id                String    @id @default(uuid())
+  title             String
+  description       String?
+  originalFilename  String
   // ResourceType 枚举值，见 shared-types。SQLite 阶段用 String。
-  resourceType     String
-  mimeType         String
-  extension        String
-  sizeBytes        BigInt
-  sha256           String?
-  categoryId       String?
-  source           String?
-  author           String?
-  licenseNote      String?
+  resourceType      String
+  mimeType          String
+  extension         String
+  sizeBytes         BigInt
+  sha256            String?
+  categoryId        String?
+  source            String?
+  author            String?
   // 外部资源接入字段。local_upload 为已有上传资源的默认模式。
-  acquisitionMode  String   @default("local_upload")
-  sourceId         String?
-  licenseId        String?
-  licenseStatus    String   @default("unknown")
+  acquisitionMode   String    @default("local_upload")
+  sourceId          String?
   externalCreatedAt DateTime?
   externalUpdatedAt DateTime?
-  isFavorite       Boolean  @default(false)
+  isFavorite        Boolean   @default(false)
   // ProcessingStatus 枚举值（pending/processing/completed/failed）
-  processingStatus String   @default("pending")
-  duplicateOfId    String?
-  width            Int?
-  height           Int?
-  durationSeconds  Decimal?
+  processingStatus  String    @default("pending")
+  duplicateOfId     String?
+  width             Int?
+  height            Int?
+  durationSeconds   Decimal?
   // searchVector: PostgreSQL tsvector，SQLite 阶段用 String 占位，不写入
   // 切换 PG 后通过 raw migration 改为 tsvector 类型并建 GIN 索引
-  searchVector     String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
-  deletedAt        DateTime?
+  searchVector      String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
 
   // 关系
-  category        Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  sourceRecord    Source?              @relation(fields: [sourceId], references: [id], onDelete: SetNull)
-  license         License?             @relation(fields: [licenseId], references: [id], onDelete: SetNull)
-  duplicateOf     Resource?            @relation("ResourceDuplicates", fields: [duplicateOfId], references: [id], onDelete: SetNull)
-  duplicates      Resource[]           @relation("ResourceDuplicates")
-  files           ResourceFile[]
-  tags            ResourceTag[]
-  collectionItems CollectionResource[]
-  processingJobs  ProcessingJob[]
-  covers          Collection[]         @relation("CollectionCover")
-  locators        ResourceLocator[]
-  provenance      ResourceProvenance[]
-  ingestionJobs   IngestionJob[]
+  category           Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  sourceRecord       Source?              @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  duplicateOf        Resource?            @relation("ResourceDuplicates", fields: [duplicateOfId], references: [id], onDelete: SetNull)
+  duplicates         Resource[]           @relation("ResourceDuplicates")
+  files              ResourceFile[]
+  processingJobs     ProcessingJob[]
+  locators           ResourceLocator[]
+  provenance         ResourceProvenance[]
+  ingestionJobs      IngestionJob[]
+  referenceSnapshots ReferenceSnapshot[]  @relation("ReferenceSnapshotResource")
 
   @@index([sha256])
   @@index([isFavorite])
@@ -80,9 +74,7 @@ model Resource {
   @@index([resourceType])
   @@index([categoryId])
   @@index([sourceId])
-  @@index([licenseId])
   @@index([acquisitionMode])
-  @@index([licenseStatus])
   @@index([createdAt])
   @@index([updatedAt])
   @@index([deletedAt])
@@ -97,81 +89,98 @@ model Resource {
 }
 
 model Source {
-  id                 String   @id @default(uuid())
-  name               String
-  slug               String   @unique
-  baseUrl            String?
-  sourceType         String
-  enabled            Boolean  @default(true)
-  allowedModes       String   @default("link_only,metadata_only")
-  termsUrl           String?
-  robotsUrl          String?
-  defaultLicenseId   String?
-  rateLimitPerMinute Int      @default(30)
-  maxConcurrency     Int      @default(1)
-  requiresReview     Boolean  @default(false)
-  config             String?
-  lastSyncedAt       DateTime?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id                    String    @id @default(uuid())
+  name                  String
+  slug                  String    @unique
+  baseUrl               String?
+  sourceType            String
+  enabled               Boolean   @default(true)
+  allowedModes          String    @default("link_only,metadata_only")
+  termsUrl              String?
+  robotsUrl             String?
+  rateLimitPerMinute    Int       @default(30)
+  downloadIntervalMs    Int       @default(1000)
+  maxConcurrency        Int       @default(1)
+  requiresReview        Boolean   @default(false)
+  config                String?
+  /// 定时自动同步间隔（小时）；null = 关闭，>0 = 每隔 N 小时自动拉取
+  autoSyncIntervalHours Int?
+  /// 下载目录（相对存储根目录的子目录，如 `civitai/foo`）；null = 默认存储布局
+  downloadDirectory     String?
+  lastSyncedAt          DateTime?
+  lastSyncStatus        String?
+  lastSyncError         String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
-  defaultLicense License?            @relation("SourceDefaultLicense", fields: [defaultLicenseId], references: [id], onDelete: SetNull)
-  resources      Resource[]
-  locators       ResourceLocator[]
-  provenance     ResourceProvenance[]
-  ingestionJobs  IngestionJob[]
+  resources     Resource[]
+  locators      ResourceLocator[]
+  provenance    ResourceProvenance[]
+  ingestionJobs IngestionJob[]
+  referenceTermsAcceptances DesignReferenceTermsAcceptance[]
+  designReferenceQuota      DesignReferenceQuota?
 
   @@index([enabled])
   @@map("sources")
 }
 
-model License {
-  id                   String   @id @default(uuid())
-  spdxId               String?  @unique
-  name                 String
-  url                  String?
-  text                 String?
-  allowsCommercialUse  Boolean?
-  allowsRedistribution Boolean?
-  allowsDerivatives    Boolean?
-  requiresAttribution  Boolean  @default(false)
-  shareAlike           Boolean  @default(false)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-
-  resources       Resource[]
-  defaultForSources Source[] @relation("SourceDefaultLicense")
-
-  @@map("licenses")
-}
-
 model ResourceLocator {
-  id             String   @id @default(uuid())
-  resourceId     String
-  sourceId       String?
-  locatorType    String
-  url            String
-  canonicalUrl   String?
-  identityUrl    String?  @unique
-  externalId     String?
-  isPrimary      Boolean  @default(false)
-  httpStatus     Int?
-  contentType    String?
-  contentLength  BigInt?
-  etag           String?
-  lastModified   DateTime?
-  lastCheckedAt  DateTime?
-  lastError      String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  id            String    @id @default(uuid())
+  resourceId    String
+  sourceId      String?
+  locatorType   String
+  url           String
+  canonicalUrl  String?
+  identityUrl   String?   @unique
+  externalId    String?
+  isPrimary     Boolean   @default(false)
+  httpStatus    Int?
+  contentType   String?
+  contentLength BigInt?
+  etag          String?
+  lastModified  DateTime?
+  lastCheckedAt DateTime?
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
   source   Source?  @relation(fields: [sourceId], references: [id], onDelete: SetNull)
 
+  @@unique([sourceId, externalId])
   @@index([resourceId])
   @@index([sourceId])
-  @@unique([sourceId, externalId])
   @@map("resource_locators")
+}
+
+// AI 供应商配置（可在「设置 → AI 配置」中管理，无需改 .env 重启）
+// 支持多个配置，同时仅一个生效（isActive）。未配置时回退到环境变量 ANTHROPIC_API_KEY。
+model AiProvider {
+  id             String          @id @default(uuid())
+  // 配置名称，如 "官方" / "中转代理"
+  name           String
+  // 供应商类型（当前仅支持 anthropic 兼容接口）
+  provider       String          @default("anthropic")
+  // 自定义接口地址（留空使用官方默认）。SDK 会在其后追加 /v1/messages
+  baseUrl        String?
+  // 密钥。落库为明文（本地自托管），对外只返回掩码
+  apiKey         String
+  // 使用的模型名，如 claude-sonnet-5
+  model          String          @default("claude-sonnet-5")
+  // 是否当前生效（同时仅一条为 true）
+  isActive       Boolean         @default(false)
+  // 是否启用；停用的配置不可生效，生效中停用会回退到下一个可用配置/环境变量
+  enabled        Boolean         @default(true)
+  // 最近一次连通性测试结果
+  lastTestedAt   DateTime?
+  lastTestStatus String?
+  lastTestError  String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  changeSessions ChangeSession[] @relation("ChangeSessionProvider")
+
+  @@index([isActive, enabled])
+  @@map("ai_providers")
 }
 
 model ResourceProvenance {
@@ -185,8 +194,6 @@ model ResourceProvenance {
   publisher        String?
   authorName       String?
   authorUrl        String?
-  licenseText      String?
-  licenseUrl       String?
   attributionText  String?
   rawMetadata      String?
   capturedAt       DateTime @default(now())
@@ -202,23 +209,23 @@ model ResourceProvenance {
 }
 
 model IngestionJob {
-  id             String   @id @default(uuid())
+  id             String    @id @default(uuid())
   sourceId       String?
   resourceId     String?
   jobType        String
-  status         String   @default("pending")
+  status         String    @default("pending")
   request        String
   result         String?
   idempotencyKey String
-  retryCount     Int      @default(0)
+  retryCount     Int       @default(0)
   nextRunAt      DateTime?
   startedAt      DateTime?
   leaseToken     String?
   finishedAt     DateTime?
   errorCode      String?
   errorMessage   String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   source     Source?              @relation(fields: [sourceId], references: [id], onDelete: SetNull)
   resource   Resource?            @relation(fields: [resourceId], references: [id], onDelete: SetNull)
@@ -232,19 +239,19 @@ model IngestionJob {
 }
 
 model ResourceFile {
-  id         String   @id @default(uuid())
-  resourceId String
+  id              String   @id @default(uuid())
+  resourceId      String
   // FileRole 枚举值（original/thumbnail/preview/extracted_text/transcode）
-  fileRole   String
-  variant    String   @default("")
-  storagePath String
-  mimeType   String
-  extension  String
-  sizeBytes  BigInt
-  width      Int?
-  height     Int?
+  fileRole        String
+  variant         String   @default("")
+  storagePath     String
+  mimeType        String
+  extension       String
+  sizeBytes       BigInt
+  width           Int?
+  height          Int?
   durationSeconds Decimal?
-  createdAt  DateTime @default(now())
+  createdAt       DateTime @default(now())
 
   resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
 
@@ -254,73 +261,20 @@ model ResourceFile {
   @@map("resource_files")
 }
 
-model Tag {
-  id        String        @id @default(uuid())
-  name      String        @unique
-  color     String?
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
-
-  resources ResourceTag[]
-
-  @@map("tags")
-}
-
-model ResourceTag {
-  resourceId String
-  tagId      String
-
-  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
-  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
-
-  @@id([resourceId, tagId])
-  @@index([tagId])
-  @@map("resource_tags")
-}
-
 model Category {
-  id        String       @id @default(uuid())
+  id        String   @id @default(uuid())
   name      String
   parentId  String?
-  sortOrder Int          @default(0)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  parent    Category?    @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
-  children  Category[]   @relation("CategoryTree")
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children  Category[] @relation("CategoryTree")
   resources Resource[]
 
   @@unique([name, parentId])
   @@map("categories")
-}
-
-model Collection {
-  id              String               @id @default(uuid())
-  name            String
-  description     String?
-  coverResourceId String?
-  createdAt       DateTime             @default(now())
-  updatedAt       DateTime             @updatedAt
-  deletedAt       DateTime?
-
-  coverResource Resource?             @relation("CollectionCover", fields: [coverResourceId], references: [id], onDelete: SetNull)
-  resources     CollectionResource[]
-
-  @@map("collections")
-}
-
-model CollectionResource {
-  collectionId String
-  resourceId   String
-  sortOrder    Int      @default(0)
-  addedAt      DateTime @default(now())
-
-  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
-  resource   Resource   @relation(fields: [resourceId], references: [id], onDelete: Cascade)
-
-  @@id([collectionId, resourceId])
-  @@index([collectionId])
-  @@map("collection_resources")
 }
 
 model ProcessingJob {
@@ -344,4 +298,374 @@ model ProcessingJob {
   @@index([status])
   @@index([createdAt])
   @@map("processing_jobs")
+}
+
+// ==================== AI 原生设计运营 ====================
+
+model DesignDocument {
+  id                        String   @id @default(uuid())
+  slug                      String   @unique
+  name                      String
+  kind                      String
+  status                    String   @default("draft")
+  visibility                String   @default("internal")
+  currentPublishedVersionId String?
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  versions                DesignVersion[]    @relation("DesignDocumentVersions")
+  currentPublishedVersion DesignVersion?     @relation("DesignDocumentCurrentVersion", fields: [currentPublishedVersionId], references: [id], onDelete: SetNull)
+  dependenciesFrom        DesignDependency[] @relation("DependencyFrom")
+  dependenciesTo          DesignDependency[] @relation("DependencyTo")
+  drafts                  DesignDraft[]
+  changeSetItems          ChangeSetItem[]
+  accessLogs              DesignAccessLog[]
+
+  @@index([kind, status])
+  @@index([currentPublishedVersionId])
+  @@map("design_documents")
+}
+
+model DesignVersion {
+  id                    String    @id @default(uuid())
+  documentId            String
+  versionNumber         Int
+  baseVersionId         String?
+  content               String
+  contentHash           String
+  summary               String?
+  changeKind            String    @default("create")
+  restoredFromVersionId String?
+  publishedAt           DateTime?
+  createdAt             DateTime  @default(now())
+
+  document              DesignDocument       @relation("DesignDocumentVersions", fields: [documentId], references: [id], onDelete: Cascade)
+  baseVersion           DesignVersion?       @relation("VersionLineage", fields: [baseVersionId], references: [id], onDelete: SetNull)
+  descendants           DesignVersion[]      @relation("VersionLineage")
+  restoredFromVersion   DesignVersion?       @relation("VersionRestore", fields: [restoredFromVersionId], references: [id], onDelete: SetNull)
+  restoredByVersions    DesignVersion[]      @relation("VersionRestore")
+  currentForDocuments   DesignDocument[]     @relation("DesignDocumentCurrentVersion")
+  draftVersions         DesignDraftVersion[]
+  candidateVersions     CandidateVersion[]
+  dependenciesAsSource  DesignDependency[]   @relation("DependencySourceVersion")
+  dependenciesAsTarget  DesignDependency[]   @relation("DependencyTargetVersion")
+  changeSetItems        ChangeSetItem[]
+  referenceSnapshots    ReferenceSnapshot[]
+  validationRuns        ValidationRun[]
+  previewSnapshots      PreviewSnapshot[]
+  draftsUsingAsBase     DesignDraft[]        @relation("DraftBaseVersion")
+  candidatesUsingAsBase CandidateProposal[]  @relation("CandidateBaseVersion")
+
+  @@unique([documentId, versionNumber])
+  @@index([documentId, publishedAt])
+  @@index([baseVersionId])
+  @@map("design_versions")
+}
+
+model DesignDependency {
+  id             String   @id @default(uuid())
+  fromDocumentId String
+  fromVersionId  String
+  toDocumentId   String
+  toVersionId    String
+  dependencyType String   @default("uses")
+  createdAt      DateTime @default(now())
+
+  fromDocument DesignDocument @relation("DependencyFrom", fields: [fromDocumentId], references: [id], onDelete: Cascade)
+  fromVersion  DesignVersion  @relation("DependencySourceVersion", fields: [fromVersionId], references: [id], onDelete: Cascade)
+  toDocument   DesignDocument @relation("DependencyTo", fields: [toDocumentId], references: [id], onDelete: Cascade)
+  toVersion    DesignVersion  @relation("DependencyTargetVersion", fields: [toVersionId], references: [id], onDelete: Cascade)
+
+  @@unique([fromVersionId, toVersionId, dependencyType])
+  @@index([fromDocumentId])
+  @@index([toDocumentId])
+  @@map("design_dependencies")
+}
+
+model ChangeSession {
+  id              String   @id @default(uuid())
+  request         String
+  status          String   @default("open")
+  providerId      String?
+  model           String?
+  contextSnapshot String?
+  budget          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  provider           AiProvider?         @relation("ChangeSessionProvider", fields: [providerId], references: [id], onDelete: SetNull)
+  drafts             DesignDraft[]
+  referenceSnapshots ReferenceSnapshot[]
+  tasks              DesignTask[]
+
+  @@index([status, createdAt])
+  @@index([providerId])
+  @@map("design_change_sessions")
+}
+
+model DesignDraft {
+  id            String    @id @default(uuid())
+  sessionId     String?
+  documentId    String
+  baseVersionId String
+  draftRevision Int       @default(1)
+  status        String    @default("editing")
+  lockVersion   Int       @default(1)
+  candidateSlotsUsed Int  @default(0)
+  expiresAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  session              ChangeSession?       @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  document             DesignDocument       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  baseVersion          DesignVersion        @relation("DraftBaseVersion", fields: [baseVersionId], references: [id], onDelete: Restrict)
+  versions             DesignDraftVersion[]
+  candidates           CandidateProposal[]
+  changeSet            ChangeSet?
+  changeSetMemberships ChangeSetDraft[]
+
+  @@index([documentId, status])
+  @@index([baseVersionId])
+  @@index([sessionId])
+  @@map("design_drafts")
+}
+
+model DesignDraftVersion {
+  id        String   @id @default(uuid())
+  draftId   String
+  versionId String
+  createdAt DateTime @default(now())
+
+  draft   DesignDraft   @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  version DesignVersion @relation(fields: [versionId], references: [id], onDelete: Restrict)
+
+  @@unique([draftId, versionId])
+  @@map("design_draft_versions")
+}
+
+model CandidateProposal {
+  id             String   @id @default(uuid())
+  draftId        String
+  baseVersionId  String
+  label          String
+  rationale      String?
+  patch          String
+  structuredDiff String?
+  impactReport   String?
+  status         String   @default("planned")
+  generationKey  String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  draft            DesignDraft        @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  baseVersion      DesignVersion      @relation("CandidateBaseVersion", fields: [baseVersionId], references: [id], onDelete: Restrict)
+  versions         CandidateVersion[]
+  validationRuns   ValidationRun[]
+  previewSnapshots PreviewSnapshot[]
+  changeSetItems   ChangeSetItem[]    @relation("ChangeSetItemCandidate")
+  tasks            DesignTask[]
+
+  @@unique([draftId, generationKey])
+  @@index([draftId, status])
+  @@index([baseVersionId])
+  @@map("design_candidate_proposals")
+}
+
+model CandidateVersion {
+  id          String   @id @default(uuid())
+  candidateId String
+  versionId   String
+  createdAt   DateTime @default(now())
+
+  candidate CandidateProposal @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  version   DesignVersion     @relation(fields: [versionId], references: [id], onDelete: Restrict)
+
+  @@unique([candidateId, versionId])
+  @@map("design_candidate_versions")
+}
+
+model ChangeSet {
+  id                   String   @id @default(uuid())
+  draftId              String   @unique
+  status               String   @default("draft")
+  publishTransactionId String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  draft  DesignDraft      @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  items  ChangeSetItem[]
+  drafts ChangeSetDraft[]
+
+  @@index([status, createdAt])
+  @@map("design_change_sets")
+}
+
+model ChangeSetDraft {
+  id          String   @id @default(uuid())
+  changeSetId String
+  draftId     String
+  createdAt   DateTime @default(now())
+
+  changeSet ChangeSet   @relation(fields: [changeSetId], references: [id], onDelete: Cascade)
+  draft     DesignDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@unique([changeSetId, draftId])
+  @@unique([draftId])
+  @@index([draftId])
+  @@map("design_change_set_drafts")
+}
+
+model ChangeSetItem {
+  id            String  @id @default(uuid())
+  changeSetId   String
+  documentId    String
+  baseVersionId String
+  candidateId   String?
+  selectedPatch String?
+  status        String  @default("pending")
+
+  changeSet   ChangeSet          @relation(fields: [changeSetId], references: [id], onDelete: Cascade)
+  document    DesignDocument     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  baseVersion DesignVersion      @relation(fields: [baseVersionId], references: [id], onDelete: Restrict)
+  candidate   CandidateProposal? @relation("ChangeSetItemCandidate", fields: [candidateId], references: [id], onDelete: SetNull)
+
+  @@unique([changeSetId, documentId])
+  @@index([documentId, status])
+  @@map("design_change_set_items")
+}
+
+model ReferenceSnapshot {
+  id               String    @id @default(uuid())
+  sessionId        String?
+  versionId        String?
+  sourceResourceId String?
+  sourceUrl        String?
+  contentHash      String
+  capturedAt       DateTime  @default(now())
+  policy           String    @default("inspiration_only")
+  snapshotVersion  String    @default("1")
+  retentionUntil   DateTime?
+  metadata         String?
+
+  session        ChangeSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  version        DesignVersion? @relation(fields: [versionId], references: [id], onDelete: SetNull)
+  sourceResource Resource?      @relation("ReferenceSnapshotResource", fields: [sourceResourceId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId])
+  @@index([versionId])
+  @@index([sourceResourceId])
+  @@index([contentHash])
+  @@map("design_reference_snapshots")
+}
+
+model ValidationRun {
+  id            String    @id @default(uuid())
+  candidateId   String?
+  versionId     String?
+  status        String    @default("pending")
+  policyVersion String
+  result        String?
+  errorMessage  String?
+  createdAt     DateTime  @default(now())
+  finishedAt    DateTime?
+
+  candidate CandidateProposal? @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  version   DesignVersion?     @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId, status])
+  @@index([versionId, status])
+  @@map("design_validation_runs")
+}
+
+model PreviewSnapshot {
+  id             String   @id @default(uuid())
+  candidateId    String?
+  versionId      String?
+  viewport       String
+  browser        String
+  fixtureVersion String
+  artifactHash   String
+  storagePath    String?
+  createdAt      DateTime @default(now())
+
+  candidate CandidateProposal? @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  version   DesignVersion?     @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId, viewport])
+  @@index([versionId, viewport])
+  @@map("design_preview_snapshots")
+}
+
+model DesignTask {
+  id             String    @id @default(uuid())
+  sessionId      String?
+  candidateId    String?
+  taskType       String
+  status         String    @default("pending")
+  input          String?
+  result         String?
+  idempotencyKey String?
+  retryCount     Int       @default(0)
+  errorCode      String?
+  errorMessage   String?
+  startedAt      DateTime?
+  leaseToken     String?
+  leaseExpiresAt DateTime?
+  candidateSlotsReleasedAt DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  session   ChangeSession?     @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  candidate CandidateProposal? @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@unique([candidateId, taskType, idempotencyKey])
+  @@index([status, createdAt])
+  @@index([status, leaseExpiresAt])
+  @@map("design_tasks")
+}
+
+model DesignAccessLog {
+  id             String   @id @default(uuid())
+  documentId     String?
+  endpoint       String
+  accessType     String
+  keyFingerprint String?
+  clientId       String?
+  createdAt      DateTime @default(now())
+
+  document DesignDocument? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  @@index([documentId, createdAt])
+  @@index([accessType, createdAt])
+  @@map("design_access_logs")
+}
+
+/// Immutable acknowledgement of the exact terms revision used by a reference source.
+model DesignReferenceTermsAcceptance {
+  id           String   @id @default(uuid())
+  sourceId     String
+  termsUrl     String
+  termsVersion String
+  termsHash    String
+  acceptedBy   String
+  acceptedAt   DateTime @default(now())
+
+  source Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([sourceId, termsUrl, termsHash])
+  @@index([sourceId, acceptedAt])
+  @@map("design_reference_terms_acceptances")
+}
+
+/// One row per source makes the per-minute reference reservation atomic across workers.
+model DesignReferenceQuota {
+  sourceId      String   @id
+  windowStartedAt DateTime
+  count         Int      @default(0)
+  updatedAt     DateTime @updatedAt
+
+  source Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@map("design_reference_quotas")
 }

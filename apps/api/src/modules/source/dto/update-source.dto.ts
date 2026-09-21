@@ -25,7 +25,8 @@ export class UpdateSourceDto {
   @IsString()
   @MaxLength(50)
   @Matches(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/, {
-    message: 'slug must be lowercase alphanumeric with hyphens, not starting or ending with a hyphen',
+    message:
+      'slug must be lowercase alphanumeric with hyphens, not starting or ending with a hyphen',
   })
   slug?: string;
 
@@ -66,12 +67,6 @@ export class UpdateSourceDto {
   @IsUrl({ require_tld: false, require_protocol: true })
   robotsUrl?: string | null;
 
-  /** 传 null 清除 defaultLicenseId，传新 UUID 更新 */
-  @IsOptional()
-  @ValidateIf((o) => o.defaultLicenseId !== null)
-  @IsUUID()
-  defaultLicenseId?: string | null;
-
   @IsOptional()
   @IsInt()
   @Min(1)
@@ -80,9 +75,37 @@ export class UpdateSourceDto {
 
   @IsOptional()
   @IsInt()
+  @Min(0)
+  @Max(60000)
+  downloadIntervalMs?: number;
+
+  @IsOptional()
+  @IsInt()
   @Min(1)
   @Max(10)
   maxConcurrency?: number;
+
+  /** 定时自动同步间隔（小时）。传 null 关闭，传 1–168 设置每隔 N 小时自动拉取 */
+  @IsOptional()
+  @ValidateIf((o) => o.autoSyncIntervalHours !== null)
+  @IsInt()
+  @Min(1)
+  @Max(168)
+  autoSyncIntervalHours?: number | null;
+
+  /**
+   * 下载目录（相对存储根目录的子目录，如 `civitai/foo`）。
+   * 传 null 清除（回到默认存储布局）。格式见 CreateSourceDto.downloadDirectory。
+   */
+  @IsOptional()
+  @ValidateIf((o) => o.downloadDirectory !== null)
+  @IsString()
+  @MaxLength(200)
+  @Matches(/^[a-zA-Z0-9_-]+(\/[a-zA-Z0-9_-]+)*$/, {
+    message:
+      'downloadDirectory must be a relative subdirectory of letters/digits/_/- separated by / without leading/trailing slash',
+  })
+  downloadDirectory?: string | null;
 
   @IsOptional()
   @Transform(({ value }) => {

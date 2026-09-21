@@ -3,8 +3,12 @@ import './globals.css';
 import { Toaster } from 'sonner';
 
 export const metadata: Metadata = {
-  title: '资源管理平台',
-  description: '多类型资源管理平台',
+  title: 'Aurum',
+  icons: {
+    icon: '/icon.svg',
+    shortcut: '/icon.svg',
+  },
+  description: 'Aurum · 多类型资源管理平台',
 };
 
 export default function RootLayout({

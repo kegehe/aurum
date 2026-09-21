@@ -1,11 +1,10 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
-import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
-import * as os from 'node:os';
 import sharp from 'sharp';
 import ffmpeg from 'fluent-ffmpeg';
 import { Prisma } from '@prisma/client';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
+import { streamStorageToTemp } from '../temp-file.util';
 import { IJobScheduler, JOB_SCHEDULER } from '../interfaces/job-scheduler.interface';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
 import { ResourceFileRepository } from '../../file/repositories/resource-file.repository';
@@ -54,16 +53,13 @@ export class MetadataDetector implements IJobProcessor {
       throw new Error(`Resource ${resourceId} not found`);
     }
 
-    const originalFile = await this.fileRepo.findByResourceAndRole(
-      resourceId,
-      FileRole.original,
-    );
+    const originalFile = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.original);
     if (!originalFile) {
       throw new Error(`Original file for resource ${resourceId} not found`);
     }
 
-    // 下载到临时文件（Sharp/FFprobe 需要文件路径，不能直接用流）
-    const tempPath = await this.storageToTemp(originalFile.storagePath);
+    // 流式下载到临时文件（Sharp/FFprobe 需要文件路径，不能直接用流）
+    const tempPath = await streamStorageToTemp(this.storage, originalFile.storagePath, 'meta');
 
     try {
       switch (resource.resourceType) {
@@ -77,9 +73,7 @@ export class MetadataDetector implements IJobProcessor {
           await this.detectAudio(resourceId, tempPath);
           break;
         default:
-          this.logger.debug(
-            `No metadata detection for resource type: ${resource.resourceType}`,
-          );
+          this.logger.debug(`No metadata detection for resource type: ${resource.resourceType}`);
       }
     } finally {
       await fs.unlink(tempPath).catch(() => {});
@@ -96,38 +90,20 @@ export class MetadataDetector implements IJobProcessor {
         (j.status === JobStatus.pending || j.status === JobStatus.processing),
     );
     if (!hasDownstream) {
-      await this.resourceRepo.updateProcessingStatus(
-        resourceId,
-        ProcessingStatus.completed,
-      );
+      await this.resourceRepo.updateProcessingStatus(resourceId, ProcessingStatus.completed);
     }
   }
 
   // ==================== 私有方法 ====================
 
-  private async storageToTemp(storagePath: string): Promise<string> {
-    const buf = await this.storage.get(storagePath);
-    const tmpPath = path.join(
-      os.tmpdir(),
-      `proc-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    );
-    await fs.writeFile(tmpPath, buf);
-    return tmpPath;
-  }
-
-  private async detectImage(
-    resourceId: string,
-    filePath: string,
-  ): Promise<void> {
+  private async detectImage(resourceId: string, filePath: string): Promise<void> {
     try {
       const metadata = await sharp(filePath).metadata();
       await this.resourceRepo.update(resourceId, {
         width: metadata.width ?? null,
         height: metadata.height ?? null,
       });
-      this.logger.log(
-        `Image metadata: ${metadata.width}x${metadata.height} for ${resourceId}`,
-      );
+      this.logger.log(`Image metadata: ${metadata.width}x${metadata.height} for ${resourceId}`);
     } catch (err) {
       throw new Error(
         `Sharp metadata detection failed for ${resourceId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -147,9 +123,7 @@ export class MetadataDetector implements IJobProcessor {
           reject(new Error(`FFprobe failed for resource ${resourceId}: ${err.message}`));
           return;
         }
-        const videoStream = metadata.streams.find(
-          (s) => s.codec_type === 'video',
-        );
+        const videoStream = metadata.streams.find((s) => s.codec_type === 'video');
         const updateData: Prisma.ResourceUpdateInput = {};
         if (videoStream) {
           updateData.width = videoStream.width ?? null;
@@ -170,7 +144,11 @@ export class MetadataDetector implements IJobProcessor {
             resolve();
           })
           .catch((updateErr) => {
-            reject(new Error(`Failed to save video metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`));
+            reject(
+              new Error(
+                `Failed to save video metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
+              ),
+            );
           });
       });
     });
@@ -204,7 +182,11 @@ export class MetadataDetector implements IJobProcessor {
             resolve();
           })
           .catch((updateErr) => {
-            reject(new Error(`Failed to save audio metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`));
+            reject(
+              new Error(
+                `Failed to save audio metadata for ${resourceId}: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
+              ),
+            );
           });
       });
     });
@@ -224,10 +206,7 @@ export class MetadataDetector implements IJobProcessor {
       await this.scheduler.enqueue(JobType.generate_thumbnail, id);
     } else if (resourceType === ResourceType.video) {
       await this.scheduler.enqueue(JobType.generate_video_cover, id);
-    } else if (
-      resourceType === ResourceType.text ||
-      mimeType === 'application/pdf'
-    ) {
+    } else if (resourceType === ResourceType.text || mimeType === 'application/pdf') {
       await this.scheduler.enqueue(JobType.extract_text, id);
     }
   }

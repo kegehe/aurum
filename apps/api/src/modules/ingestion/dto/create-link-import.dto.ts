@@ -1,4 +1,4 @@
-import { ArrayMaxSize, ArrayUnique, IsArray, IsOptional, IsString, IsUrl, IsUUID, MaxLength } from 'class-validator';
+import { IsOptional, IsString, IsUrl, IsUUID, MaxLength } from 'class-validator';
 
 export class CreateLinkImportDto {
   @IsUrl({ require_tld: false, require_protocol: true })
@@ -17,11 +17,4 @@ export class CreateLinkImportDto {
   @IsString()
   @MaxLength(255)
   title?: string;
-
-  @IsOptional()
-  @IsArray()
-  @ArrayMaxSize(50)
-  @ArrayUnique()
-  @IsUUID('4', { each: true })
-  tagIds?: string[];
 }

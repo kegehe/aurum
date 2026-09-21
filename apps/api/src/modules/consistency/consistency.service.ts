@@ -42,7 +42,9 @@ export class ConsistencyService {
       (key) => !dbPathSet.has(key) && !key.startsWith('temp/'),
     );
     const expiredTempFiles = storageObjects
-      .filter((object) => object.key.startsWith('temp/') && now - object.modifiedAt.getTime() > tempTtlMs)
+      .filter(
+        (object) => object.key.startsWith('temp/') && now - object.modifiedAt.getTime() > tempTtlMs,
+      )
       .map((object) => object.key);
 
     return {
@@ -59,5 +61,4 @@ export class ConsistencyService {
       },
     };
   }
-
 }

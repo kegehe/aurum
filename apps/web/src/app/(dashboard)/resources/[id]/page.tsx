@@ -1,9 +1,12 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { toast } from 'sonner';
 import {
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
   Download,
   ExternalLink,
   Pencil,
@@ -13,10 +16,9 @@ import {
   FileText,
   Image,
   Video,
-  Plus,
-  X,
+  Loader2,
+  Square,
 } from 'lucide-react';
-import { PageHeader } from '@/components/shared/page-header';
 import { LoadingState } from '@/components/shared/loading-state';
 import { ErrorState } from '@/components/shared/error-state';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -45,21 +47,26 @@ import {
 } from '@/components/ui/select';
 import {
   getResource,
+  getResourceNeighbors,
   updateResource,
   softDeleteResource,
   restoreResource,
   reprocessResource,
-  addTagToResource,
-  removeTagFromResource,
   getResourceDownloadUrl,
   getResourcePreviewUrl,
+  getResourceThumbnailUrl,
   checkResourceLocators,
+  mirrorRemoteResource,
 } from '@/lib/api/resources';
-import { listTags } from '@/lib/api/tags';
+import {
+  cancelIngestionJob,
+  listIngestionJobs,
+} from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
 import { formatByteString, formatDateTime } from '@/lib/format';
-import { PROCESSING_STATUS_LABELS, LICENSE_STATUS_LABELS, LOCATOR_TYPE_LABELS } from '@/lib/constants';
-import type { ResourceDetail, TagWithUsage, CategoryTreeNode } from '@/lib/types';
+import { PROCESSING_STATUS_LABELS, LOCATOR_TYPE_LABELS } from '@/lib/constants';
+import type { ResourceDetail, CategoryTreeNode, IngestionJobItem } from '@/lib/types';
+import { IngestionJobStatus, IngestionJobType, type ResourceType } from '@aurum/shared-types';
 
 const NO_FOLDER_VALUE = '__no_folder__';
 
@@ -83,15 +90,365 @@ const FILE_ROLE_LABELS: Record<string, string> = {
   transcode: '转码',
 };
 
+const TEXT_PREVIEW_MAX_CHARS = 200_000;
+
+/** 预览失败 / 无可用预览时的类型图标占位 */
+function PreviewIconFallback({ type }: { type: ResourceType }) {
+  return (
+    <div className="flex items-center justify-center py-16">
+      <ResourceTypeIcon type={type} className="h-24 w-24 text-muted-foreground" />
+    </div>
+  );
+}
+
+/** 文本在线预览：流式拉取原文件内容以 <pre> 展示（React 自动转义，避免 XSS） */
+function TextViewer({
+  url,
+  resourceType,
+  onError,
+}: {
+  url: string;
+  resourceType: ResourceType;
+  onError?: () => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+    setText(null);
+    setTruncated(false);
+    setFailed(false);
+
+    const read = async (): Promise<{ text: string; truncated: boolean }> => {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.body) throw new Error('Empty response body');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let result = '';
+      // 按 Unicode 码点计数：emoji 等代理对不会被重复计数，截断时也不会拆散代理对
+      let charCount = 0;
+      let truncated = false;
+      for (;;) {
+        if (cancelled) return { text: result, truncated };
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        result += chunk;
+        charCount += Array.from(chunk).length;
+        if (charCount >= TEXT_PREVIEW_MAX_CHARS) {
+          truncated = charCount > TEXT_PREVIEW_MAX_CHARS;
+          if (!truncated) {
+            // 恰好达到上限：再多读一次确认是否还有内容，避免误判截断
+            const next = await reader.read();
+            truncated = !next.done;
+          }
+          // 已读到显示上限，停止拉取，避免大文件占用内存
+          controller.abort();
+          break;
+        }
+      }
+      result += decoder.decode();
+      return { text: result, truncated };
+    };
+
+    void read()
+      .then(({ text: raw, truncated: isTruncated }) => {
+        if (!cancelled) {
+          // 截断时按码点边界截取，避免拆散代理对产生乱码
+          setText(isTruncated ? Array.from(raw).slice(0, TEXT_PREVIEW_MAX_CHARS).join('') : raw);
+          setTruncated(isTruncated);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true);
+          onErrorRef.current?.();
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [url]);
+
+  if (failed) {
+    return <PreviewIconFallback type={resourceType} />;
+  }
+
+  if (text === null) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <span className="text-sm text-muted-foreground">正在加载文本内容…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full">
+      <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-4 font-mono text-xs leading-relaxed">
+        {text}
+      </pre>
+      {truncated && (
+        <p className="px-4 pb-4 pt-2 text-center text-xs text-muted-foreground">
+          文件过大，仅显示前 {TEXT_PREVIEW_MAX_CHARS.toLocaleString()} 个字符。请使用「下载」查看完整内容。
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 内联预览查看器：按资源类型渲染对应元素
+ * - 图片 → <img>
+ * - 视频 → <video>（HTML5 播放器，可显示封面）
+ * - 音频 → <audio>
+ * - PDF → <iframe>（浏览器内置 PDF 查看器）
+ * - 文本 → <pre>（拉取内容渲染）
+ * - 其他 / 预览失败 → 类型图标
+ */
+function InlinePreview({
+  resource,
+  previewUrl,
+  posterUrl,
+  onError,
+}: {
+  resource: ResourceDetail;
+  previewUrl: string | null;
+  posterUrl?: string | null;
+  onError?: () => void;
+}) {
+  const type = resource.resourceType;
+  const mimeType = resource.mimeType.toLowerCase();
+  // MIME 可能带参数（如 application/pdf; charset=binary），用前缀匹配
+  const isPdf = type === 'document' && mimeType.startsWith('application/pdf');
+  const isText = type === 'text';
+  const isVideo = type === 'video';
+  const isAudio = type === 'audio';
+
+  if (!previewUrl) {
+    return <PreviewIconFallback type={type} />;
+  }
+
+  if (isText) {
+    return <TextViewer url={previewUrl} resourceType={type} onError={onError} />;
+  }
+
+  if (isPdf) {
+    return (
+      <div className="w-full pt-4">
+        <iframe
+          src={previewUrl}
+          title="PDF 预览"
+          className="h-[70vh] w-full rounded-md border border-border"
+        />
+        <p className="px-4 pb-4 pt-2 text-center text-xs text-muted-foreground">
+          如果 PDF 未正常显示，请使用右上角「下载」查看原文件。
+        </p>
+      </div>
+    );
+  }
+
+  if (isVideo) {
+    return (
+      <div className="flex w-full items-center justify-center py-8">
+        <video
+          controls
+          preload="metadata"
+          src={previewUrl}
+          poster={posterUrl ?? undefined}
+          className="max-h-[480px] max-w-full rounded-md bg-black/5"
+          onError={onError}
+        />
+      </div>
+    );
+  }
+
+  if (isAudio) {
+    return (
+      <div className="flex w-full items-center justify-center py-16">
+        <audio
+          controls
+          preload="metadata"
+          src={previewUrl}
+          className="w-full max-w-md"
+          onError={onError}
+        />
+      </div>
+    );
+  }
+
+  if (type === 'image') {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <img
+          src={previewUrl}
+          alt={resource.title || resource.originalFilename}
+          className="max-h-[480px] max-w-full rounded object-contain"
+          onError={onError}
+        />
+      </div>
+    );
+  }
+
+  return <PreviewIconFallback type={type} />;
+}
+
+/**
+ * 外部资源预览：根据预览定位器的实际 Content-Type 决定查看器
+ * 图片/未知类型保持原有 <img> 行为（多为缩略图），video/audio/pdf 用对应播放器
+ */
+function ExternalPreview({
+  url,
+  resource,
+  onError,
+}: {
+  url: string;
+  resource: ResourceDetail;
+  onError?: () => void;
+}) {
+  const locator = resource.locators?.find((l) => l.locatorType === 'preview');
+  const contentType = (locator?.contentType ?? '').toLowerCase();
+
+  if (contentType.startsWith('video/')) {
+    return (
+      <div className="flex w-full items-center justify-center py-8">
+        <video
+          controls
+          preload="metadata"
+          src={url}
+          className="max-h-[480px] max-w-full rounded-md bg-black/5"
+          onError={onError}
+        />
+      </div>
+    );
+  }
+
+  if (contentType.startsWith('audio/')) {
+    return (
+      <div className="flex w-full items-center justify-center py-16">
+        <audio
+          controls
+          preload="metadata"
+          src={url}
+          className="w-full max-w-md"
+          onError={onError}
+        />
+      </div>
+    );
+  }
+
+  if (contentType.startsWith('application/pdf')) {
+    return (
+      <div className="w-full pt-4">
+        <iframe
+          src={url}
+          title="PDF 预览"
+          className="h-[70vh] w-full rounded-md border border-border"
+        />
+      </div>
+    );
+  }
+
+  // 图片缩略图 / 未知类型：保持原有 <img> 行为
+  return (
+    <div className="flex items-center justify-center py-16">
+      <img
+        src={url}
+        alt={resource.title || resource.originalFilename}
+        referrerPolicy="no-referrer"
+        className="max-h-[480px] max-w-full rounded object-contain"
+        onError={onError}
+      />
+    </div>
+  );
+}
+
+/**
+ * 从详情页 URL 的查询串还原"相邻资源"接口所需的筛选/排序参数。
+ * 与资源库列表页的 URL↔筛选状态映射保持一致：
+ * - 有关键字/类型/categoryId/acquisitionMode 时原样传递；
+ * - 无 categoryId 且 scope !== 'all'（即根目录默认视图）→ uncategorized=true；
+ * - 排序参数缺省时保持默认（createdAt desc）。
+ */
+function neighborsParamsFromUrl(searchParams: URLSearchParams): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  const keyword = searchParams.get('keyword');
+  if (keyword) params.keyword = keyword;
+  const resourceType = searchParams.get('resourceType');
+  if (resourceType) params.resourceType = resourceType;
+  const categoryId = searchParams.get('categoryId');
+  const scope = searchParams.get('scope');
+  if (categoryId) {
+    params.categoryId = categoryId;
+  } else if (scope !== 'all') {
+    // 无分类且非"全部资源"：即根目录视图，与列表页对空 URL 的默认一致
+    params.uncategorized = true;
+  }
+  const acquisitionMode = searchParams.get('acquisitionMode');
+  if (acquisitionMode) params.acquisitionMode = acquisitionMode;
+  const sortBy = searchParams.get('sortBy');
+  const sortOrder = searchParams.get('sortOrder');
+  if (sortBy) params.sortBy = sortBy;
+  if (sortOrder) params.sortOrder = sortOrder;
+  return params;
+}
+
+/** 返回资源库按钮 */
+function BackButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button variant="outline" size="sm" className="gap-1" onClick={onClick}>
+      <ArrowLeft className="h-4 w-4" />返回资源库
+    </Button>
+  );
+}
+
 export default function ResourceDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // 来自资源库列表的筛选/排序上下文（跟随 URL，切换相邻资源时保持）
+  const contextQuery = searchParams.toString();
+
+  // 相邻资源导航（上一个/下一个）
+  const [previousId, setPreviousId] = useState<string | null>(null);
+  const [nextId, setNextId] = useState<string | null>(null);
+  const [neighborsPosition, setNeighborsPosition] = useState<{ current: number; total: number } | null>(null);
+
+  const handleBack = useCallback(() => {
+    if (window.history.length > 1) {
+      router.back();
+      return;
+    }
+    router.push('/resources');
+  }, [router]);
+
+  // 在筛选上下文中切换相邻资源：保留当前查询串，使箭头状态与列表持续性保持一致
+  const goToNeighbor = useCallback(
+    (neighborId: string) => {
+      router.push(`/resources/${neighborId}${contextQuery ? `?${contextQuery}` : ''}`);
+    },
+    [router, contextQuery],
+  );
 
   const [resource, setResource] = useState<ResourceDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState(false);
   const [externalPreviewError, setExternalPreviewError] = useState(false);
+  const [mirroring, setMirroring] = useState(false);
+  const [mirrorJob, setMirrorJob] = useState<IngestionJobItem | null>(null);
+  const hadMirrorJobRef = useRef(false);
 
   // 编辑 Dialog
   const [editOpen, setEditOpen] = useState(false);
@@ -101,10 +458,8 @@ export default function ResourceDetailPage() {
   const [editAuthor, setEditAuthor] = useState('');
   const [editCategoryId, setEditCategoryId] = useState('');
 
-  // 标签
-  const [allTags, setAllTags] = useState<TagWithUsage[]>([]);
+  // 分类
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
-  const [addTagId, setAddTagId] = useState('');
   const flatCategories = useMemo(() => flattenCategories(categories), [categories]);
 
   // 确认
@@ -127,9 +482,75 @@ export default function ResourceDetailPage() {
 
   useEffect(() => {
     fetchResource();
-    listTags().then((d) => setAllTags(d.items)).catch(() => {});
     listCategories().then((d) => setCategories(d.items)).catch(() => {});
   }, [fetchResource]);
+
+  // 拉取相邻资源（携带列表的筛选/排序上下文）。失败时静默隐藏箭头，不影响当前详情。
+  // 以序列化后的查询串 contextQuery 为依赖（而非 searchParams 对象），避免每次渲染重复请求。
+  useEffect(() => {
+    let cancelled = false;
+    setPreviousId(null);
+    setNextId(null);
+    setNeighborsPosition(null);
+    getResourceNeighbors(id, neighborsParamsFromUrl(new URLSearchParams(contextQuery)))
+      .then((result) => {
+        if (cancelled) return;
+        setPreviousId(result.previousId);
+        setNextId(result.nextId);
+        if (result.currentIndex !== null) {
+          setNeighborsPosition({ current: result.currentIndex, total: result.total });
+        }
+      })
+      .catch(() => {
+        // 忽略：上下文不适用（如其他入口直达详情）时仅不显示箭头
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, contextQuery]);
+
+  const fetchMirrorJob = useCallback(async () => {
+    try {
+      const [pending, processing] = await Promise.all([
+        listIngestionJobs({
+          resourceId: id,
+          jobType: IngestionJobType.download_file,
+          status: IngestionJobStatus.pending,
+          pageSize: 1,
+        }),
+        listIngestionJobs({
+          resourceId: id,
+          jobType: IngestionJobType.download_file,
+          status: IngestionJobStatus.processing,
+          pageSize: 1,
+        }),
+      ]);
+      setMirrorJob(processing.items[0] ?? pending.items[0] ?? null);
+    } catch {
+      // Resource viewing remains available if background-job polling fails.
+    }
+  }, [id]);
+
+  useEffect(() => {
+    void fetchMirrorJob();
+  }, [fetchMirrorJob]);
+
+  useEffect(() => {
+    if (!mirrorJob) return;
+    const timer = window.setInterval(() => void fetchMirrorJob(), 3000);
+    return () => window.clearInterval(timer);
+  }, [fetchMirrorJob, mirrorJob]);
+
+  useEffect(() => {
+    if (mirrorJob) {
+      hadMirrorJobRef.current = true;
+      return;
+    }
+    if (hadMirrorJobRef.current) {
+      hadMirrorJobRef.current = false;
+      void fetchResource();
+    }
+  }, [fetchResource, mirrorJob]);
 
   const openEdit = () => {
     if (!resource) return;
@@ -188,34 +609,36 @@ export default function ResourceDetailPage() {
     }
   };
 
-  const handleAddTag = async () => {
-    if (!addTagId) return;
-    try {
-      await addTagToResource(id, addTagId);
-      toast.success('标签已添加');
-      setAddTagId('');
-      await fetchResource();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : '添加标签失败');
-    }
-  };
-
-  const handleRemoveTag = async (tagId: string) => {
-    try {
-      await removeTagFromResource(id, tagId);
-      toast.success('标签已移除');
-      await fetchResource();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : '移除标签失败');
-    }
-  };
-
   const handleCheckLocators = async () => {
     try {
       const result = await checkResourceLocators(id);
       toast.success(result.message);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '检查失败');
+    }
+  };
+
+  const handleMirror = async () => {
+    setMirroring(true);
+    try {
+      const job = await mirrorRemoteResource(id);
+      setMirrorJob(job);
+      toast.success('已提交本地下载任务');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '提交下载任务失败');
+    } finally {
+      setMirroring(false);
+    }
+  };
+
+  const handleCancelMirror = async () => {
+    if (!mirrorJob) return;
+    try {
+      const job = await cancelIngestionJob(mirrorJob.id);
+      setMirrorJob(job);
+      toast.info('已停止本地下载任务');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '停止下载失败');
     }
   };
 
@@ -226,11 +649,17 @@ export default function ResourceDetailPage() {
   const primaryLocator = resource?.locators?.find((locator) => locator.isPrimary);
   const previewLocator = resource?.locators?.find((locator) => locator.locatorType === 'preview');
   const isExternalResource = !!resource?.acquisitionMode && resource.acquisitionMode !== 'local_upload';
+  // 是否有本地原文件（下载镜像、本地上传）。有本地文件的资源优先展示本地预览/下载按钮。
+  const hasLocalOriginalFile = (resource?.files ?? []).some((f) => f.fileRole === 'original');
+  // 是否已生成缩略图（作为视频预览封面）
+  const hasThumbnail = (resource?.files ?? []).some((f) => f.fileRole === 'thumbnail');
 
   if (loading) {
     return (
       <div>
-        <PageHeader title="资源详情" />
+        <div className="mb-6">
+          <BackButton onClick={handleBack} />
+        </div>
         <LoadingState variant="card" count={3} />
       </div>
     );
@@ -239,7 +668,9 @@ export default function ResourceDetailPage() {
   if (error || !resource) {
     return (
       <div>
-        <PageHeader title="资源详情" />
+        <div className="mb-6">
+          <BackButton onClick={handleBack} />
+        </div>
         <ErrorState message={error ?? '未找到资源'} onRetry={fetchResource} />
       </div>
     );
@@ -247,14 +678,73 @@ export default function ResourceDetailPage() {
 
   return (
     <div>
-      <PageHeader title={resource.title || resource.originalFilename}>
-        <div className="flex items-center gap-1">
-          {isExternalResource && primaryLocator ? (
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <BackButton onClick={handleBack} />
+          {/* 相邻资源导航：在相同的筛选/排序上下文中快速查看上一个/下一个资源。
+              仅当资源属于某列表上下文时显示（neighborsPosition 非空），否则（直接深链等）隐藏。 */}
+          {neighborsPosition && (
+            <div className="flex items-center gap-1 rounded-md border px-1 py-1">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1 px-2"
+                disabled={!previousId}
+                onClick={() => previousId && goToNeighbor(previousId)}
+                title="上一个资源"
+                aria-label="上一个资源"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <span className="px-1 text-xs tabular-nums text-muted-foreground">
+                {neighborsPosition.current} / {neighborsPosition.total}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1 px-2"
+                disabled={!nextId}
+                onClick={() => nextId && goToNeighbor(nextId)}
+                title="下一个资源"
+                aria-label="下一个资源"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
+        </div>
+        <div className="flex flex-wrap justify-end gap-1">
+          {hasLocalOriginalFile ? (
             <Button variant="outline" size="sm" className="gap-1" asChild>
-              <a href={primaryLocator.url} target="_blank" rel="noreferrer">
-                <ExternalLink className="h-4 w-4" />打开链接
+              <a href={getResourceDownloadUrl(id)} download>
+                <Download className="h-4 w-4" />下载
               </a>
             </Button>
+          ) : isExternalResource && primaryLocator ? (
+            <>
+              {resource.acquisitionMode === 'metadata_only' && (
+                mirrorJob ? (
+                  <>
+                    <Button variant="outline" size="sm" className="gap-1" disabled>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {mirrorJob.status === IngestionJobStatus.processing ? '下载中' : '等待中'}
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={handleCancelMirror} title="停止下载" className="text-destructive hover:text-destructive">
+                      <Square className="h-4 w-4" />
+                    </Button>
+                  </>
+                ) : (
+                  <Button variant="outline" size="sm" className="gap-1" onClick={handleMirror} disabled={mirroring}>
+                    <Download className="h-4 w-4" />{mirroring ? '正在提交' : '下载到本地'}
+                  </Button>
+                )
+              )}
+              <Button variant="outline" size="sm" className="gap-1" asChild>
+                <a href={primaryLocator.url} target="_blank" rel="noreferrer">
+                  <ExternalLink className="h-4 w-4" />打开链接
+                </a>
+              </Button>
+            </>
           ) : (
             <Button variant="outline" size="sm" className="gap-1" asChild>
               <a href={getResourceDownloadUrl(id)} download>
@@ -274,46 +764,44 @@ export default function ResourceDetailPage() {
               <Trash2 className="h-4 w-4 text-destructive" />删除
             </Button>
           )}
-          {!isExternalResource && (
+          {hasLocalOriginalFile && (
             <Button variant="outline" size="sm" className="gap-1" onClick={handleReprocess}>
               <RefreshCw className="h-4 w-4" />重新处理
             </Button>
           )}
         </div>
-      </PageHeader>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* 左侧：预览 + 信息 */}
         <div className="lg:col-span-2 space-y-6">
-          {/* 预览 */}
-          {isExternalResource && previewLocator ? (
+          {/* 预览：有本地文件优先显示本地预览，否则外部链接资源显示远端预览 */}
+          {hasLocalOriginalFile || !isExternalResource ? (
             <Card>
-              <CardContent className="flex items-center justify-center py-16">
-                {externalPreviewError ? (
-                  <ResourceTypeIcon type={resource.resourceType} className="h-24 w-24 text-muted-foreground" />
-                ) : (
-                  <img
-                    src={previewLocator.url}
-                    alt={resource.title || resource.originalFilename}
-                    referrerPolicy="no-referrer"
-                    className="max-h-[480px] max-w-full rounded object-contain"
-                    onError={() => setExternalPreviewError(true)}
-                  />
-                )}
-              </CardContent>
-            </Card>
-          ) : !isExternalResource ? (
-            <Card>
-              <CardContent className="flex items-center justify-center py-16">
-                {resource.resourceType === 'image' && !previewError ? (
-                  <img
-                    src={getResourcePreviewUrl(resource.id)}
-                    alt={resource.title || resource.originalFilename}
-                    className="max-h-[480px] max-w-full rounded object-contain"
+              <CardContent>
+                {!previewError ? (
+                  <InlinePreview
+                    resource={resource}
+                    previewUrl={getResourcePreviewUrl(resource.id)}
+                    posterUrl={hasThumbnail ? getResourceThumbnailUrl(resource.id) : null}
                     onError={() => setPreviewError(true)}
                   />
                 ) : (
-                  <ResourceTypeIcon type={resource.resourceType} className="h-24 w-24 text-muted-foreground" />
+                  <PreviewIconFallback type={resource.resourceType} />
+                )}
+              </CardContent>
+            </Card>
+          ) : isExternalResource && (previewLocator || primaryLocator) ? (
+            <Card>
+              <CardContent>
+                {!externalPreviewError ? (
+                  <ExternalPreview
+                    url={(previewLocator ?? primaryLocator)!.url}
+                    resource={resource}
+                    onError={() => setExternalPreviewError(true)}
+                  />
+                ) : (
+                  <PreviewIconFallback type={resource.resourceType} />
                 )}
               </CardContent>
             </Card>
@@ -357,6 +845,10 @@ export default function ResourceDetailPage() {
               <CardTitle className="text-base">基本信息</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
+              <div className="flex justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">标题</span>
+                <span className="text-right">{resource.title || resource.originalFilename}</span>
+              </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">类型</span>
                 <ResourceTypeBadge type={resource.resourceType} />
@@ -373,6 +865,11 @@ export default function ResourceDetailPage() {
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">获取方式</span>
                   <span>链接</span>
+                </div>
+              ) : resource.acquisitionMode === 'metadata_only' ? (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">获取方式</span>
+                  <span>远程元数据</span>
                 </div>
               ) : (
                 <div className="flex justify-between">
@@ -407,48 +904,6 @@ export default function ResourceDetailPage() {
             </CardContent>
           </Card>
 
-          {/* 标签 */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">标签</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="flex flex-wrap gap-1">
-                {resource.tags.map((tag) => (
-                  <Badge key={tag.id} variant="secondary" className="gap-1">
-                    {tag.color && (
-                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: tag.color }} />
-                    )}
-                    {tag.name}
-                    <button onClick={() => handleRemoveTag(tag.id)} className="ml-1 hover:text-destructive">
-                      <X className="h-3 w-3" />
-                    </button>
-                  </Badge>
-                ))}
-                {resource.tags.length === 0 && (
-                  <p className="text-sm text-muted-foreground">暂无标签</p>
-                )}
-              </div>
-              <div className="flex gap-1">
-                <Select value={addTagId} onValueChange={setAddTagId}>
-                  <SelectTrigger className="h-8 text-xs">
-                    <SelectValue placeholder="添加标签" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {allTags
-                      .filter((t) => !resource.tags.some((rt) => rt.id === t.id))
-                      .map((t) => (
-                        <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
-                      ))}
-                  </SelectContent>
-                </Select>
-                <Button size="sm" variant="outline" className="h-8" onClick={handleAddTag} disabled={!addTagId}>
-                  <Plus className="h-3 w-3" />
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-
           {/* 元数据 */}
           <Card>
             <CardHeader>
@@ -471,32 +926,6 @@ export default function ResourceDetailPage() {
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">作者</span>
                   <span>{resource.author}</span>
-                </div>
-              )}
-              {isExternalResource && resource.licenseStatus && (
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">许可状态</span>
-                  <Badge variant={resource.licenseStatus === 'verified' ? 'success' : resource.licenseStatus === 'restricted' || resource.licenseStatus === 'rejected' ? 'destructive' : 'secondary'}>
-                    {LICENSE_STATUS_LABELS[resource.licenseStatus] ?? resource.licenseStatus}
-                  </Badge>
-                </div>
-              )}
-              {resource.license && (
-                <div className="flex justify-between gap-3">
-                  <span className="shrink-0 text-muted-foreground">许可证</span>
-                  {resource.license.url ? (
-                    <a href={resource.license.url} target="_blank" rel="noreferrer" className="truncate text-primary hover:underline">
-                      {resource.license.spdxId ?? resource.license.name}
-                    </a>
-                  ) : (
-                    <span className="truncate">{resource.license.spdxId ?? resource.license.name}</span>
-                  )}
-                </div>
-              )}
-              {resource.licenseNote && (
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">许可证备注</span>
-                  <span>{resource.licenseNote}</span>
                 </div>
               )}
               {primaryLocator && (
@@ -618,12 +1047,6 @@ export default function ResourceDetailPage() {
                         ) : (
                           <span>{p.authorName}</span>
                         )}
-                      </div>
-                    )}
-                    {p.licenseText && (
-                      <div>
-                        <span className="text-muted-foreground">许可文本：</span>
-                        <p className="mt-1 text-xs text-muted-foreground line-clamp-3">{p.licenseText}</p>
                       </div>
                     )}
                     {p.attributionText && (

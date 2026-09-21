@@ -32,6 +32,7 @@ export enum SourceType {
   link_metadata = 'link_metadata',
   github = 'github',
   rss = 'rss',
+  civitai = 'civitai',
   custom = 'custom',
 }
 
@@ -43,14 +44,6 @@ export enum LocatorType {
   mirror = 'mirror',
   preview = 'preview',
   favicon = 'favicon',
-}
-
-/** 许可证确认状态 */
-export enum LicenseStatus {
-  unknown = 'unknown',
-  verified = 'verified',
-  restricted = 'restricted',
-  rejected = 'rejected',
 }
 
 /** 外部资源导入任务类型 */

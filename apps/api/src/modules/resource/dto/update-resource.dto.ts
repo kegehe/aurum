@@ -2,7 +2,7 @@ import { IsNotEmpty, IsOptional, IsString, IsUUID, MaxLength, ValidateIf } from 
 
 /**
  * 更新资源元数据 DTO
- * 仅允许更新标题、描述、来源、作者、许可证备注、分类
+ * 仅允许更新标题、描述、来源、作者、分类
  */
 export class UpdateResourceDto {
   @IsOptional()
@@ -40,12 +40,4 @@ export class UpdateResourceDto {
   @IsString()
   @MaxLength(255)
   author?: string | null;
-
-  /** 传 null 清除许可证备注，传新值更新；不允许空字符串 */
-  @IsOptional()
-  @ValidateIf((o) => o.licenseNote !== null)
-  @IsNotEmpty()
-  @IsString()
-  @MaxLength(2000)
-  licenseNote?: string | null;
 }

@@ -12,7 +12,7 @@ import {
   Gamepad2,
   FileQuestion,
 } from 'lucide-react';
-import type { ResourceType } from '@resource-service/shared-types';
+import type { ResourceType } from '@aurum/shared-types';
 
 const ICON_MAP: Record<ResourceType, React.ComponentType<{ className?: string }>> = {
   image: Image,

@@ -1,12 +1,13 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import * as path from 'node:path';
 import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
+import { streamStorageToTemp } from '../temp-file.util';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
 import { ResourceFileRepository } from '../../file/repositories/resource-file.repository';
 import {
@@ -39,10 +40,7 @@ export class ThumbnailGenerator implements IJobProcessor {
       throw new Error(`Resource ${resourceId} not found`);
     }
 
-    const originalFile = await this.fileRepo.findByResourceAndRole(
-      resourceId,
-      FileRole.original,
-    );
+    const originalFile = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.original);
     if (!originalFile) {
       throw new Error(`No original file for ${resourceId}`);
     }
@@ -50,11 +48,9 @@ export class ThumbnailGenerator implements IJobProcessor {
     const maxW = this.config.get<number>('thumbnail.maxWidth')!;
     const maxH = this.config.get<number>('thumbnail.maxHeight')!;
 
-    // 下载到临时文件（使用 UUID 避免并发/重试碰撞）
-    const tmpIn = path.join(os.tmpdir(), `thumb-in-${randomUUID()}`);
+    // 流式下载到临时文件（Sharp 需要文件路径，不能直接用流）
+    const tmpIn = await streamStorageToTemp(this.storage, originalFile.storagePath, 'thumb-in');
     const tmpOut = path.join(os.tmpdir(), `thumb-out-${randomUUID()}.webp`);
-    const buf = await this.storage.get(originalFile.storagePath);
-    await fs.writeFile(tmpIn, buf);
 
     try {
       // Sharp 缩放并输出 WebP
@@ -67,21 +63,13 @@ export class ThumbnailGenerator implements IJobProcessor {
 
       // 生成 storage key 并写入正式存储
       const hash = resource.sha256!;
-      const storageKey = this.storage.generateKey(
-        FileRole.thumbnail,
-        hash,
-        undefined,
-        'webp',
-      );
+      const storageKey = this.storage.generateKey(FileRole.thumbnail, hash, undefined, 'webp');
 
       const stream = createReadStream(tmpOut);
       await this.storage.put(storageKey, stream);
 
       // 创建派生文件记录（幂等：已存在则跳过）
-      const existing = await this.fileRepo.findByResourceAndRole(
-        resourceId,
-        FileRole.thumbnail,
-      );
+      const existing = await this.fileRepo.findByResourceAndRole(resourceId, FileRole.thumbnail);
       if (!existing) {
         await this.fileRepo.create({
           resource: { connect: { id: resourceId } },
@@ -94,9 +82,7 @@ export class ThumbnailGenerator implements IJobProcessor {
         });
       }
 
-      this.logger.log(
-        `Thumbnail generated for resource ${resourceId} (${stats.size} bytes)`,
-      );
+      this.logger.log(`Thumbnail generated for resource ${resourceId} (${stats.size} bytes)`);
     } finally {
       await fs.unlink(tmpIn).catch(() => {});
       await fs.unlink(tmpOut).catch(() => {});

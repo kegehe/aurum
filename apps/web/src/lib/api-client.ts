@@ -47,13 +47,16 @@ export interface PaginatedResponse<T> {
 // ==================== 核心 ====================
 
 export const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api';
+export const DESIGN_BASE_URL = process.env.NEXT_PUBLIC_DESIGN_API_URL || '/api/design-proxy';
 
-async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const url = `${BASE_URL}${endpoint}`;
+async function request<T>(endpoint: string, options?: RequestInit, baseUrl = BASE_URL): Promise<T> {
+  const url = `${baseUrl}${endpoint}`;
   const config: RequestInit = {
     ...options,
     headers: {
-      'Content-Type': 'application/json',
+      // 仅在有请求体时设置 JSON Content-Type，避免 GET/无体 POST 等简单请求触发 CORS 预检
+      //（DELETE 因方法本身不在 CORS 安全列表，无论是否带头都会预检）
+      ...(options?.body != null ? { 'Content-Type': 'application/json' } : {}),
       ...options?.headers,
     },
   };
@@ -88,19 +91,32 @@ export function get<T>(endpoint: string, params?: Record<string, unknown>): Prom
 export function post<T>(endpoint: string, body?: unknown): Promise<T> {
   return request<T>(endpoint, {
     method: 'POST',
-    body: body ? JSON.stringify(body) : undefined,
+    body: body != null ? JSON.stringify(body) : undefined,
   });
 }
 
 export function patch<T>(endpoint: string, body?: unknown): Promise<T> {
   return request<T>(endpoint, {
     method: 'PATCH',
-    body: body ? JSON.stringify(body) : undefined,
+    body: body != null ? JSON.stringify(body) : undefined,
   });
 }
 
 export function del<T>(endpoint: string): Promise<T> {
   return request<T>(endpoint, { method: 'DELETE' });
+}
+
+export function designGet<T>(endpoint: string, params?: Record<string, unknown>): Promise<T> {
+  const qs = params ? `?${buildQueryString(params)}` : '';
+  return request<T>(`${endpoint}${qs}`, undefined, DESIGN_BASE_URL);
+}
+
+export function designPost<T>(endpoint: string, body?: unknown): Promise<T> {
+  return request<T>(
+    endpoint,
+    { method: 'POST', body: body != null ? JSON.stringify(body) : undefined },
+    DESIGN_BASE_URL,
+  );
 }
 
 /**
