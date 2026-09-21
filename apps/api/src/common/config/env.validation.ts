@@ -48,4 +48,6 @@ export const envValidationSchema = Joi.object({
   MAX_STYLE_IMAGE_SIZE_MB: Joi.number().integer().min(1).max(100).default(20),
   DESIGN_READ_API_KEY: Joi.string().min(16).allow('').optional(),
   DESIGN_INTERNAL_API_KEY: Joi.string().min(16).allow('').optional(),
+  // GitHub API Token（可选）：github 来源同步使用；未配置时匿名访问（限额 60 次/小时）
+  GITHUB_TOKEN: Joi.string().allow('').optional(),
 });

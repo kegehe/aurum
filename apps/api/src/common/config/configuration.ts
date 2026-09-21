@@ -50,4 +50,8 @@ export default () => ({
     styleModel: process.env.AI_STYLE_MODEL || 'claude-sonnet-5',
     maxImageSizeMB: parseInt(process.env.MAX_STYLE_IMAGE_SIZE_MB || '20', 10),
   },
+  github: {
+    // GitHub REST API Token（可选）；未配置时匿名访问，速率限额更低
+    token: process.env.GITHUB_TOKEN || '',
+  },
 });

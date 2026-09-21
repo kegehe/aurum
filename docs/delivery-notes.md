@@ -9,7 +9,7 @@
 - 支持上传、资源库、搜索筛选、分类、批量操作、回收站、处理任务、统计和一致性检查。
 - 外部资源接入 P1-P3：来源配置管理、链接导入、SSRF 防护、元数据提取。
 - 外部资源接入 P4：来源策略执行、链接健康检查、策略门禁。
-- Civitai 连接器与来源定时自动同步。
+- Civitai / GitHub 连接器与来源定时自动同步（GitHub 走官方 REST API：分页游标、ETag/If-None-Match、速率限制报错、Release 资产导入）。
 - 样式实验室（AI 视觉样式分析 + 本地降级）与页面内 AI 配置管理。
 - AI 设计运营台（design 模块：文档/版本/候选/ChangeSet 原子发布/受控渲染）。
 - 已移除集合（collection）、标签（tag）、许可证（license）模块。
@@ -44,7 +44,7 @@ pnpm build:web
 
 最近一次验收结果（2026-09-21）：
 
-- `pnpm test`: 26 个测试文件，228 条测试通过。
+- `pnpm test`: 27 个测试文件，244 条测试通过。
 - `pnpm typecheck`: 通过。
 - `pnpm lint`: 通过（API 6 条 unused-vars 警告，无错误）。
 - `pnpm build:api`: 通过。
@@ -74,7 +74,7 @@ pnpm build:web
 - 批量资源操作与 DTO 校验。
 - 资源服务/仓储、永久删除与回收站清空顺序。
 - 上传分类校验报错。
-- 外部资源接入：来源策略、SSRF 防护、Civitai/LinkMetadata 连接器、导入任务与调度。
+- 外部资源接入：来源策略、SSRF 防护、Civitai/GitHub/LinkMetadata 连接器、导入任务与调度。
 - 样式实验室：分析服务、Claude Vision（mock）、本地降级、CSS Tokens 导出。
 - AI 配置管理与设计运营台工作流（含受控渲染）。
 - IngestionScheduler 健康检查调度。

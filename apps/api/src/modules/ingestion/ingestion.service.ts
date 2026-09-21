@@ -30,6 +30,7 @@ import { SourceRepository } from '../source/repositories/source.repository';
 import { LinkMetadataConnector } from './connectors/link-metadata.connector';
 import { LocatorHealthChecker } from './connectors/locator-health-checker';
 import { CivitaiConnector } from './connectors/civitai.connector';
+import { GitHubConnector } from './connectors/github.connector';
 import { ResourceConnector } from './connectors/resource-connector.interface';
 import { CreateLinkImportDto } from './dto/create-link-import.dto';
 import { QueryIngestionJobsDto } from './dto/query-ingestion-jobs.dto';
@@ -87,6 +88,7 @@ export class IngestionService {
     private readonly linkMetadataConnector: LinkMetadataConnector,
     private readonly locatorHealthChecker: LocatorHealthChecker,
     private readonly civitaiConnector: CivitaiConnector,
+    private readonly githubConnector: GitHubConnector,
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
     private readonly fileRepo: ResourceFileRepository,
     @Inject(JOB_SCHEDULER) private readonly scheduler: IJobScheduler,
@@ -180,10 +182,7 @@ export class IngestionService {
   async deleteJob(id: string) {
     const job = await this.jobRepo.findById(id);
     if (!job) throw new NotFoundException(`Ingestion job ${id} not found`);
-    if (
-      job.status === IngestionJobStatus.pending ||
-      job.status === IngestionJobStatus.processing
-    ) {
+    if (job.status === IngestionJobStatus.pending || job.status === IngestionJobStatus.processing) {
       throw new BadRequestException('Cannot delete an active ingestion job');
     }
     if (!(await this.jobRepo.deleteTerminal(id))) {
@@ -894,6 +893,8 @@ export class IngestionService {
     if (!filters.sort && config.sort) filters.sort = config.sort;
     if (!filters.period && config.period) filters.period = config.period;
     if (filters.nsfw === undefined && config.nsfw !== undefined) filters.nsfw = config.nsfw;
+    // GitHub 等连接器的仓库定位同样支持顶层 repo
+    if (!filters.repo && config.repo) filters.repo = config.repo;
 
     // 每次同步最多连续抓取多少页（config.maxPages，默认 1），每页最多 limit 条。
     // 页间通过 cursor 续传，抓完的页数越多耗时越长（后台执行，任务心跳保持）。
@@ -1070,7 +1071,12 @@ export class IngestionService {
    */
   private async syncRemoteWithDownload(
     remote: import('./connectors/resource-connector.interface').RemoteResource,
-    source: { id: string; name: string; requiresReview?: boolean; downloadDirectory?: string | null },
+    source: {
+      id: string;
+      name: string;
+      requiresReview?: boolean;
+      downloadDirectory?: string | null;
+    },
     ingestionJobId: string,
     leaseToken: string,
     connectorType: string,
@@ -1778,6 +1784,7 @@ export class IngestionService {
   /** 按 sourceType 路由到对应的连接器 */
   private getConnectorForSourceType(sourceType: string): ResourceConnector | null {
     if (sourceType === 'civitai') return this.civitaiConnector;
+    if (sourceType === 'github') return this.githubConnector;
     return null;
   }
 

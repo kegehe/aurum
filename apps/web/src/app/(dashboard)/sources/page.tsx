@@ -77,7 +77,7 @@ interface SyncProgress {
 
 function parseSyncProgress(job: IngestionJobItem): SyncProgress | null {
   try {
-    return job.result ? JSON.parse(job.result) as SyncProgress : null;
+    return job.result ? (JSON.parse(job.result) as SyncProgress) : null;
   } catch {
     return null;
   }
@@ -101,16 +101,23 @@ export default function SourcesPage() {
   const [formDownloadInterval, setFormDownloadInterval] = useState('1000');
 
   // Civitai 配置：获取方式 / 排序 / 时间范围 / NSFW / 每次数量 / 页数
-  const [formSyncMode, setFormSyncMode] = useState<'auto_download' | 'metadata_only'>('auto_download');
+  const [formSyncMode, setFormSyncMode] = useState<'auto_download' | 'metadata_only'>(
+    'auto_download',
+  );
   const [formCivitaiSort, setFormCivitaiSort] = useState('Newest');
   const [formCivitaiPeriod, setFormCivitaiPeriod] = useState('AllTime');
   const [formCivitaiNsfw, setFormCivitaiNsfw] = useState(false);
+  // GitHub 配置：仓库（owner/repo 或 github.com URL）
+  const [formGithubRepo, setFormGithubRepo] = useState('');
   const [formLimit, setFormLimit] = useState('100');
   const [formMaxPages, setFormMaxPages] = useState('1');
   const [formAutoSyncInterval, setFormAutoSyncInterval] = useState('off');
   const [formDownloadDirectory, setFormDownloadDirectory] = useState('');
   // 可选的下载目录（已有来源目录 + 存储根下的自定义目录），供 datalist 建议
   const [availableDirectories, setAvailableDirectories] = useState<string[]>([]);
+
+  // 可同步的来源类型（有后台连接器支持 sync_source）：civitai / github
+  const isSyncSource = formSourceType === 'civitai' || formSourceType === 'github';
 
   // 同步状态
   const [activeSyncJobs, setActiveSyncJobs] = useState<Record<string, IngestionJobItem>>({});
@@ -144,10 +151,9 @@ export default function SourcesPage() {
           pageSize: 100,
         }),
       ]);
-      const jobsBySource = [...pendingJobs.items, ...processingJobs.items].reduce<Record<string, IngestionJobItem>>(
-        (jobs, job) => (job.source ? { ...jobs, [job.source.id]: job } : jobs),
-        {},
-      );
+      const jobsBySource = [...pendingJobs.items, ...processingJobs.items].reduce<
+        Record<string, IngestionJobItem>
+      >((jobs, job) => (job.source ? { ...jobs, [job.source.id]: job } : jobs), {});
       setSources(data.items);
       setActiveSyncJobs(jobsBySource);
     } catch (e) {
@@ -157,15 +163,23 @@ export default function SourcesPage() {
     }
   }, []);
 
-  useEffect(() => { fetchSources(); }, [fetchSources]);
+  useEffect(() => {
+    fetchSources();
+  }, [fetchSources]);
 
   // 加载可选的下载目录（编辑弹窗“选择目录”用）
   useEffect(() => {
     let cancelled = false;
     listSourceDownloadDirectories()
-      .then((dirs) => { if (!cancelled) setAvailableDirectories(dirs); })
-      .catch(() => { /* 目录建议加载失败不阻塞弹窗，仅少一组建议 */ });
-    return () => { cancelled = true; };
+      .then((dirs) => {
+        if (!cancelled) setAvailableDirectories(dirs);
+      })
+      .catch(() => {
+        /* 目录建议加载失败不阻塞弹窗，仅少一组建议 */
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -215,6 +229,7 @@ export default function SourcesPage() {
     setFormCivitaiSort('Newest');
     setFormCivitaiPeriod('AllTime');
     setFormCivitaiNsfw(false);
+    setFormGithubRepo('');
     setFormLimit('100');
     setFormMaxPages('1');
     setFormAutoSyncInterval('off');
@@ -240,13 +255,16 @@ export default function SourcesPage() {
       source.maxConcurrency >= 2 ? String(Math.min(source.maxConcurrency, 10)) : '4',
     );
     setFormRateLimit(String(Math.min(1000, Math.max(1, source.rateLimitPerMinute || 30))));
-    setFormDownloadInterval(String(Math.min(60000, Math.max(0, source.downloadIntervalMs ?? 1000))));
+    setFormDownloadInterval(
+      String(Math.min(60000, Math.max(0, source.downloadIntervalMs ?? 1000))),
+    );
     // 获取方式：需要人工审核 = 仅保存元数据，否则自动下载图片
     setFormSyncMode(source.requiresReview ? 'metadata_only' : 'auto_download');
     // 重置 Civitai 配置，然后按需从 config 解析
     setFormCivitaiSort('Newest');
     setFormCivitaiPeriod('AllTime');
     setFormCivitaiNsfw(false);
+    setFormGithubRepo('');
     setFormLimit('100');
     setFormMaxPages('1');
     if (source.sourceType === 'civitai' && source.config) {
@@ -256,6 +274,16 @@ export default function SourcesPage() {
         setFormCivitaiPeriod(config.filters?.period ?? config.period ?? 'AllTime');
         setFormCivitaiNsfw(config.filters?.nsfw ?? config.nsfw ?? false);
         setFormLimit(String(config.limit ?? 100));
+        setFormMaxPages(String(config.maxPages ?? 1));
+      } catch {
+        // keep defaults
+      }
+    }
+    if (source.sourceType === 'github' && source.config) {
+      try {
+        const config = JSON.parse(source.config);
+        setFormGithubRepo(typeof config.repo === 'string' ? config.repo : '');
+        setFormLimit(String(config.limit ?? 30));
         setFormMaxPages(String(config.maxPages ?? 1));
       } catch {
         // keep defaults
@@ -311,26 +339,54 @@ export default function SourcesPage() {
         ...(cursor && !filtersChanged ? { cursor } : {}),
       });
     }
+    if (formSourceType === 'github') {
+      // 编辑时保留分页游标；仓库变化则从头拉取
+      let cursor: string | undefined;
+      let existingRepo: string | undefined;
+      if (existingConfig) {
+        try {
+          const parsed = JSON.parse(existingConfig);
+          if (typeof parsed.cursor === 'string') cursor = parsed.cursor;
+          if (typeof parsed.repo === 'string') existingRepo = parsed.repo;
+        } catch {
+          // malformed config — ignore
+        }
+      }
+      const repo = formGithubRepo.trim();
+      const limit = Number.parseInt(formLimit, 10);
+      const maxPages = Number.parseInt(formMaxPages, 10);
+      return JSON.stringify({
+        repo,
+        limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 100) : 30,
+        maxPages: Number.isFinite(maxPages) && maxPages > 0 ? maxPages : 1,
+        ...(cursor && existingRepo === repo ? { cursor } : {}),
+      });
+    }
     return undefined;
   };
 
   const handleSave = async () => {
     if (!formName.trim() || !formSlug.trim()) return;
-    const isCivitai = formSourceType === 'civitai';
-    // 仅 civitai 按表单筛选条件重写 config；其它类型保留原有 config，
+    if (formSourceType === 'github' && !formGithubRepo.trim()) {
+      toast.error('GitHub 来源需要填写仓库（owner/repo）');
+      return;
+    }
+    // 仅同步型来源按表单重写 config；其它类型保留原有 config，
     // 避免编辑（改个名字）时误把已有 config（如同步 cursor）清空。
-    const config = isCivitai
+    const config = isSyncSource
       ? buildConfig(editingSource?.config)
       : (editingSource?.config ?? undefined);
     // 获取方式决定 allowedModes / requiresReview（仅同步型来源生效；
     // link_only 始终保留，链接导入功能依赖它）。maxConcurrency 只对同步有意义，
-    // 一并放进 civitaiPolicy，避免编辑非 civitai 来源时误改这个死字段。
+    // 一并放进 syncPolicy，避免编辑非同步来源时误改这个死字段。
     const metadataOnly = formSyncMode === 'metadata_only';
-    const civitaiPolicy = isCivitai
+    const syncPolicy = isSyncSource
       ? {
           // Metadata-only sources do not download during sync, but a user may
           // explicitly review an item and mirror it later from its detail page.
-          allowedModes: metadataOnly ? 'link_only,metadata_only,mirror_file' : 'link_only,mirror_file',
+          allowedModes: metadataOnly
+            ? 'link_only,metadata_only,mirror_file'
+            : 'link_only,mirror_file',
           requiresReview: metadataOnly,
           // 与输入框 min=2/max=10 及后端 DTO 约束保持一致，避免 1 或超限值落库
           maxConcurrency: Math.min(10, Math.max(2, parseInt(formMaxConcurrency) || 4)),
@@ -338,20 +394,23 @@ export default function SourcesPage() {
           downloadIntervalMs: Math.min(60000, Math.max(0, parseInt(formDownloadInterval) || 0)),
         }
       : {};
-    // 定时自动同步间隔（小时）：仅同步型来源（civitai）可配置。
+    // 定时自动同步间隔（小时）：仅同步型来源（civitai/github）可配置。
     // 'off' = 关闭（创建时省略字段，更新时置 null 清除）。
-    // 非 civitai 来源不发送该字段：创建时省略、更新时保留原值，
-    // 避免在创建对话框里把 civitai 的间隔残留写到不支持同步的来源上。
-    const autoSyncIntervalHours = isCivitai
+    // 非同步来源不发送该字段：创建时省略、更新时保留原值，
+    // 避免在创建对话框里把同步间隔残留写到不支持同步的来源上。
+    const autoSyncIntervalHours = isSyncSource
       ? formAutoSyncInterval === 'off'
         ? null
         : Number.parseInt(formAutoSyncInterval, 10)
       : undefined;
     // 下载目录：仅同步型来源可配置。规整用户输入（反斜杠转正斜杠、去首尾斜杠、去空白），
     // 与后端 DTO 规则一致：由 / 分隔的若干段，每段为字母/数字/下划线/连字符。
-    // civitai：填了写目录、留空传 null 清除（回到默认存储布局）；非 civitai：不发送字段。
-    const rawDir = formDownloadDirectory.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-    const downloadDirectoryValue = !isCivitai
+    // 同步来源：填了写目录、留空传 null 清除（回到默认存储布局）；非同步来源：不发送字段。
+    const rawDir = formDownloadDirectory
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+    const downloadDirectoryValue = !isSyncSource
       ? undefined
       : rawDir
         ? rawDir
@@ -369,7 +428,7 @@ export default function SourcesPage() {
           sourceType: formSourceType,
           baseUrl: formBaseUrl.trim() || null,
           enabled: formEnabled,
-          ...civitaiPolicy,
+          ...syncPolicy,
           config: config ?? null,
           autoSyncIntervalHours,
           downloadDirectory: downloadDirectoryValue,
@@ -383,7 +442,7 @@ export default function SourcesPage() {
           sourceType: formSourceType,
           baseUrl: formBaseUrl.trim() || undefined,
           enabled: formEnabled,
-          ...civitaiPolicy,
+          ...syncPolicy,
           config,
           autoSyncIntervalHours: autoSyncIntervalHours ?? undefined,
           ...(downloadDirectoryValue !== undefined
@@ -541,9 +600,7 @@ export default function SourcesPage() {
       header: '状态',
       className: 'w-20',
       render: (s) => (
-        <Badge variant={s.enabled ? 'default' : 'outline'}>
-          {s.enabled ? '启用' : '禁用'}
-        </Badge>
+        <Badge variant={s.enabled ? 'default' : 'outline'}>{s.enabled ? '启用' : '禁用'}</Badge>
       ),
     },
     {
@@ -552,13 +609,21 @@ export default function SourcesPage() {
       className: 'w-28',
       render: (s) => {
         // 同步仅 civitai 类型支持；其它来源显示占位符
-        if (s.sourceType !== 'civitai') {
-          return <Badge variant="outline" className="text-xs">—</Badge>;
+        if (s.sourceType !== 'civitai' && s.sourceType !== 'github') {
+          return (
+            <Badge variant="outline" className="text-xs">
+              —
+            </Badge>
+          );
         }
         return s.requiresReview ? (
-          <Badge variant="secondary" className="text-xs">仅元数据</Badge>
+          <Badge variant="secondary" className="text-xs">
+            仅元数据
+          </Badge>
         ) : (
-          <Badge variant="default" className="text-xs">自动下载</Badge>
+          <Badge variant="default" className="text-xs">
+            自动下载
+          </Badge>
         );
       },
     },
@@ -568,7 +633,11 @@ export default function SourcesPage() {
       className: 'w-24',
       render: (s) => {
         if (!s.autoSyncIntervalHours || s.autoSyncIntervalHours < 1) {
-          return <Badge variant="outline" className="text-xs">—</Badge>;
+          return (
+            <Badge variant="outline" className="text-xs">
+              —
+            </Badge>
+          );
         }
         return (
           <Badge variant="secondary" className="text-xs">
@@ -608,7 +677,9 @@ export default function SourcesPage() {
         if (s.lastSyncStatus === 'failed') {
           return (
             <div className="flex flex-col gap-0.5">
-              <Badge variant="destructive" className="w-fit text-xs">同步失败</Badge>
+              <Badge variant="destructive" className="w-fit text-xs">
+                同步失败
+              </Badge>
               {s.lastSyncedAt && (
                 <span className="text-xs text-muted-foreground">
                   {new Date(s.lastSyncedAt).toLocaleString('zh-CN', {
@@ -620,10 +691,7 @@ export default function SourcesPage() {
                 </span>
               )}
               {s.lastSyncError && (
-                <span
-                  className="text-xs text-destructive line-clamp-1"
-                  title={s.lastSyncError}
-                >
+                <span className="text-xs text-destructive line-clamp-1" title={s.lastSyncError}>
                   {s.lastSyncError}
                 </span>
               )}
@@ -633,7 +701,9 @@ export default function SourcesPage() {
         if (s.lastSyncStatus === 'completed') {
           return (
             <div className="flex flex-col gap-0.5">
-              <Badge variant="success" className="w-fit text-xs">成功</Badge>
+              <Badge variant="success" className="w-fit text-xs">
+                成功
+              </Badge>
               {s.lastSyncedAt && (
                 <span className="text-xs text-muted-foreground">
                   {new Date(s.lastSyncedAt).toLocaleString('zh-CN', {
@@ -648,7 +718,11 @@ export default function SourcesPage() {
           );
         }
         if (s.lastSyncStatus === 'canceled') {
-          return <Badge variant="outline" className="w-fit text-xs">已停止</Badge>;
+          return (
+            <Badge variant="outline" className="w-fit text-xs">
+              已停止
+            </Badge>
+          );
         }
         return (
           <span className="text-xs text-muted-foreground">
@@ -670,7 +744,7 @@ export default function SourcesPage() {
       className: 'w-40 text-right',
       render: (s) => (
         <div className="flex justify-end gap-1">
-          {s.sourceType === 'civitai' && activeSyncJobs[s.id] ? (
+          {(s.sourceType === 'civitai' || s.sourceType === 'github') && activeSyncJobs[s.id] ? (
             <Button
               variant="ghost"
               size="sm"
@@ -681,16 +755,18 @@ export default function SourcesPage() {
             >
               <Square className="h-3.5 w-3.5" />
             </Button>
-          ) : s.sourceType === 'civitai' && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => handleSync(s)}
-              disabled={!s.enabled}
-              title="开始下载"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-            </Button>
+          ) : (
+            (s.sourceType === 'civitai' || s.sourceType === 'github') && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => handleSync(s)}
+                disabled={!s.enabled}
+                title="开始下载"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </Button>
+            )
           )}
           <Button
             variant="ghost"
@@ -737,10 +813,16 @@ export default function SourcesPage() {
       />
 
       {/* 新建/编辑 Dialog */}
-      <Dialog open={dialogOpen} onOpenChange={(open) => {
-        setDialogOpen(open);
-        if (!open) { setEditingSource(null); resetForm(); }
-      }}>
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open);
+          if (!open) {
+            setEditingSource(null);
+            resetForm();
+          }
+        }}
+      >
         <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editingSource ? '编辑来源' : '新建来源'}</DialogTitle>
@@ -749,50 +831,98 @@ export default function SourcesPage() {
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="source-name">名称 *</Label>
-                <Input id="source-name" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="来源名称" maxLength={100} />
+                <Input
+                  id="source-name"
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  placeholder="来源名称"
+                  maxLength={100}
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="source-slug">标识符 *</Label>
-                <Input id="source-slug" value={formSlug} onChange={(e) => setFormSlug(e.target.value.replace(/[^a-z0-9-]/g, ''))} placeholder="my-source" maxLength={50} />
+                <Input
+                  id="source-slug"
+                  value={formSlug}
+                  onChange={(e) => setFormSlug(e.target.value.replace(/[^a-z0-9-]/g, ''))}
+                  placeholder="my-source"
+                  maxLength={50}
+                />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>来源类型 *</Label>
                 <Select value={formSourceType} onValueChange={setFormSourceType}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
                   <SelectContent>
                     {SOURCE_TYPES.map(([value, label]) => (
-                      <SelectItem key={value} value={value}>{label}</SelectItem>
+                      <SelectItem key={value} value={value}>
+                        {label}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="source-base-url">Base URL</Label>
-                <Input id="source-base-url" value={formBaseUrl} onChange={(e) => setFormBaseUrl(e.target.value)} placeholder="https://example.com" />
+                <Input
+                  id="source-base-url"
+                  value={formBaseUrl}
+                  onChange={(e) => setFormBaseUrl(e.target.value)}
+                  placeholder="https://example.com"
+                />
               </div>
             </div>
-            {/* Civitai 专属配置 */}
-            {formSourceType === 'civitai' && (
+            {/* 同步来源（civitai / github）设置 */}
+            {isSyncSource && (
               <div className="space-y-3 border rounded-md p-3">
                 <Label className="text-sm font-medium">同步设置</Label>
+                {formSourceType === 'github' && (
+                  <div className="space-y-2">
+                    <Label htmlFor="source-github-repo" className="text-xs">
+                      仓库 *
+                    </Label>
+                    <Input
+                      id="source-github-repo"
+                      value={formGithubRepo}
+                      onChange={(e) => setFormGithubRepo(e.target.value)}
+                      placeholder="owner/repo 或 https://github.com/owner/repo"
+                      maxLength={200}
+                      className="h-8 text-xs"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      同步该仓库的 Release 资产（无资产的 Release 回退到 tag
+                      源码包）。私有仓库需配置 GITHUB_TOKEN。
+                    </p>
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <Label className="text-xs">获取方式</Label>
                     <Select
                       value={formSyncMode}
-                      onValueChange={(value) => setFormSyncMode(value as 'auto_download' | 'metadata_only')}
+                      onValueChange={(value) =>
+                        setFormSyncMode(value as 'auto_download' | 'metadata_only')
+                      }
                     >
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="auto_download">自动下载图片</SelectItem>
+                        <SelectItem value="auto_download">
+                          {formSourceType === 'github' ? '自动下载文件' : '自动下载图片'}
+                        </SelectItem>
                         <SelectItem value="metadata_only">仅保存元数据</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="source-concurrency" className="text-xs">下载并发</Label>
+                    <Label htmlFor="source-concurrency" className="text-xs">
+                      下载并发
+                    </Label>
                     <Input
                       id="source-concurrency"
                       type="number"
@@ -806,7 +936,9 @@ export default function SourcesPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-2">
-                    <Label htmlFor="source-rate-limit" className="text-xs">每分钟请求上限</Label>
+                    <Label htmlFor="source-rate-limit" className="text-xs">
+                      每分钟请求上限
+                    </Label>
                     <Input
                       id="source-rate-limit"
                       type="number"
@@ -818,7 +950,9 @@ export default function SourcesPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="source-download-interval" className="text-xs">下载间隔（毫秒）</Label>
+                    <Label htmlFor="source-download-interval" className="text-xs">
+                      下载间隔（毫秒）
+                    </Label>
                     <Input
                       id="source-download-interval"
                       type="number"
@@ -831,43 +965,56 @@ export default function SourcesPage() {
                     />
                   </div>
                 </div>
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <Label className="text-xs">排序</Label>
-                    <Select value={formCivitaiSort} onValueChange={setFormCivitaiSort}>
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="Newest">最新</SelectItem>
-                        <SelectItem value="Most Reactions">最多反应</SelectItem>
-                        <SelectItem value="Most Comments">最多评论</SelectItem>
-                      </SelectContent>
-                    </Select>
+                {formSourceType === 'civitai' && (
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <Label className="text-xs">排序</Label>
+                      <Select value={formCivitaiSort} onValueChange={setFormCivitaiSort}>
+                        <SelectTrigger className="h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="Newest">最新</SelectItem>
+                          <SelectItem value="Most Reactions">最多反应</SelectItem>
+                          <SelectItem value="Most Comments">最多评论</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div>
+                      <Label className="text-xs">时间范围</Label>
+                      <Select value={formCivitaiPeriod} onValueChange={setFormCivitaiPeriod}>
+                        <SelectTrigger className="h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="AllTime">全部</SelectItem>
+                          <SelectItem value="Year">一年</SelectItem>
+                          <SelectItem value="Month">一月</SelectItem>
+                          <SelectItem value="Week">一周</SelectItem>
+                          <SelectItem value="Day">一天</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="flex items-end gap-2 pb-1">
+                      <label className="flex items-center gap-1.5 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={formCivitaiNsfw}
+                          onChange={(e) => setFormCivitaiNsfw(e.target.checked)}
+                          className="rounded border-gray-300"
+                        />
+                        NSFW
+                      </label>
+                    </div>
                   </div>
-                  <div>
-                    <Label className="text-xs">时间范围</Label>
-                    <Select value={formCivitaiPeriod} onValueChange={setFormCivitaiPeriod}>
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="AllTime">全部</SelectItem>
-                        <SelectItem value="Year">一年</SelectItem>
-                        <SelectItem value="Month">一月</SelectItem>
-                        <SelectItem value="Week">一周</SelectItem>
-                        <SelectItem value="Day">一天</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex items-end gap-2 pb-1">
-                    <label className="flex items-center gap-1.5 text-xs">
-                      <input type="checkbox" checked={formCivitaiNsfw} onChange={(e) => setFormCivitaiNsfw(e.target.checked)} className="rounded border-gray-300" />
-                      NSFW
-                    </label>
-                  </div>
-                </div>
+                )}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <Label className="text-xs">每次同步数量</Label>
                     <Select value={formLimit} onValueChange={setFormLimit}>
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="10">10</SelectItem>
                         <SelectItem value="50">50</SelectItem>
@@ -879,7 +1026,9 @@ export default function SourcesPage() {
                   <div>
                     <Label className="text-xs">同步页数</Label>
                     <Select value={formMaxPages} onValueChange={setFormMaxPages}>
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="1">1 页</SelectItem>
                         <SelectItem value="3">3 页</SelectItem>
@@ -894,14 +1043,20 @@ export default function SourcesPage() {
                   <div>
                     <Label className="text-xs">定时自动同步</Label>
                     <Select value={formAutoSyncInterval} onValueChange={setFormAutoSyncInterval}>
-                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
                         {AUTO_SYNC_INTERVAL_OPTIONS.map((opt) => (
-                          <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                          <SelectItem key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
                         ))}
                         {/* 兼容非预设间隔值（如 API 直接设置的 12 小时） */}
                         {formAutoSyncInterval !== 'off' &&
-                          !AUTO_SYNC_INTERVAL_OPTIONS.some((o) => o.value === formAutoSyncInterval) && (
+                          !AUTO_SYNC_INTERVAL_OPTIONS.some(
+                            (o) => o.value === formAutoSyncInterval,
+                          ) && (
                             <SelectItem value={formAutoSyncInterval}>
                               每 {formAutoSyncInterval} 小时
                             </SelectItem>
@@ -926,7 +1081,11 @@ export default function SourcesPage() {
                       id="source-download-directory"
                       value={formDownloadDirectory}
                       onChange={(e) => setFormDownloadDirectory(e.target.value)}
-                      placeholder="如 civitai/my-images"
+                      placeholder={
+                        formSourceType === 'github'
+                          ? '如 github/owner-repo'
+                          : '如 civitai/my-images'
+                      }
                       list="source-download-directory-options"
                       maxLength={200}
                       className="h-8 pl-8 text-xs"
@@ -944,13 +1103,22 @@ export default function SourcesPage() {
               </div>
             )}
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={formEnabled} onChange={(e) => setFormEnabled(e.target.checked)} className="rounded border-gray-300" />
+              <input
+                type="checkbox"
+                checked={formEnabled}
+                onChange={(e) => setFormEnabled(e.target.checked)}
+                className="rounded border-gray-300"
+              />
               启用
             </label>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>取消</Button>
-            <Button onClick={handleSave} disabled={!formName.trim() || !formSlug.trim()}>保存</Button>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={handleSave} disabled={!formName.trim() || !formSlug.trim()}>
+              保存
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -958,7 +1126,9 @@ export default function SourcesPage() {
       {/* 删除确认 */}
       <ConfirmDialog
         open={!!deleteTarget}
-        onOpenChange={(v) => { if (!v) setDeleteTarget(null); }}
+        onOpenChange={(v) => {
+          if (!v) setDeleteTarget(null);
+        }}
         title="删除来源"
         description={`确定要删除来源 "${deleteTarget?.name}" 吗？其名下的资源仍会保留，但与其关联的定位器/溯源记录将失去来源归属，已接受的条款记录及限流配额会被一并清除。此操作不可撤销。`}
         variant="destructive"

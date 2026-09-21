@@ -41,6 +41,7 @@ pnpm test
   - 来源配置 CRUD 与策略门禁。
   - 链接导入任务与 SSRF 防护（SafeUrlService）。
   - Civitai 连接器与定时自动同步（分页游标、幂等 upsert、审核门禁、下载开关）。
+  - GitHub 连接器（Release 资产映射、tag 源码包回退、页号游标、ETag/304、速率限制报错、私有仓库鉴权头）。
   - LinkMetadata 提取、LocatorHealthChecker 健康探测调度。
   - 导入任务仓储与 IngestionScheduler。
 - 样式实验室：

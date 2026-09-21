@@ -32,6 +32,7 @@ function createService(
     linkMetadataConnector?: object;
     locatorHealthChecker?: object;
     civitaiConnector?: object;
+    githubConnector?: object;
     storage?: object;
     fileRepo?: object;
     scheduler?: object;
@@ -47,6 +48,7 @@ function createService(
     (options.linkMetadataConnector ?? {}) as never,
     (options.locatorHealthChecker ?? {}) as never,
     (options.civitaiConnector ?? {}) as never,
+    (options.githubConnector ?? {}) as never,
     (options.storage ?? {}) as never,
     (options.fileRepo ?? {}) as never,
     (options.scheduler ?? { enqueue: vi.fn().mockResolvedValue(undefined) }) as never,

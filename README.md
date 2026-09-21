@@ -19,7 +19,7 @@ Aurum 是面向个人、工作室或小团队的多类型资源管理平台。�
 | 回收站         | 软删除、恢复、彻底删除、清空回收站                                                  |
 | 处理任务       | 进程内轮询调度、任务列表、统计、失败重试、临时文件清理                              |
 | 统计与一致性   | 概览统计、资源类型统计、存储文件一致性检查                                          |
-| 外部资源接入   | 来源配置、链接导入、SSRF 防护、幂等任务、元数据提取、Civitai 定时自动同步               |
+| 外部资源接入   | 来源配置、链接导入、SSRF 防护、幂等任务、元数据提取、Civitai/GitHub 定时自动同步               |
 | 样式实验室     | AI 视觉样式分析（配色/字体/排版/布局）、多种布局变体、生图提示词 / CSS Tokens 导出   |
 | 前端           | Next.js 15 管理界面：上传、资源库、详情、分类、回收站、处理任务、仪表盘、样式实验室 |
 | 测试验收       | API 单元测试、类型检查、lint、API/Web 生产构建                                      |
@@ -145,6 +145,7 @@ pnpm build:web
 | `ANTHROPIC_BASE_URL`       | AI 自定义接口地址（可选，官方留空；SDK 自动追加 `/v1/messages`） | （空）   |
 | `AI_STYLE_MODEL`           | 样式分析模型      | `claude-sonnet-5`           |
 | `MAX_STYLE_IMAGE_SIZE_MB`  | 单张分析图片上限  | `20`                        |
+| `GITHUB_TOKEN`             | GitHub API Token（可选，提高同步限额并支持私有仓库） | （空）               |
 | `NEXT_PUBLIC_API_URL`      | Web 调用 API 地址 | `http://localhost:3000/api` |
 
 ## API 概览
