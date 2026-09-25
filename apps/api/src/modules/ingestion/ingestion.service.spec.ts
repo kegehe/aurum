@@ -24,6 +24,24 @@ import fileType from 'file-type';
 const mockFetch = vi.mocked(fetch);
 const mockFileTypeFromFile = vi.mocked(fileType.fromFile);
 
+/**
+ * storage.put 替身，按真实驱动（LocalStorageDriver.put）的契约消费入参。
+ *
+ * 若收下 Readable 却不读：连接器 download() 的 finally 会紧接着 unlink 临时文件，
+ * 而 ReadStream 的 open 排在下一 tick，落地时文件已没了 —— 错误无人接收，
+ * 冒成 unhandled 'error'（ENOENT/EPERM），vitest 会把全绿的一次运行判成退出码 1。
+ */
+function storagePutSpy() {
+  return vi.fn(async (key: string, data: Buffer | NodeJS.ReadableStream) => {
+    if (!Buffer.isBuffer(data)) {
+      for await (const _chunk of data as NodeJS.ReadableStream) {
+        // drain
+      }
+    }
+    return key;
+  });
+}
+
 /** 构造 IngestionService，可用 overrides 覆盖任意依赖 */
 function createService(
   options: {
@@ -488,7 +506,7 @@ describe('IngestionService sync_source', () => {
 
   it('rejects media content that only pretends to be an image through its response header', async () => {
     const prisma = { resourceLocator: { update: vi.fn().mockResolvedValue({}) } };
-    const storage = { generateKey: vi.fn(), put: vi.fn() };
+    const storage = { generateKey: vi.fn(), put: storagePutSpy() };
     const service = createService({ prisma, storage });
     const internalService = service as unknown as {
       downloadRemoteFile: (
@@ -970,7 +988,7 @@ describe('IngestionService sync_source', () => {
       }),
     };
 
-    const storage = { generateKey: vi.fn(), put: vi.fn() };
+    const storage = { generateKey: vi.fn(), put: storagePutSpy() };
     const scheduler = { enqueue: vi.fn() };
 
     const service = createService({
@@ -1056,7 +1074,7 @@ describe('IngestionService sync_source', () => {
       }),
     };
 
-    const storage = { generateKey: vi.fn(), put: vi.fn() };
+    const storage = { generateKey: vi.fn(), put: storagePutSpy() };
     const scheduler = { enqueue: vi.fn() };
 
     const service = createService({
@@ -1135,14 +1153,7 @@ describe('IngestionService sync_source', () => {
 
     const storage = {
       generateKey: vi.fn().mockReturnValue('originals/ab/cd/hash.original.jpg'),
-      put: vi.fn().mockImplementation(async (_key: string, stream: NodeJS.ReadableStream) => {
-        // 生产环境 LocalStorageDriver.put 会 pipe 消费流；这里 mock 不消费，
-        // 需挂 error 监听，避免临时文件被 finally 的 unlink 抢先删除时读流报 ENOENT 未处理
-        const readable = stream as import('node:stream').Readable;
-        readable.on('error', () => undefined);
-        readable.resume();
-        return 'originals/ab/cd/hash.original.jpg';
-      }),
+      put: storagePutSpy(),
     };
     const scheduler = { enqueue: vi.fn().mockResolvedValue(undefined) };
 
@@ -1666,7 +1677,7 @@ function makeSnapshotMocks(
       (role: string, hash: string, _variant?: string, ext?: string) =>
         `${role}s/ab/cd/${hash}.${ext ?? 'bin'}`,
     ),
-    put: vi.fn().mockResolvedValue(undefined),
+    put: storagePutSpy(),
     delete: vi.fn().mockResolvedValue(undefined),
   };
   const sha256 = createHash('sha256').update(html, 'utf-8').digest('hex');
