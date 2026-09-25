@@ -38,7 +38,13 @@ function createDeps(
       (role: string, hash: string, _variant?: string, ext?: string) =>
         `${role}s/ab/cd/${hash}.${ext}`,
     ),
-    put: vi.fn().mockResolvedValue(undefined),
+    put: vi.fn(async (_key: string, stream: NodeJS.ReadableStream) => {
+      // 与真实驱动一样消费可读流：否则未读的 Readable 会在 finally 的 unlink 之后
+      // 才 open，冒成 unhandled 'error'（ENOENT/EPERM）使 vitest 退出码变 1
+      for await (const _chunk of stream) {
+        // drain
+      }
+    }),
   };
   const config = {
     get: vi.fn(() => options.maxFileSizeMB ?? 100),
