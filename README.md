@@ -7,9 +7,9 @@
 - **资源管理**：单文件/批量上传（SHA-256 去重、MIME 识别）、元数据编辑、下载与内联预览、缩略图、关键词/类型/分类/时间/大小的搜索筛选与排序、批量移动与收藏、软删除回收站、树形分类。
 - **处理任务**：缩略图、转码、文本提取等异步任务。默认在 API 进程内轮询执行；设 `EXECUTION_ENABLED=false` 可把执行拆到独立 Worker 进程。
 - **外部资源接入**：来源配置、链接导入、SSRF 防护、Civitai/GitHub/RSS 定时自动同步、页面 HTML 快照、链接健康检查与策略门禁。
-- **AI**：样式实验室（视觉样式分析，未配置 Key 或调用失败时自动降级为本地确定性分析）、AI 设计运营台、页面内运行时 AI 配置管理（多套 Key 切换、连通性测试，无需重启）。
+- **AI**：样式实验室（视觉样式分析，未配置 Key 或调用失败时自动降级为本地确定性分析）、AI 设计运营台（设计资产版本化治理 + AI 候选 + 对比度门禁 + 受控渲染 + 只读导出，含**面向非专业用户的创建向导**：选配色 → 挑现成效果或描述一句 → 微调 → 一键发布）、页面内运行时 AI 配置管理（多套 Key 切换、连通性测试，无需重启）。
 - **统计与一致性**：概览与资源类型统计、存储文件一致性检查。
-- **前端**：Next.js 15 管理界面 — 仪表盘、资源库与详情、上传、添加链接、任务中心、来源管理、处理任务、回收站、样式实验室、设计运营台、设置（AI 配置）。
+- **前端**：Next.js 15 管理界面 — 仪表盘、资源库与详情、上传、添加链接、任务中心、来源管理、处理任务、回收站、样式实验室、设计运营台（创建向导 `/design-library` + 审核台 `/design-library/review`）、设置（AI 配置）。
 
 ## 技术栈
 
@@ -98,10 +98,17 @@ aurum/
 - 本地存储 key 经过路径穿越校验（禁止绝对路径、反斜杠、冒号、空字节和 `.`/`..` 段）。
 - 样式实验室是**精益版**：不落库、不进任务队列，同步返回结果；颜色 HEX 由 sharp 确定性提取，大模型只做语义命名。
 - `pnpm lint` 会运行 API ESLint `--fix`，可能产生格式化改动。
+- API 开发启动复用 `dist/` 的增量编译缓存：`nest-cli.json` 关闭了 `deleteOutDir`，`tsconfig.build.json` 把 `tsBuildInfoFile` 放到 `node_modules/.cache/`。关闭 `deleteOutDir` 后重启走增量（约 4s）而不是每次全量（约 30s）。代价是产物里可能残留已删除源文件的 `.js`，需要干净产物时跑 `pnpm --filter @aurum/api clean:dist`（注意：这个命令会连增量缓存一起清掉，之后第一次构建必然是全量）。
+- **全新 clone 后要先 `pnpm db:generate`，再 `pnpm build:api`，最后才能 `typecheck` / `build:worker`**：Prisma Client 的生成产物在 gitignore 里，缺了它 API 会报几百个 `Property 'xxx' does not exist on type 'PrismaService'`；而 `apps/worker` 校验和构建的是 `@aurum/api/dist/worker`，API 没构建过就会报 TS2307。CI 已按此顺序编排（`db:generate` → `build:api` → `typecheck` → `test` → `build:worker` → `build:web`）。
+- 改动合并前跑 `pnpm lint:check`（只检查、不改文件）；`pnpm lint` 带 `--fix`，会在本地改文件，不要用在 CI。
+- **模块边界由 `pnpm depcruise` 把关**（dependency-cruiser，CI 会跑）：模块之间只能通过对方的 service 通信，不得直接引用对方的 repository（持久化内部），也不得有循环依赖。现存越界（19 处跨模块 repository 访问、1 处 processing↔resource 循环）登记在 `.dependency-cruiser.cjs` 里并注明了原因，修好一处删一条；新增越界会被拦下。
+- **枚举只有一份权威定义**：`packages/shared-types/src/enums.ts`。`apps/api/src/common/constants/enums.ts` 是 `pnpm sync:enums` 从它生成的，**不要手改**；CI 用 `pnpm check:enums` 校验同步。为什么不直接依赖：API 走 tsc，消费不了 shared-types 的裸 TS 源码，而给它加构建产物会让三个包多出构建顺序依赖、并在 watch 模式下静默用旧产物——原因写在 `scripts/sync-shared-enums.mjs` 顶部。
 
 ## 已知限制
 
 前端 E2E、真实 multipart 上传、真实媒体处理链路尚未自动化；Docker Compose、备份与生产部署说明仍待整理。PostgreSQL、Redis/BullMQ、S3/MinIO 属于后续演进方向，当前默认运行不依赖它们。详细清单见 [docs/acceptance-checklist.md](docs/acceptance-checklist.md)。
+
+前端目前只覆盖了纯逻辑层（`lib/` 的 api-client、format、resource）与少量基础组件，**页面级 / 交互流（1518 行的资源列表、设计发布流程）还没有测试**；后端 `design.service.ts`（2419 行 / 52 个方法）也只有 15 个用例，不足以支撑拆分。两者都属于待补。
 
 ## 相关文档
 
