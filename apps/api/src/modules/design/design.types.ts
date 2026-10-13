@@ -1,4 +1,11 @@
-export const DESIGN_KINDS = ['foundation', 'theme', 'component', 'layout', 'style_pack'] as const;
+export const DESIGN_KINDS = [
+  'foundation',
+  'theme',
+  'component',
+  'layout',
+  'style_pack',
+  'animation',
+] as const;
 export type DesignKind = (typeof DESIGN_KINDS)[number];
 
 export type JsonRecord = Record<string, unknown>;

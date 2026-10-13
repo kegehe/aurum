@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { DesignController } from './design.controller';
 import { DesignService } from './design.service';
+import { DesignDocumentService } from './design-document.service';
+import { DesignPublishService } from './design-publish.service';
 import { DesignTaskProcessor } from './design-task.processor';
 import { AiSettingsModule } from '../ai-settings/ai-settings.module';
 import { DesignAgentService } from './design-agent.service';
@@ -16,6 +18,8 @@ import { DesignInternalGuard } from './design-internal.guard';
   controllers: [DesignController],
   providers: [
     DesignService,
+    DesignDocumentService,
+    DesignPublishService,
     DesignTaskProcessor,
     DesignAgentService,
     ControlledRendererService,

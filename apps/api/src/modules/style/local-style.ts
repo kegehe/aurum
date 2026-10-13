@@ -9,42 +9,17 @@
  *
  * 与 AI 路径共享 StyleProfile / StyleVariation 结构，前端无需区分。
  */
+import { hexToRgb, relativeLuminance as luminance, type Rgb } from '../../common/color/contrast';
 import type { ExtractedPalette } from './extractors/color-extractor';
 import type { StyleProfile } from './types';
 
 // ==================== 颜色工具 ====================
-
-interface Rgb {
-  r: number;
-  g: number;
-  b: number;
-}
-
-function hexToRgb(hex: string): Rgb {
-  const h = hex.replace('#', '').trim();
-  const value =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const num = parseInt(value, 16);
-  return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
-}
+// hexToRgb / relativeLuminance 已抽到 common/color/contrast，与设计运营台的
+// 对比度门禁共用一份实现（那边需要解析 rgb()/hsl()，这里只喂 hex）。
 
 function toHex(r: number, g: number, b: number): string {
   const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
   return `#${[clamp(r), clamp(g), clamp(b)].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
-}
-
-/** WCAG 相对亮度（0-1） */
-function luminance(c: Rgb): number {
-  const [r, g, b] = [c.r, c.g, c.b].map((v) => {
-    const s = v / 255;
-    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
-  });
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
 /**

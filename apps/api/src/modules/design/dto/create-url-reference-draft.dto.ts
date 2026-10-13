@@ -1,4 +1,4 @@
-import { IsString, IsUrl, IsUUID, MaxLength } from 'class-validator';
+import { IsUrl, IsUUID, MaxLength } from 'class-validator';
 
 /** A reference must be tied to an operator-approved source registry entry. */
 export class CreateUrlReferenceDraftDto {

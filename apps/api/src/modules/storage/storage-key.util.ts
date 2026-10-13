@@ -1,26 +1,39 @@
 /**
  * 文件角色 -> 存储目录名映射
+ *
+ * 对测试导出：role 缺失会抛错，但两张表必须同时注册——只补一张是静默失败
+ * （见 ROLE_SUFFIX_MAP 注释），所以「两张表都覆盖 FileRole 每个成员」要能被断言。
  */
-const ROLE_DIR_MAP: Record<string, string> = {
+export const ROLE_DIR_MAP: Record<string, string> = {
   original: 'originals',
   thumbnail: 'thumbnails',
   preview: 'previews',
   extracted_text: 'extracted-text',
   transcode: 'transcodes',
   snapshot: 'snapshots',
+  // 设计运营台的受控渲染产物。分成独立目录，便于按前缀做孤儿对账。
+  'design-preview': 'design-previews',
+  'design-diff': 'design-diffs',
 };
 
 /**
  * 文件角色 -> 文件名后缀映射
- * extracted_text 无后缀，直接用 hash 命名
+ *
+ * extracted_text 是唯一的无后缀角色（空串是有意的）。
+ *
+ * 注意：与 ROLE_DIR_MAP 不同，这里缺条目**不会抛错**——`suffix ? ... : hash`
+ * 会静默产出另一种 key 形态（丢掉后缀段）。所以新增 role 时两张表都要补，
+ * 漏掉这一张的症状更隐蔽。测试按 FileRole 全量断言可覆盖。
  */
-const ROLE_SUFFIX_MAP: Record<string, string> = {
+export const ROLE_SUFFIX_MAP: Record<string, string> = {
   original: 'original',
   thumbnail: 'thumb',
   preview: 'preview',
   extracted_text: '',
   transcode: 'transcode',
   snapshot: 'snapshot',
+  'design-preview': 'preview',
+  'design-diff': 'diff',
 };
 
 /**

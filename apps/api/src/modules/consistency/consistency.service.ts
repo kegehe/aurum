@@ -39,7 +39,7 @@ export class ConsistencyService {
 
     const missingStorageFiles = dbPaths.filter((path) => !storageKeySet.has(path));
     const orphanStorageFiles = storageKeys.filter(
-      (key) => !dbPathSet.has(key) && !key.startsWith('temp/'),
+      (key) => !dbPathSet.has(key) && !isExemptFromOrphanReport(key),
     );
     const expiredTempFiles = storageObjects
       .filter(
@@ -61,4 +61,22 @@ export class ConsistencyService {
       },
     };
   }
+}
+
+/**
+ * 是否豁免"孤儿文件"上报。
+ *
+ * 现在有两类：
+ * - `temp/`：上传中转，由 temp-cleanup-cron 负责回收
+ * - `design-previews/`、`design-diffs/`：设计运营台的渲染产物。它们的归属记录在
+ *   PreviewSnapshot / 渲染任务 result 里，不在 resourceFile 表——而本模块只比对
+ *   resourceFile.storagePath，所以这些文件会被无条件算成孤儿。候选删除会回收
+ *   自己的产物，这里豁免只是为了不产生持续噪音。
+ *
+ * 注意本模块**只报告不清理**，所以豁免不会导致文件被漏删。
+ */
+function isExemptFromOrphanReport(key: string): boolean {
+  return (
+    key.startsWith('temp/') || key.startsWith('design-previews/') || key.startsWith('design-diffs/')
+  );
 }

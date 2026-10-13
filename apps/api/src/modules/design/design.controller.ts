@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Headers,
   Inject,
@@ -15,6 +16,12 @@ import {
 import { timingSafeEqual } from 'node:crypto';
 import type { Response } from 'express';
 import { CreateCandidateDto } from './dto/create-candidate.dto';
+import {
+  ComposeGenerateDto,
+  ComposePreviewDto,
+  ComposePublishDto,
+  ComposeRecipeDto,
+} from './dto/compose-publish.dto';
 import { CreateDesignDocumentDto } from './dto/create-design-document.dto';
 import { GenerateAiCandidatesDto } from './dto/generate-ai-candidates.dto';
 import { DesignService } from './design.service';
@@ -26,6 +33,7 @@ import {
   type IStorageService,
 } from '../storage/interfaces/storage-service.interface';
 import { DesignInternalGuard } from './design-internal.guard';
+import type { ExportFormat } from './design-export';
 
 @Controller('design')
 @UseGuards(DesignInternalGuard)
@@ -83,12 +91,9 @@ export class DesignController {
     @Headers('x-aurum-design-key') key: string | undefined,
     @Headers('x-client-id') clientId: string | undefined,
     @Param('idOrSlug') idOrSlug: string,
-    @Query('format') format: 'json' | 'css' | 'tailwind' | 'markdown' = 'json',
+    @Query('format') format: ExportFormat = 'json',
   ) {
     this.requireReadKey(key);
-    if (!['json', 'css', 'tailwind', 'markdown'].includes(format)) {
-      throw new BadRequestException('format 必须为 json、css、tailwind 或 markdown');
-    }
     const asset = await this.designService.getPublishedAsset(idOrSlug);
     await this.designService.recordReadAccess(
       asset.document.id,
@@ -141,9 +146,60 @@ export class DesignController {
     return this.designService.createDocument(dto);
   }
 
+  /** 效果配方清单。创建向导用它渲染"试试这些"芯片。 */
+  @Get('recipes')
+  listRecipes() {
+    return this.designService.listRecipes();
+  }
+
+  /** 从现成效果起手：不花 AI 调用，且成品质量由配方测试预先保证。 */
+  @Post('compose/recipe')
+  composeRecipe(@Body() dto: ComposeRecipeDto) {
+    return this.designService.composeRecipe(dto);
+  }
+
+  /**
+   * 对话生成：让 AI 出几个方案。走任务队列（方案 §15.3），结果不落库——
+   * 它是提案，不是资产；选中的那一份再经 `compose/publish` 走完整发布链。
+   */
+  @Post('compose/generate')
+  composeGenerate(@Body() dto: ComposeGenerateDto) {
+    return this.designService.composeGenerate(dto);
+  }
+
+  /**
+   * 创建向导的实时编译：内容 + 控件编辑 → CSS/HTML 骨架 + 门禁结论 + 反推控件。
+   *
+   * 不落库、不花 AI 调用、不开浏览器，所以滑块每动一下都能调。
+   */
+  @Post('compose/preview')
+  composePreview(@Body() dto: ComposePreviewDto) {
+    return this.designService.composePreview(dto);
+  }
+
+  /**
+   * 一键保存并发布。门禁在请求线程里同步预检，不通过就一个字都不写库；
+   * 通过则建文档、记录候选，并把「渲染 → 选择 → 发布」交给 Worker。
+   */
+  @Post('compose/publish')
+  composeAndPublish(@Body() dto: ComposePublishDto) {
+    return this.designService.composeAndPublish(dto);
+  }
+
   @Get('documents/:id')
   getDocument(@Param('id') id: string) {
     return this.designService.getDocument(id);
+  }
+
+  /**
+   * 运营台内部的导出入口。
+   *
+   * 走内部守卫而不是只读 key：只读 key 是给外部 AI 消费方用的，浏览器不该持有它。
+   * 没有这条，运营台就只能复制原始 JSON，拿不到可直接粘贴的 CSS/HTML。
+   */
+  @Get('documents/:id/export')
+  exportDocument(@Param('id') id: string, @Query('format') format: ExportFormat = 'bundle') {
+    return this.designService.exportPublishedAsset(id, format);
   }
 
   @Post('documents/:id/drafts')
@@ -215,6 +271,11 @@ export class DesignController {
     return this.designService.selectCandidate(id);
   }
 
+  @Delete('candidates/:id')
+  deleteCandidate(@Param('id') id: string) {
+    return this.designService.deleteCandidate(id);
+  }
+
   @Post('candidates/:id/render-validate')
   renderAndValidate(@Param('id') id: string) {
     return this.designService.renderAndValidateCandidate(id);
@@ -233,6 +294,12 @@ export class DesignController {
   @Get('tasks')
   listTasks(@Query('status') status?: string) {
     return this.designService.listTasks(status);
+  }
+
+  /** 单个任务。创建向导轮询生成进度用，避免拉整张任务表。 */
+  @Get('tasks/:id')
+  getTask(@Param('id') id: string) {
+    return this.designService.getTask(id);
   }
 
   @Get('drafts/ready')
