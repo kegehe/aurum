@@ -119,6 +119,10 @@ export function designPost<T>(endpoint: string, body?: unknown): Promise<T> {
   );
 }
 
+export function designDelete<T>(endpoint: string): Promise<T> {
+  return request<T>(endpoint, { method: 'DELETE' }, DESIGN_BASE_URL);
+}
+
 /**
  * multipart 上传
  * 不设置 Content-Type，让浏览器自动生成 boundary

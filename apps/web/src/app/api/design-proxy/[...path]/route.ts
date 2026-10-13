@@ -2,7 +2,9 @@ import { NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 
-const FORWARDED_METHODS = new Set(['GET', 'POST']);
+const FORWARDED_METHODS = new Set(['GET', 'POST', 'DELETE']);
+/** 只有这些方法带请求体，其余方法不该发送空 body */
+const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
 const DASHBOARD_GATEWAY_HEADER = 'x-aurum-design-dashboard-key';
 
 async function proxy(request: Request, context: { params: Promise<{ path: string[] }> }) {
@@ -37,7 +39,7 @@ async function proxy(request: Request, context: { params: Promise<{ path: string
   const response = await fetch(upstream, {
     method: request.method,
     headers,
-    body: request.method === 'GET' ? undefined : await request.arrayBuffer(),
+    body: METHODS_WITH_BODY.has(request.method) ? await request.arrayBuffer() : undefined,
     cache: 'no-store',
   });
   const responseHeaders = new Headers();
@@ -50,3 +52,4 @@ async function proxy(request: Request, context: { params: Promise<{ path: string
 
 export const GET = proxy;
 export const POST = proxy;
+export const DELETE = proxy;
