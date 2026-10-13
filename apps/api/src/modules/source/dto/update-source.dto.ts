@@ -6,7 +6,6 @@ import {
   IsOptional,
   IsString,
   IsUrl,
-  IsUUID,
   Matches,
   Max,
   MaxLength,

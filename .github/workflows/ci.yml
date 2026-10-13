@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# 同一分支的新推送取消上一次未完成的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # 开发与运行环境都是 Windows，且 scripts/（clean-dev-ports 等）含 win32 分支逻辑。
+    # 先让门禁与本地严格一致；确认跨平台后再考虑加 ubuntu 矩阵。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本从 package.json 的 packageManager 字段读取
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # @prisma/client 的生成产物在 gitignore 里，全新检出后必须先 generate，
+      # 否则编译会报几百个 "Property 'xxx' does not exist on type 'PrismaService'"。
+      - name: 生成 Prisma Client
+        run: pnpm db:generate
+
+      # 快反馈项放前面：都不需要构建产物
+      - name: 共享枚举同步校验
+        run: pnpm check:enums
+
+      - name: Lint（check 模式，不改文件）
+        run: pnpm lint:check
+
+      - name: 模块边界
+        run: pnpm depcruise
+
+      # Worker 的 typecheck 依赖 @aurum/api/dist/worker，必须先构建 API。
+      # 顺序不能调换，否则全新 clone 上 worker 会报 TS2307。
+      - name: 构建 API
+        run: pnpm build:api
+
+      # controlled-renderer 的测试会真的启动 Chromium 渲染设计稿。
+      # 浏览器不随 pnpm install 下载（也不在 pnpm-workspace.yaml 的 allowBuilds 里），
+      # 缺了它这几个测试会以 "Executable doesn't exist" 硬失败。
+      - name: 安装 Playwright 浏览器
+        run: pnpm --filter @aurum/api exec playwright install chromium
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      - name: 构建 Worker
+        run: pnpm build:worker
+
+      - name: 构建 Web
+        run: pnpm build:web

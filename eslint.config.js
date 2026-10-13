@@ -11,7 +11,7 @@ module.exports = tseslint.config(
     ignores: ['**/dist/**', '**/node_modules/**', '**/.prisma/**', '**/coverage/**'],
   },
   {
-    files: ['**/*.ts'],
+    files: ['**/*.ts', '**/*.tsx'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'commonjs',
@@ -23,6 +23,14 @@ module.exports = tseslint.config(
       ],
       '@typescript-eslint/no-explicit-any': 'warn',
       '@typescript-eslint/explicit-module-boundary-types': 'off',
+    },
+  },
+  {
+    // 前端是 ESM + JSX。此前 files 只写了 **/*.ts，50 个 .tsx 文件没有任何 lint 覆盖。
+    files: ['**/*.tsx'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
     },
   },
 );

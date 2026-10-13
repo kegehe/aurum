@@ -72,6 +72,9 @@ export enum FileRole {
   extracted_text = 'extracted_text',
   transcode = 'transcode',
   snapshot = 'snapshot',
+  /** 设计运营台预览/像素差异产物。注意本枚举值即存储 role 字符串（连字符形式）。 */
+  design_preview = 'design-preview',
+  design_diff = 'design-diff',
 }
 
 /** 资源处理状态（资源级） */

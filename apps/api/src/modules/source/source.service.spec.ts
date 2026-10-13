@@ -244,7 +244,7 @@ describe('SourceService', () => {
 
   describe('listDownloadDirectories', () => {
     it('unions DB directories with existing top-level custom dirs, excluding system role dirs', async () => {
-      const { service, sourceRepo } = createService({
+      const { service } = createService({
         findDownloadDirectories: vi.fn().mockResolvedValue([
           { downloadDirectory: 'civitai/anime' },
           { downloadDirectory: 'civitai/real' },
@@ -267,7 +267,7 @@ describe('SourceService', () => {
     });
 
     it('returns only DB directories when the storage root does not exist', async () => {
-      const { service, sourceRepo } = createService({
+      const { service } = createService({
         findDownloadDirectories: vi.fn().mockResolvedValue([
           { downloadDirectory: 'civitai/anime' },
         ]),

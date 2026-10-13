@@ -60,7 +60,7 @@ function createService() {
     enqueue: vi.fn(),
   };
   const searchService = {
-    buildWhereClause: vi.fn((query) => ({ deletedAt: null })),
+    buildWhereClause: vi.fn((_query) => ({ deletedAt: null })),
     buildOrderBy: vi.fn(),
   };
   const service = new ResourceService(
