@@ -60,6 +60,12 @@
     同样成立，已一并修掉。
 - 处理任务可拆独立 Worker 进程（`@aurum/worker` 转发 `@aurum/api` 的 worker 入口）：环境变量决定本进程是否执行处理任务 / 是否跑摄入调度，默认保持单进程全开。
 - 直连下载抽成独立连接器 `DirectDownloadConnector`（SSRF 逐跳重定向校验、限量流式落盘、SHA-256、魔数 MIME 识别、写正式存储），IngestionService 只保留任务控制与资源记录；来源同步 / 单资源镜像 / 后续批量下载与独立 Worker 共用同一份实现。
+- 出站 DNS 与失败下载重试（本轮补齐）：
+  - **SSRF 校验改用 DoH 解析**（`DohResolver`，`SAFE_URL_DNS_MODE=auto|doh|system`）：配置代理时默认走 DoH（A+AAAA 并行、TTL 缓存、失败冷却后回退系统 DNS），并在同一个代理上查询。此前后端用系统 DNS 校验、由代理远端连接，本机 DNS 被污染时会把 `image.civitai.com` 解析成假地址/保留地址，校验直接判「blocked network address」；改用 DoH 后校验看到的地址与代理实际连接的目标一致。
+  - **同步内瞬时重试**：网络层错误（`fetch failed`/`ECONN*`/超时/5xx 等）在本次下载内立即重试 2 次（1s、3s）；4xx、超限、策略拒绝不重试。
+  - **失败后持久退避**：失败写入 `ResourceLocator.lastError`，并累计 `downloadAttempts`、按 30m→1h→2h→4h（上限 24h）写入 `nextDownloadAttemptAt`；后台扫描（默认每分钟、每轮 20 条，约等于 2s/文件的下载节流上限）只补漏「来源启用且无需人工审核」的到期条目，最多 5 次。成功后计数清零。
+  - **手动兜底**：`POST /ingestion/retry-failed-downloads?sourceId=&limit=`（上限 200）批量重排失败下载；来源页每行新增「重试失败下载」按钮。手动重试不受自动补漏次数上限约束，仍逐条走来源策略门禁。
+  - **失败可见**：资源列表/卡片/仪表盘显示「下载失败」（悬停给出原因）或「待下载」，详情页显示失败次数；不再一律显示「远程资源」。
 - 已移除集合（collection）、标签（tag）、许可证（license）模块。
 - 已补充测试与验收文档。
 

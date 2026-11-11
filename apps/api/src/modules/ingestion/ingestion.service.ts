@@ -67,6 +67,15 @@ const SYNC_DOWNLOAD_CONCURRENCY_CAP = 20;
 const SYNC_MAX_PAGES_CAP = 50;
 /** 单个远端文件的整体下载超时（DirectDownloadConnector 内部另有读写超时） */
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 180_000;
+/** 同步内瞬时网络错误的重试间隔（不含首次尝试） */
+const INLINE_DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000];
+/** 下载失败自动补漏的尝试上限（达到后不再自动重试，需手动触发） */
+const DOWNLOAD_RETRY_MAX_ATTEMPTS = 5;
+/** 补漏重试的指数退避基数与上限 */
+const DOWNLOAD_RETRY_BASE_MS = 30 * 60_000;
+const DOWNLOAD_RETRY_MAX_DELAY_MS = 24 * 60 * 60_000;
+/** 补漏只处理创建超过该时长的资源，避免与正在进行的同步抢同一条目 */
+const RETRY_SWEEP_MIN_AGE_MS = 10 * 60_000;
 /**
  * 页面快照的响应体上限。现代新闻/社区站点的骨架 HTML 常在 0.5–2 MB，
  * 上限太小会让快照对真实页面失效；再大则说明抓到的不是页面本身。
@@ -478,6 +487,97 @@ export class IngestionService {
     // Clicking "download locally" is the explicit manual review required by
     // metadata-only sources. The source's mirror_file policy is still enforced.
     await this.assertDownloadAllowed(resource.sourceId, AcquisitionMode.mirror_file, true);
+    return this.enqueueDownloadJob(resourceId, resource.sourceId);
+  }
+
+  /**
+   * 后台补漏：重排到期（nextDownloadAttemptAt 已过）的失败下载。
+   *
+   * 只处理无需人工审核、来源仍启用的资源；同一资源已有排队任务时
+   * 由幂等键复用，不会重复入队。返回本轮入队数量。
+   */
+  async scheduleFailedDownloadRetries(batchSize = 20): Promise<number> {
+    const now = new Date();
+    const candidates = await this.prisma.resource.findMany({
+      where: {
+        acquisitionMode: AcquisitionMode.metadata_only,
+        deletedAt: null,
+        createdAt: { lte: new Date(now.getTime() - RETRY_SWEEP_MIN_AGE_MS) },
+        files: { none: { fileRole: FileRole.original, variant: '' } },
+        locators: {
+          some: {
+            locatorType: LocatorType.download,
+            lastError: { not: null },
+            downloadAttempts: { lt: DOWNLOAD_RETRY_MAX_ATTEMPTS },
+            OR: [{ nextDownloadAttemptAt: null }, { nextDownloadAttemptAt: { lte: now } }],
+          },
+        },
+        sourceId: { not: null },
+        sourceRecord: { enabled: true, requiresReview: false },
+      },
+      select: { id: true, sourceId: true },
+      orderBy: { createdAt: 'asc' },
+      take: batchSize,
+    });
+
+    let queued = 0;
+    for (const candidate of candidates) {
+      try {
+        await this.enqueueDownloadJob(candidate.id, candidate.sourceId);
+        queued += 1;
+      } catch (error) {
+        this.logger.warn(
+          `Failed to enqueue download retry for ${candidate.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return queued;
+  }
+
+  /**
+   * 手动批量重试失败下载（超过自动补漏上限的资源也包含在内）。
+   *
+   * 仍逐条走来源策略门禁：不允许镜像下载的来源记为 skipped，不会建任务。
+   */
+  async retryFailedDownloads(params: { sourceId?: string; limit?: number } = {}): Promise<{
+    queued: number;
+    skipped: number;
+  }> {
+    const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
+    const candidates = await this.prisma.resource.findMany({
+      where: {
+        acquisitionMode: AcquisitionMode.metadata_only,
+        deletedAt: null,
+        files: { none: { fileRole: FileRole.original, variant: '' } },
+        locators: {
+          some: { locatorType: LocatorType.download, lastError: { not: null } },
+        },
+        sourceId: params.sourceId ?? { not: null },
+      },
+      select: { id: true, sourceId: true },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    });
+
+    let queued = 0;
+    let skipped = 0;
+    for (const candidate of candidates) {
+      try {
+        await this.assertDownloadAllowed(candidate.sourceId, AcquisitionMode.mirror_file, true);
+        await this.enqueueDownloadJob(candidate.id, candidate.sourceId);
+        queued += 1;
+      } catch (error) {
+        skipped += 1;
+        this.logger.warn(
+          `Skip download retry for ${candidate.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return { queued, skipped };
+  }
+
+  /** 下载任务入队（幂等：同一资源已有排队/执行中的任务时直接复用） */
+  private async enqueueDownloadJob(resourceId: string, sourceId: string | null) {
     const request: DownloadResourceRequest = { resourceId };
     const idempotencyKey = createHash('sha256')
       .update(`${IngestionJobType.download_file}:${resourceId}`)
@@ -486,7 +586,7 @@ export class IngestionService {
     if (existing) return existing;
     try {
       return await this.jobRepo.create({
-        sourceId: resource.sourceId ?? undefined,
+        sourceId: sourceId ?? undefined,
         resourceId,
         jobType: IngestionJobType.download_file,
         request: JSON.stringify(request),
@@ -1380,61 +1480,93 @@ export class IngestionService {
       : null;
 
     try {
-      const downloaded = await this.directDownload.download({
-        url: remote.url,
-        expectedResourceType: remote.resourceType,
-        declaredMimeType: remote.mimeType ?? null,
-        downloadDirectory,
-        signal: controller.signal,
-        onCheckpoint: assertJobActive,
-      });
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const downloaded = await this.directDownload.download({
+            url: remote.url,
+            expectedResourceType: remote.resourceType,
+            declaredMimeType: remote.mimeType ?? null,
+            downloadDirectory,
+            signal: controller.signal,
+            onCheckpoint: assertJobActive,
+          });
 
-      // 事务：更新资源元数据 + 建原文件记录 + 更新 locator + 按 sha256 查重
-      await this.commitDownloadedFile({
-        resourceId,
-        locatorId,
-        remote,
-        sha256: downloaded.sha256,
-        mimeType: downloaded.mimeType,
-        extension: downloaded.extension,
-        resourceType: downloaded.resourceType,
-        sizeBytes: BigInt(downloaded.sizeBytes),
-        storageKey: downloaded.storageKey,
-        originalFilename: this.remoteOriginalFilename(
-          remote.url,
-          remote.externalId,
-          downloaded.extension,
-        ),
-        completion: jobControl?.completeOnCommit
-          ? {
-              id: jobControl.id,
-              leaseToken: jobControl.leaseToken,
-              resourceId,
-              result: JSON.stringify({ status: 'downloaded' }),
-            }
-          : undefined,
-      });
+          // 事务：更新资源元数据 + 建原文件记录 + 更新 locator + 按 sha256 查重
+          await this.commitDownloadedFile({
+            resourceId,
+            locatorId,
+            remote,
+            sha256: downloaded.sha256,
+            mimeType: downloaded.mimeType,
+            extension: downloaded.extension,
+            resourceType: downloaded.resourceType,
+            sizeBytes: BigInt(downloaded.sizeBytes),
+            storageKey: downloaded.storageKey,
+            originalFilename: this.remoteOriginalFilename(
+              remote.url,
+              remote.externalId,
+              downloaded.extension,
+            ),
+            completion: jobControl?.completeOnCommit
+              ? {
+                  id: jobControl.id,
+                  leaseToken: jobControl.leaseToken,
+                  resourceId,
+                  result: JSON.stringify({ status: 'downloaded' }),
+                }
+              : undefined,
+          });
 
-      // 入队元数据检测（图片会链式生成缩略图），与上传流程一致
-      await this.scheduler.enqueue(JobType.detect_metadata, resourceId).catch((error) => {
-        this.logger.warn(
-          `Failed to enqueue metadata detection for ${resourceId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+          // 入队元数据检测（图片会链式生成缩略图），与上传流程一致
+          await this.scheduler.enqueue(JobType.detect_metadata, resourceId).catch((error) => {
+            this.logger.warn(
+              `Failed to enqueue metadata detection for ${resourceId}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
 
-      return 'downloaded';
-    } catch (error) {
-      if (canceled || error instanceof SyncJobCanceledError) {
-        throw new SyncJobCanceledError();
+          return 'downloaded';
+        } catch (error) {
+          if (canceled || error instanceof SyncJobCanceledError) {
+            throw new SyncJobCanceledError();
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          const canRetryInline =
+            attempt < INLINE_DOWNLOAD_RETRY_DELAYS_MS.length &&
+            this.isTransientDownloadError(message);
+          if (!canRetryInline) {
+            this.logger.warn(`Download ${remote.externalId} (${remote.url}) failed: ${message}`);
+            await this.markLocatorError(locatorId, message).catch(() => undefined);
+            return 'failed';
+          }
+          this.logger.warn(
+            `Download ${remote.externalId} (${remote.url}) failed on attempt ${attempt + 1}, retrying: ${message}`,
+          );
+          await this.sleep(INLINE_DOWNLOAD_RETRY_DELAYS_MS[attempt]);
+          await assertJobActive();
+        }
       }
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.warn(`Download ${remote.externalId} (${remote.url}) failed: ${message}`);
-      await this.markLocatorError(locatorId, message).catch(() => undefined);
-      return 'failed';
     } finally {
       clearTimeout(timeout);
       if (cancellationPoll) clearInterval(cancellationPoll);
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** 只有网络层/上游 5xx 才值得立刻重试；策略拒绝、4xx、超限重试也不会变好 */
+  private isTransientDownloadError(message: string): boolean {
+    if (
+      /blocked network address|File too large|Unsupported protocol|HTTP 4\d\d|no location|does not allow|manual review/i.test(
+        message,
+      )
+    ) {
+      return false;
+    }
+    return /fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|other side closed|terminated|timeout|timed out|UND_ERR|HTTP 5\d\d/i.test(
+      message,
+    );
   }
 
   /** 事务提交下载结果：更新资源 + 建原文件 + 更新 locator + 按 sha256 查重 */
@@ -1507,6 +1639,8 @@ export class IngestionService {
             lastCheckedAt: new Date(),
             lastError: null,
             contentType: args.mimeType,
+            downloadAttempts: 0,
+            nextDownloadAttemptAt: null,
           },
         });
       }
@@ -1531,12 +1665,33 @@ export class IngestionService {
     });
   }
 
-  /** 记录下载失败到 locator，供健康检查与 UI 溯源 */
+  /**
+   * 记录下载失败到 locator，供健康检查与 UI 溯源，并排下一次补漏时间。
+   *
+   * 指数退避 30m、1h、2h、4h…（上限 24h）；到 DOWNLOAD_RETRY_MAX_ATTEMPTS 后
+   * 不再自动排期，只能由用户手动重试（手动重试会把计数清零）。
+   */
   private async markLocatorError(locatorId: string | null, message: string): Promise<void> {
     if (!locatorId) return;
+    const locator = await this.prisma.resourceLocator.findUnique({
+      where: { id: locatorId },
+      select: { downloadAttempts: true },
+    });
+    if (!locator) return;
+    const attempts = locator.downloadAttempts + 1;
+    const delay =
+      attempts >= DOWNLOAD_RETRY_MAX_ATTEMPTS
+        ? null
+        : Math.min(DOWNLOAD_RETRY_MAX_DELAY_MS, DOWNLOAD_RETRY_BASE_MS * 2 ** (attempts - 1));
     await this.prisma.resourceLocator.update({
       where: { id: locatorId },
-      data: { lastError: message, lastCheckedAt: new Date(), httpStatus: 0 },
+      data: {
+        lastError: message,
+        lastCheckedAt: new Date(),
+        httpStatus: 0,
+        downloadAttempts: attempts,
+        nextDownloadAttemptAt: delay === null ? null : new Date(Date.now() + delay),
+      },
     });
   }
 

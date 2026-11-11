@@ -55,6 +55,16 @@ export class IngestionController {
     return this.ingestionService.clearJobs();
   }
 
+  /** 批量重试下载失败的远程资源（可选限定来源） */
+  @Post('ingestion/retry-failed-downloads')
+  retryFailedDownloads(@Query('sourceId') sourceId?: string, @Query('limit') limit?: string) {
+    const parsedLimit = limit === undefined ? undefined : Number(limit);
+    return this.ingestionService.retryFailedDownloads({
+      sourceId: sourceId || undefined,
+      limit: Number.isFinite(parsedLimit) ? parsedLimit : undefined,
+    });
+  }
+
   /** 手动触发资源所有定位器的健康检查 */
   @Post('resources/:id/locators/check')
   checkResourceLocators(@Param('id') id: string) {

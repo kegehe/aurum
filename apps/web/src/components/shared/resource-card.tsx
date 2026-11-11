@@ -58,6 +58,7 @@ function ResourceCardComponent({
   const [thumbError, setThumbError] = useState(false);
   const isLink = isLinkResource(resource);
   const isRemote = isRemoteResource(resource);
+  const remoteStatus = isRemote ? (resource.downloadError ? '下载失败' : '待下载') : null;
   // 详情页链接：在资源库上下文内导航时携带当前筛选/排序查询串，供详情页左右箭头定位相邻资源
   const detailHref = `/resources/${resource.id}${contextQuery ? `?${contextQuery}` : ''}`;
 
@@ -177,15 +178,20 @@ function ResourceCardComponent({
         <div className="flex items-center gap-2">
           <ResourceTypeBadge type={resource.resourceType} />
           {isLink && <span className="text-xs text-muted-foreground">链接</span>}
-          {isRemote && <span className="text-xs text-muted-foreground">远程资源</span>}
+          {isRemote && (
+            <span
+              className={`text-xs ${resource.downloadError ? 'text-destructive' : 'text-muted-foreground'}`}
+              title={resource.downloadError ?? undefined}
+            >
+              {remoteStatus}
+            </span>
+          )}
           {resource.processingStatus === 'failed' && (
             <span className="text-xs text-destructive">{PROCESSING_STATUS_LABELS.failed}</span>
           )}
         </div>
         <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <span>
-            {isLink ? '链接' : isRemote ? '远程资源' : formatByteString(resource.sizeBytes)}
-          </span>
+          <span>{isLink ? '链接' : isRemote ? '—' : formatByteString(resource.sizeBytes)}</span>
           <span>{formatDate(resource.createdAt)}</span>
         </div>
       </CardContent>

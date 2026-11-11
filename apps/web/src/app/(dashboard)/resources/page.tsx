@@ -935,8 +935,20 @@ export default function ResourcesPage() {
       header: '大小',
       className: 'w-24 text-right',
       render: (r) => (
-        <span className="text-muted-foreground">
-          {r.acquisitionMode === 'link_only' ? '链接' : r.acquisitionMode === 'metadata_only' ? '远程资源' : formatByteString(r.sizeBytes)}
+        <span
+          className={r.downloadError ? 'text-destructive' : 'text-muted-foreground'}
+          title={
+            r.downloadError ??
+            (r.acquisitionMode === 'metadata_only' ? '尚未下载到本地' : undefined)
+          }
+        >
+          {r.acquisitionMode === 'link_only'
+            ? '链接'
+            : r.acquisitionMode === 'metadata_only'
+              ? r.downloadError
+                ? '下载失败'
+                : '待下载'
+              : formatByteString(r.sizeBytes)}
         </span>
       ),
     },

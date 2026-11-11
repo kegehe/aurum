@@ -19,6 +19,10 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
   private healthCheckBatchSize = 10;
   private autoSyncCheckIntervalMs = 60_000; // 每分钟检查一次自动同步到期
   private autoSyncBatchSize = 10;
+  private retrySweepTimer: NodeJS.Timeout | null = null;
+  private retrySweeping = false;
+  private retrySweepIntervalMs = 60_000; // 每分钟补漏一轮失败下载
+  private retrySweepBatchSize = 20;
 
   constructor(
     private readonly ingestionService: IngestionService,
@@ -43,6 +47,10 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
       this.config.get<number>('ingestion.autoSyncCheckIntervalMs') ?? this.autoSyncCheckIntervalMs;
     this.autoSyncBatchSize =
       this.config.get<number>('ingestion.autoSyncBatchSize') ?? this.autoSyncBatchSize;
+    this.retrySweepIntervalMs =
+      this.config.get<number>('ingestion.retrySweepIntervalMs') ?? this.retrySweepIntervalMs;
+    this.retrySweepBatchSize =
+      this.config.get<number>('ingestion.retrySweepBatchSize') ?? this.retrySweepBatchSize;
     await this.recoverStaleJobs();
     this.pollTimer = setInterval(() => void this.poll(), interval);
     this.recoveryTimer = setInterval(
@@ -54,10 +62,15 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
       this.healthCheckIntervalMs,
     );
     this.autoSyncTimer = setInterval(() => void this.runAutoSyncs(), this.autoSyncCheckIntervalMs);
+    this.retrySweepTimer = setInterval(
+      () => void this.sweepFailedDownloads(),
+      this.retrySweepIntervalMs,
+    );
     void this.poll();
-    // 首次启动时也调度一轮健康检查和自动同步
+    // 首次启动时也调度一轮健康检查、自动同步和失败下载补漏
     void this.scheduleHealthChecks();
     void this.runAutoSyncs();
+    void this.sweepFailedDownloads();
   }
 
   onModuleDestroy() {
@@ -65,6 +78,7 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
     if (this.recoveryTimer) clearInterval(this.recoveryTimer);
     if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
     if (this.autoSyncTimer) clearInterval(this.autoSyncTimer);
+    if (this.retrySweepTimer) clearInterval(this.retrySweepTimer);
   }
 
   private async poll() {
@@ -105,6 +119,23 @@ export class IngestionScheduler implements OnModuleInit, OnModuleDestroy {
       this.logger.error(error instanceof Error ? error.message : String(error));
     } finally {
       this.healthChecking = false;
+    }
+  }
+
+  private async sweepFailedDownloads() {
+    if (this.retrySweeping) return;
+    this.retrySweeping = true;
+    try {
+      const queued = await this.ingestionService.scheduleFailedDownloadRetries(
+        this.retrySweepBatchSize,
+      );
+      if (queued > 0) {
+        this.logger.log(`Queued ${queued} failed download retry job(s)`);
+      }
+    } catch (error) {
+      this.logger.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      this.retrySweeping = false;
     }
   }
 

@@ -48,6 +48,9 @@ export default () => ({
       10,
     ),
     autoSyncBatchSize: parseInt(process.env.INGESTION_AUTO_SYNC_BATCH_SIZE || '10', 10),
+    // 失败下载的补漏扫描间隔与每轮批量
+    retrySweepIntervalMs: parseInt(process.env.INGESTION_RETRY_SWEEP_INTERVAL_MS || '60000', 10),
+    retrySweepBatchSize: parseInt(process.env.INGESTION_RETRY_SWEEP_BATCH_SIZE || '20', 10),
   },
   thumbnail: {
     maxWidth: parseInt(process.env.THUMBNAIL_MAX_WIDTH || '400', 10),
@@ -55,6 +58,12 @@ export default () => ({
   },
   download: {
     maxFileSizeMB: parseInt(process.env.MAX_DOWNLOAD_FILE_SIZE_MB || '100', 10),
+  },
+  safeUrl: {
+    // 出站解析优先 DoH，避开本地 DNS 污染；auto 表示仅在配置代理时启用
+    dnsMode: (process.env.SAFE_URL_DNS_MODE || 'auto').trim().toLowerCase(),
+    dohUrl: process.env.SAFE_URL_DOH_URL || 'https://cloudflare-dns.com/dns-query',
+    dohTimeoutMs: parseInt(process.env.SAFE_URL_DOH_TIMEOUT_MS || '3000', 10),
   },
   ai: {
     // 环境变量回退配置：数据库未配置生效项时使用。

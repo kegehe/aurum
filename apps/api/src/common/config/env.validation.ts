@@ -25,6 +25,8 @@ export const envValidationSchema = Joi.object({
   INGESTION_HEALTH_CHECK_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
   INGESTION_AUTO_SYNC_CHECK_INTERVAL_MS: Joi.number().integer().min(1000).default(60000),
   INGESTION_AUTO_SYNC_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
+  INGESTION_RETRY_SWEEP_INTERVAL_MS: Joi.number().integer().min(60000).default(60000),
+  INGESTION_RETRY_SWEEP_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(20),
   THUMBNAIL_MAX_WIDTH: Joi.number().integer().min(1).default(400),
   THUMBNAIL_MAX_HEIGHT: Joi.number().integer().min(1).default(400),
   // 外部同步单文件下载上限（MB）。防止拉取超大数据。
@@ -40,6 +42,13 @@ export const envValidationSchema = Joi.object({
     .allow('')
     .optional(),
   NO_PROXY: Joi.string().allow('').optional(),
+  // 出站 DNS 解析模式：auto=配了代理时用 DoH（默认），doh=总是优先 DoH，system=只用系统 DNS。
+  // DoH 用于避开本地 DNS 污染导致的 SSRF 误判/连接失败；不可用时自动回退系统 DNS。
+  SAFE_URL_DNS_MODE: Joi.string().valid('auto', 'doh', 'system').default('auto'),
+  SAFE_URL_DOH_URL: Joi.string()
+    .uri({ scheme: ['https'] })
+    .default('https://cloudflare-dns.com/dns-query'),
+  SAFE_URL_DOH_TIMEOUT_MS: Joi.number().integer().min(500).max(10000).default(3000),
   // AI 样式分析（可选：未配置 ANTHROPIC_API_KEY 时样式实验室功能禁用，
   // 也可在「设置 → AI 配置」页面运行时配置，无需改 .env）
   ANTHROPIC_API_KEY: Joi.string().allow('').optional(),

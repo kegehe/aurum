@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
-import { FolderOpen, Plus, Power, PowerOff, RefreshCw, Square } from 'lucide-react';
+import { FolderOpen, Plus, Power, PowerOff, RefreshCw, RotateCcw, Square } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
 import { DataTable, type Column } from '@/components/shared/data-table';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -35,6 +35,7 @@ import {
   listIngestionJobs,
   listSourceDownloadDirectories,
 } from '@/lib/api/sources';
+import { retryFailedDownloads } from '@/lib/api/ingestion';
 import { SOURCE_TYPE_LABELS } from '@/lib/constants';
 import { IngestionJobStatus, IngestionJobType } from '@aurum/shared-types';
 import type { SourceItem, IngestionJobItem } from '@/lib/types';
@@ -126,6 +127,7 @@ export default function SourcesPage() {
   // 同步状态
   const [activeSyncJobs, setActiveSyncJobs] = useState<Record<string, IngestionJobItem>>({});
   const [stoppingSyncSourceIds, setStoppingSyncSourceIds] = useState<string[]>([]);
+  const [retryingFailedSourceIds, setRetryingFailedSourceIds] = useState<string[]>([]);
   // 组件卸载后停止同步轮询（避免在其它页面弹出 toast / 更新已卸载组件）
   const syncPollCancelledRef = useRef(false);
   useEffect(() => {
@@ -609,6 +611,33 @@ export default function SourcesPage() {
     }
   };
 
+  /** 批量重排该来源下载失败的远程资源（不受自动补漏次数上限限制） */
+  const handleRetryFailedDownloads = async (source: SourceItem) => {
+    setRetryingFailedSourceIds((ids) => [...ids, source.id]);
+    try {
+      const { queued, skipped } = await retryFailedDownloads({
+        sourceId: source.id,
+        limit: 200,
+      });
+      if (queued > 0) {
+        toast.success(
+          `已为来源 "${source.name}" 排队 ${queued} 个失败下载${skipped > 0 ? `，跳过 ${skipped} 个` : ''}`,
+          { description: '任务会按来源限速逐个重试，可在资源库查看下载状态' },
+        );
+      } else {
+        toast.info(
+          skipped > 0
+            ? `来源 "${source.name}" 有 ${skipped} 个失败下载无法重试（来源已禁用或不允许镜像下载）`
+            : `来源 "${source.name}" 没有下载失败的资源`,
+        );
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '重试失败下载失败');
+    } finally {
+      setRetryingFailedSourceIds((ids) => ids.filter((id) => id !== source.id));
+    }
+  };
+
   const handleDelete = async () => {
     if (!deleteTarget) return;
     try {
@@ -821,6 +850,17 @@ export default function SourcesPage() {
           >
             {s.enabled ? <PowerOff className="h-3.5 w-3.5" /> : <Power className="h-3.5 w-3.5" />}
           </Button>
+          {SYNC_SOURCE_TYPES.has(s.sourceType) && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => handleRetryFailedDownloads(s)}
+              disabled={retryingFailedSourceIds.includes(s.id)}
+              title="重试下载失败的远程资源（最多 200 条）"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+            </Button>
+          )}
           <Button variant="ghost" size="sm" onClick={() => openEdit(s)}>
             编辑
           </Button>

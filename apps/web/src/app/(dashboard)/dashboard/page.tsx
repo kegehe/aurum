@@ -194,11 +194,18 @@ export default function DashboardPage() {
                           {r.title || r.originalFilename}
                         </p>
                         <p className="text-xs text-muted-foreground">
-                          {r.acquisitionMode === 'link_only'
-                            ? '链接'
-                            : r.acquisitionMode === 'metadata_only'
-                              ? '远程资源'
-                              : formatByteString(r.sizeBytes)}{' '}
+                          {r.acquisitionMode === 'link_only' ? (
+                            '链接'
+                          ) : r.acquisitionMode === 'metadata_only' ? (
+                            <span
+                              className={r.downloadError ? 'text-destructive' : undefined}
+                              title={r.downloadError ?? '尚未下载到本地'}
+                            >
+                              {r.downloadError ? '下载失败' : '待下载'}
+                            </span>
+                          ) : (
+                            formatByteString(r.sizeBytes)
+                          )}{' '}
                           · {formatDateTime(r.createdAt)}
                         </p>
                       </div>

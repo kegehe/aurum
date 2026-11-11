@@ -141,6 +141,10 @@ model ResourceLocator {
   lastModified  DateTime?
   lastCheckedAt DateTime?
   lastError     String?
+  /// 下载失败次数（成功下载后清零）；后台补漏任务据此做退避与上限
+  downloadAttempts      Int       @default(0)
+  /// 下次允许重试下载的时间；null 表示下一次补漏即可尝试
+  nextDownloadAttemptAt DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -150,6 +154,7 @@ model ResourceLocator {
   @@unique([sourceId, externalId])
   @@index([resourceId])
   @@index([sourceId])
+  @@index([nextDownloadAttemptAt])
   @@map("resource_locators")
 }
 

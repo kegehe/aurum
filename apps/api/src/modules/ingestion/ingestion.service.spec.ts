@@ -94,6 +94,7 @@ function makeSyncPrisma() {
   return {
     resourceLocator: {
       findFirst: vi.fn().mockResolvedValue(null),
+      findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
       update: vi.fn().mockResolvedValue({}),
     },
     resource: {
@@ -505,7 +506,12 @@ describe('IngestionService sync_source', () => {
   });
 
   it('rejects media content that only pretends to be an image through its response header', async () => {
-    const prisma = { resourceLocator: { update: vi.fn().mockResolvedValue({}) } };
+    const prisma = {
+      resourceLocator: {
+        findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
     const storage = { generateKey: vi.fn(), put: storagePutSpy() };
     const service = createService({ prisma, storage });
     const internalService = service as unknown as {
@@ -1911,5 +1917,235 @@ describe('IngestionService page snapshots', () => {
 
     expect(mocks.storage.put).not.toHaveBeenCalled();
     expect(jobRepo.fail).toHaveBeenCalled();
+  });
+});
+
+describe('IngestionService download retries', () => {
+  beforeEach(() => {
+    vi.spyOn(SafeUrlService.prototype, 'resolvePublicHost').mockResolvedValue([
+      { address: '93.184.216.34', family: 4 },
+    ]);
+  });
+
+  it('retries a transient failure inline and commits the successful attempt', async () => {
+    const tx = {
+      resource: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      resourceFile: { create: vi.fn().mockResolvedValue({}) },
+      resourceLocator: { update: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
+      resourceLocator: {
+        findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const download = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockResolvedValueOnce({
+        sha256: 'a'.repeat(64),
+        mimeType: 'image/jpeg',
+        extension: 'jpg',
+        resourceType: 'image',
+        sizeBytes: 10,
+        storageKey: 'originals/ab/a.jpg',
+      });
+    const scheduler = { enqueue: vi.fn().mockResolvedValue(undefined) };
+    const service = createService({ prisma, directDownload: { download }, scheduler });
+
+    vi.useFakeTimers();
+    try {
+      const promise = (
+        service as unknown as {
+          downloadRemoteFile: (
+            resourceId: string,
+            locatorId: string,
+            remote: object,
+          ) => Promise<string>;
+        }
+      ).downloadRemoteFile('resource-1', 'locator-1', {
+        externalId: 'remote-1',
+        url: 'https://example.com/a.jpg',
+        resourceType: 'image',
+        mimeType: 'image/jpeg',
+      });
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('downloaded');
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(tx.resourceLocator.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ downloadAttempts: 0, nextDownloadAttemptAt: null }),
+      }),
+    );
+    expect(scheduler.enqueue).toHaveBeenCalled();
+  });
+
+  it('stops after the inline retries and schedules a backoff retry', async () => {
+    const prisma = {
+      resourceLocator: {
+        findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const download = vi.fn().mockRejectedValue(new Error('socket hang up'));
+    const service = createService({ prisma, directDownload: { download } });
+
+    vi.useFakeTimers();
+    try {
+      const promise = (
+        service as unknown as {
+          downloadRemoteFile: (
+            resourceId: string,
+            locatorId: string,
+            remote: object,
+          ) => Promise<string>;
+        }
+      ).downloadRemoteFile('resource-1', 'locator-1', {
+        externalId: 'remote-1',
+        url: 'https://example.com/a.jpg',
+        resourceType: 'image',
+        mimeType: 'image/jpeg',
+      });
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('failed');
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(download).toHaveBeenCalledTimes(3);
+    expect(prisma.resourceLocator.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          downloadAttempts: 1,
+          nextDownloadAttemptAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
+  it('does not retry a non-transient failure', async () => {
+    const prisma = {
+      resourceLocator: {
+        findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const download = vi.fn().mockRejectedValue(new Error('HTTP 403'));
+    const service = createService({ prisma, directDownload: { download } });
+
+    await expect(
+      (
+        service as unknown as {
+          downloadRemoteFile: (
+            resourceId: string,
+            locatorId: string,
+            remote: object,
+          ) => Promise<string>;
+        }
+      ).downloadRemoteFile('resource-1', 'locator-1', {
+        externalId: 'remote-1',
+        url: 'https://example.com/a.jpg',
+        resourceType: 'image',
+        mimeType: 'image/jpeg',
+      }),
+    ).resolves.toBe('failed');
+
+    expect(download).toHaveBeenCalledOnce();
+    expect(prisma.resourceLocator.update).toHaveBeenCalledOnce();
+  });
+
+  it('stops scheduling automatic retries once the attempt cap is reached', async () => {
+    const prisma = {
+      resourceLocator: {
+        findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 4 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const service = createService({ prisma });
+
+    await (
+      service as unknown as { markLocatorError: (id: string, msg: string) => Promise<void> }
+    ).markLocatorError('locator-1', 'still failing');
+
+    expect(prisma.resourceLocator.update).toHaveBeenCalledWith({
+      where: { id: 'locator-1' },
+      data: expect.objectContaining({ downloadAttempts: 5, nextDownloadAttemptAt: null }),
+    });
+  });
+
+  it('queues due failed downloads for background retry', async () => {
+    const prisma = {
+      resource: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: 'resource-1', sourceId: null },
+          { id: 'resource-2', sourceId: null },
+        ]),
+      },
+    };
+    const jobRepo = {
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: 'retry-job' }),
+    };
+    const service = createService({ prisma, jobRepo });
+
+    await expect(
+      (
+        service as unknown as { scheduleFailedDownloadRetries: (n: number) => Promise<number> }
+      ).scheduleFailedDownloadRetries(2),
+    ).resolves.toBe(2);
+    expect(prisma.resource.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 2, orderBy: { createdAt: 'asc' } }),
+    );
+    expect(jobRepo.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips sources that do not permit mirror downloads during a bulk retry', async () => {
+    const prisma = {
+      resource: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: 'resource-1', sourceId: 'enabled-source' },
+          { id: 'resource-2', sourceId: 'disabled-source' },
+        ]),
+      },
+    };
+    const sourceRepo = {
+      findById: vi.fn().mockImplementation(async (id: string) =>
+        id === 'enabled-source'
+          ? {
+              id,
+              enabled: true,
+              allowedModes: 'metadata_only,mirror_file',
+              requiresReview: false,
+            }
+          : {
+              id,
+              enabled: false,
+              allowedModes: 'metadata_only',
+              requiresReview: false,
+            },
+      ),
+    };
+    const jobRepo = {
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: 'retry-job' }),
+    };
+    const service = createService({ prisma, sourceRepo, jobRepo });
+
+    await expect(
+      (
+        service as unknown as {
+          retryFailedDownloads: (params: object) => Promise<{ queued: number; skipped: number }>;
+        }
+      ).retryFailedDownloads({ limit: 10 }),
+    ).resolves.toEqual({ queued: 1, skipped: 1 });
+    expect(jobRepo.create).toHaveBeenCalledOnce();
   });
 });

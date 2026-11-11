@@ -699,6 +699,7 @@ export default function ResourceDetailPage() {
 
   const primaryLocator = resource?.locators?.find((locator) => locator.isPrimary);
   const previewLocator = resource?.locators?.find((locator) => locator.locatorType === 'preview');
+  const downloadLocator = resource?.locators?.find((locator) => locator.locatorType === 'download');
   const isExternalResource =
     !!resource?.acquisitionMode && resource.acquisitionMode !== 'local_upload';
   // 是否有本地原文件（下载镜像、本地上传）。有本地文件的资源优先展示本地预览/下载按钮。
@@ -974,10 +975,26 @@ export default function ResourceDetailPage() {
                   <span>链接</span>
                 </div>
               ) : resource.acquisitionMode === 'metadata_only' ? (
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">获取方式</span>
-                  <span>远程元数据</span>
-                </div>
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">获取方式</span>
+                    <span>远程元数据</span>
+                  </div>
+                  {downloadLocator?.lastError && (
+                    <div className="flex justify-between gap-3">
+                      <span className="shrink-0 text-muted-foreground">下载状态</span>
+                      <span
+                        className="text-right text-destructive"
+                        title={downloadLocator.lastError}
+                      >
+                        下载失败
+                        {downloadLocator.downloadAttempts
+                          ? `（已尝试 ${downloadLocator.downloadAttempts} 次）`
+                          : ''}
+                      </span>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">大小</span>

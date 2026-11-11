@@ -42,6 +42,10 @@ export interface ResourceListItem {
   durationSeconds: string | null;
   /** Remote preview image/video URL for resources without a local thumbnail. */
   previewUrl?: string | null;
+  /** 远程资源最近一次下载失败的原因；null 表示没有失败记录 */
+  downloadError?: string | null;
+  /** 该下载地址累计失败次数（成功后归零） */
+  downloadAttempts?: number;
   /** 搜索用全文（仅详情/列表接口提供） */
   searchVector?: string | null;
   createdAt: string;
@@ -85,6 +89,8 @@ export interface ResourceLocator {
   contentLength: string | null;
   lastCheckedAt: string | null;
   lastError: string | null;
+  downloadAttempts?: number;
+  nextDownloadAttemptAt?: string | null;
 }
 
 export interface ResourceProvenance {

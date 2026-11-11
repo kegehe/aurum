@@ -198,16 +198,23 @@ export class ResourceService {
     ]);
 
     // BigInt 无法 JSON 序列化，转成字符串
-    const serializedItems = items.map(({ locators, ...item }) => ({
-      ...item,
-      sizeBytes: item.sizeBytes.toString(),
-      // External images have no generated local thumbnail. Prefer the source's
-      // preview URL and fall back to its direct download URL for recognition.
-      previewUrl:
-        locators.find((locator) => locator.locatorType === 'preview')?.url ??
-        locators.find((locator) => locator.locatorType === 'download')?.url ??
-        null,
-    }));
+    const serializedItems = items.map(({ locators, ...item }) => {
+      const downloadLocator = locators.find((locator) => locator.locatorType === 'download');
+      return {
+        ...item,
+        sizeBytes: item.sizeBytes.toString(),
+        // External images have no generated local thumbnail. Prefer the source's
+        // preview URL and fall back to its direct download URL for recognition.
+        previewUrl:
+          locators.find((locator) => locator.locatorType === 'preview')?.url ??
+          downloadLocator?.url ??
+          null,
+        // 远程资源下载失败时列表要能直接看出原因，而不是只显示“远程资源”
+        downloadError:
+          item.acquisitionMode === 'metadata_only' ? (downloadLocator?.lastError ?? null) : null,
+        downloadAttempts: downloadLocator?.downloadAttempts ?? 0,
+      };
+    });
 
     return {
       items: serializedItems,

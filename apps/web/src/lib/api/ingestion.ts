@@ -43,3 +43,15 @@ export function deleteIngestionJob(id: string): Promise<{ id: string; deleted: b
 export function clearIngestionJobs(): Promise<{ deleted: number }> {
   return del('/ingestion/jobs');
 }
+
+/** 批量重试下载失败的远程资源（可按来源限定，limit 上限 200） */
+export function retryFailedDownloads(params?: {
+  sourceId?: string;
+  limit?: number;
+}): Promise<{ queued: number; skipped: number }> {
+  const qs = new URLSearchParams();
+  if (params?.sourceId) qs.set('sourceId', params.sourceId);
+  if (params?.limit) qs.set('limit', String(params.limit));
+  const query = qs.toString();
+  return post(`/ingestion/retry-failed-downloads${query ? `?${query}` : ''}`);
+}

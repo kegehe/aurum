@@ -47,6 +47,8 @@ pnpm test
   - 派生文件下载端点的角色白名单与 attachment + nosniff 分发（含 /preview 对 HTML/XML 的内联降级防护）。
   - LinkMetadata 提取、LocatorHealthChecker 健康探测调度。
   - 直连下载连接器（重定向逐跳公网校验、file:// 等协议拦截、声明长度与实际字节两级限量、魔数 MIME 与回退、HTML 响应拒绝、下载目录前缀、检查点回调与取消传播、失败清理）。
+  - 出站 DNS 解析（DoH）：代理环境默认走 DoH、A+AAAA 并行、TTL 缓存、失败冷却回退系统 DNS；SSRF 校验以 DoH 结果为准。
+  - 下载失败重试：同步内瞬时错误重试（1s/3s）、失败后按 30m→24h 指数退避排期（最多 5 次）、后台补漏只处理启用且无需审核的来源、手动批量重试接口、成功提交时清零计数。
   - 导入任务仓储与 IngestionScheduler。
 - 样式实验室：
   - 样式分析服务、Claude Vision 客户端（mock）、本地降级分析、CSS Tokens 导出。

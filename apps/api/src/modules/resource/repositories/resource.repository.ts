@@ -106,7 +106,13 @@ export class ResourceRepository {
         locators: {
           where: { locatorType: { in: ['preview', 'download'] } },
           orderBy: [{ locatorType: 'asc' }, { isPrimary: 'desc' }],
-          select: { locatorType: true, url: true },
+          select: {
+            locatorType: true,
+            url: true,
+            lastError: true,
+            downloadAttempts: true,
+            nextDownloadAttemptAt: true,
+          },
         },
       },
     });

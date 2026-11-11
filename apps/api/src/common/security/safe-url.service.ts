@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { lookup } from 'node:dns/promises';
 import * as ipaddr from 'ipaddr.js';
 import { Agent, Dispatcher, ProxyAgent, fetch } from 'undici';
+import { DohResolver } from './doh-resolver';
 
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
 const MAX_REDIRECTS = 5;
@@ -21,6 +21,23 @@ export interface SafeFetchOptions {
 /** Validates outbound URLs and pins each connection to a public DNS result. */
 @Injectable()
 export class SafeUrlService {
+  private readonly hostResolver: DohResolver;
+
+  constructor() {
+    const configuredDohUrl = process.env.SAFE_URL_DOH_URL;
+    let dohHostname: string | undefined;
+    try {
+      dohHostname = new URL(configuredDohUrl ?? 'https://cloudflare-dns.com/dns-query').hostname;
+    } catch {
+      // 配置损坏时回退到 DohResolver 内置默认地址
+    }
+    // DoH 查询走的代理与实际下载保持一致，保证校验结果与连接目标不分裂
+    this.hostResolver = new DohResolver({
+      dohUrl: dohHostname ? configuredDohUrl : undefined,
+      proxyUrl: this.resolveProxyUrl(dohHostname),
+    });
+  }
+
   normalize(rawUrl: string): URL {
     let url: URL;
     try {
@@ -176,19 +193,16 @@ export class SafeUrlService {
   /**
    * 解析主机并校验其解析结果均为公网地址（SSRF 防护）。
    * 返回全部公网地址（IPv4 优先），供连接层选择。
-   * 走代理时连接由代理发出，此校验仍作为客户端侧防御，防止请求指向内网地址。
+   *
+   * 解析优先走 DoH（配置代理时默认启用），避免本地 DNS 污染把公网域名
+   * 解析成保留地址/假地址；DoH 不可用时自动回退系统 DNS。
    */
   async resolvePublicHost(hostname: string): Promise<Array<{ address: string; family: 4 | 6 }>> {
-    const addresses = await lookup(hostname, { all: true, verbatim: true });
+    const addresses = await this.hostResolver.resolve(hostname);
     if (addresses.length === 0 || addresses.some(({ address }) => !this.isPublicAddress(address))) {
       throw new BadRequestException('URL resolves to a blocked network address');
     }
-    return (
-      addresses
-        .map((a) => ({ address: a.address, family: a.family as 4 | 6 }))
-        // IPv4 优先：多数环境 IPv6 连通性不可靠，避免首选 IPv6 时连接超时
-        .sort((a, b) => (a.family === 4 ? -1 : b.family === 4 ? 1 : 0))
-    );
+    return addresses.map((a) => ({ address: a.address, family: a.family }));
   }
 
   /**
