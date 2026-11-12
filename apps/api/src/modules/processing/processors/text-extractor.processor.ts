@@ -1,6 +1,7 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as fs from 'node:fs/promises';
-import pdfParse from 'pdf-parse';
+import pdfParse from 'pdf-parse/lib/pdf-parse';
 import { IJobProcessor } from '../interfaces/job-processor.interface';
 import { streamStorageToTemp, readTextCapped } from '../temp-file.util';
 import { ResourceRepository } from '../../resource/repositories/resource.repository';
@@ -24,9 +25,17 @@ const MAX_TEXT_BYTES = MAX_TEXT * 4;
 const MAX_SEARCH_VECTOR = 10_000;
 
 /**
+ * PDF 文本提取的内存上限（MB）默认值，可由 MAX_PDF_PARSE_SIZE_MB 覆盖。
+ *
+ * pdf-parse 只接受完整 Buffer，解析期间文件需整份常驻内存；上限 100MB 实测单任务
+ * 峰值约 150MB，非 ASCII 长文本（UTF-16 双字节）会更高，按并发数叠加后仍可承受。
+ */
+const DEFAULT_MAX_PDF_PARSE_MB = 100;
+
+/**
  * 文本提取处理器
  *
- * - PDF：使用 pdf-parse 提取文本
+ * - PDF：使用 pdf-parse 提取文本，超过内存上限的 PDF 跳过（只记录警告）
  * - 纯文本文件：直接读取 UTF-8 内容
  * - Office 文档（docx/pptx/xlsx）：第一版不提取，只记录文件元数据
  *
@@ -42,6 +51,7 @@ export class TextExtractor implements IJobProcessor {
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
     private readonly resourceRepo: ResourceRepository,
     private readonly fileRepo: ResourceFileRepository,
+    private readonly config: ConfigService,
   ) {}
 
   async process(resourceId: string, _jobId: string): Promise<void> {
@@ -58,9 +68,21 @@ export class TextExtractor implements IJobProcessor {
     let extractedText = '';
 
     if (resource.mimeType === 'application/pdf') {
-      // PDF：pdf-parse 需要完整 Buffer，先流式落盘再从临时文件读取
+      const limitBytes = this.maxPdfParseBytes();
+      // 先用已记录的体积预判：超限的 PDF 连临时文件都不用写，1GB 级文件落盘纯属浪费磁盘
+      if (originalFile.sizeBytes > BigInt(limitBytes)) {
+        this.warnSkipPdf(resourceId, originalFile.sizeBytes, limitBytes);
+        return;
+      }
+      // PDF：pdf-parse 需要完整 Buffer，先流式落盘，再按大小上限决定是否解析
       const tmpPath = await streamStorageToTemp(this.storage, originalFile.storagePath, 'text-in');
       try {
+        const { size } = await fs.stat(tmpPath);
+        if (size > limitBytes) {
+          // 记录值与实际文件可能不一致（历史数据、外部直接换文件），落盘后再按真实大小复核
+          this.warnSkipPdf(resourceId, size, limitBytes);
+          return;
+        }
         const buf = await fs.readFile(tmpPath);
         extractedText = await this.extractPdf(buf);
       } finally {
@@ -114,11 +136,32 @@ export class TextExtractor implements IJobProcessor {
   }
 
   /**
+   * 跳过超大 PDF 的日志：pdf-parse 解析时整份文件常驻内存，超限只能放弃。
+   * 这类文件多为扫描件，本就没有文本层，提取意义有限。
+   */
+  private warnSkipPdf(resourceId: string, sizeBytes: number | bigint, limitBytes: number): void {
+    this.logger.warn(
+      `Skip PDF text extraction for resource ${resourceId}: ${sizeBytes} bytes exceeds ${limitBytes} byte limit (MAX_PDF_PARSE_SIZE_MB)`,
+    );
+  }
+
+  /** PDF 解析上限字节数（MAX_PDF_PARSE_SIZE_MB，默认 100MB） */
+  private maxPdfParseBytes(): number {
+    const mb = this.config.get<number>('processing.maxPdfParseMB') ?? DEFAULT_MAX_PDF_PARSE_MB;
+    return mb * 1024 * 1024;
+  }
+
+  /**
    * 使用 pdf-parse 提取 PDF 文本
+   *
+   * 调用方需先用 {@link maxPdfParseBytes} 校验文件大小：该方法会把整份文件读入内存。
    * 解析失败时抛出错误，由调度器决定重试或标记失败
    */
   private async extractPdf(buffer: Buffer): Promise<string> {
-    const data = await pdfParse(buffer);
-    return data.text || '';
+    // pdf.js 1.10 对 Buffer 入参有缺陷：小 PDF（实测 2KB 以下）会解析错位并抛 bad XRef entry，
+    // 传 Uint8Array 视图（同一块内存，零拷贝）时大文件小文件都正常
+    const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const result = await pdfParse(data);
+    return result.text || '';
   }
 }

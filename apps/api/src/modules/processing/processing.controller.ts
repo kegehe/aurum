@@ -30,6 +30,12 @@ export class ProcessingController {
     return this.processingService.retryJob(jobId);
   }
 
+  /** 取消待处理/处理中的任务（卡住任务的恢复入口） */
+  @Post('jobs/:jobId/cancel')
+  cancelJob(@Param('jobId') jobId: string) {
+    return this.processingService.cancelJob(jobId);
+  }
+
   /** 删除指定已结束（terminal）的任务记录 */
   @Delete('jobs/:jobId')
   deleteJob(@Param('jobId') jobId: string) {

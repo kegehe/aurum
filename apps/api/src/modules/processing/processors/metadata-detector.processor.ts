@@ -82,7 +82,7 @@ export class MetadataDetector implements IJobProcessor {
     // 链式创建下游任务（在下游任务创建前，保持 processing 状态）
     await this.chainDownstreamJobs(resource);
 
-    // 只有在没有下游任务时才标记 completed（否则由 checkResourceCompletion 处理）
+    // 只有在没有下游任务时才标记 completed（否则由调度器统一按全部任务重算）
     const allJobs = await this.jobRepo.findByResourceId(resourceId);
     const hasDownstream = allJobs.some(
       (j) =>

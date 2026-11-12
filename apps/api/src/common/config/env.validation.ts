@@ -19,6 +19,10 @@ export const envValidationSchema = Joi.object({
   WORKER_POLL_INTERVAL_MS: Joi.number().integer().min(100).default(5000),
   WORKER_MAX_RETRY: Joi.number().integer().min(0).max(10).default(3),
   WORKER_CONCURRENCY: Joi.number().integer().min(1).max(10).default(2),
+  WORKER_STALE_JOB_TIMEOUT_MS: Joi.number().integer().min(30000).default(300000),
+  // 单次执行上限必须大于心跳超时：配反了会让正常的长任务被当成卡死反复回收重跑。
+  // 跨字段检查放在对象级 custom 里，保证两个字段的 default 都已生效。
+  WORKER_MAX_EXECUTION_MS: Joi.number().integer().min(60000).default(1800000),
   INGESTION_POLL_INTERVAL_MS: Joi.number().integer().min(100).default(3000),
   INGESTION_STALE_JOB_TIMEOUT_MS: Joi.number().integer().min(20000).default(60000),
   INGESTION_HEALTH_CHECK_INTERVAL_MS: Joi.number().integer().min(60000).default(21600000),
@@ -31,6 +35,8 @@ export const envValidationSchema = Joi.object({
   THUMBNAIL_MAX_HEIGHT: Joi.number().integer().min(1).default(400),
   // 外部同步单文件下载上限（MB）。防止拉取超大数据。
   MAX_DOWNLOAD_FILE_SIZE_MB: Joi.number().integer().min(1).max(10240).default(100),
+  // PDF 文本提取上限（MB）。pdf-parse 需要整份文件常驻内存，超过该体积跳过解析。
+  MAX_PDF_PARSE_SIZE_MB: Joi.number().integer().min(1).max(10240).default(100),
   // 出站 HTTP 代理（本机经本地代理访问外网时配置，如 http://127.0.0.1:10808）。
   // 未配置时走直连（带 SSRF DNS-pinning）。
   HTTP_PROXY: Joi.string()
@@ -62,4 +68,13 @@ export const envValidationSchema = Joi.object({
   DESIGN_INTERNAL_API_KEY: Joi.string().min(16).allow('').optional(),
   // GitHub API Token（可选）：github 来源同步使用；未配置时匿名访问（限额 60 次/小时）
   GITHUB_TOKEN: Joi.string().allow('').optional(),
-});
+})
+  .custom((value: { WORKER_STALE_JOB_TIMEOUT_MS: number; WORKER_MAX_EXECUTION_MS: number }, helpers) => {
+    if (value.WORKER_MAX_EXECUTION_MS <= value.WORKER_STALE_JOB_TIMEOUT_MS) {
+      return helpers.error('any.invalid');
+    }
+    return value;
+  })
+  .messages({
+    'any.invalid': 'WORKER_MAX_EXECUTION_MS must be greater than WORKER_STALE_JOB_TIMEOUT_MS',
+  });

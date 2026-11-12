@@ -19,6 +19,35 @@ export class ProcessingJobRepository {
     return client.processingJob.create({ data });
   }
 
+  /**
+   * 入队：仅当同资源同类型没有活跃任务时创建
+   *
+   * 幂等判断和插入放在同一个事务里：SQLite（WAL，写事务串行）下可以完全避免
+   * 两个消费者同时入队时各插入一条 pending（随后被两边各跑一遍）；切到 PostgreSQL
+   * 后 READ COMMITTED 仍可能双插，届时需要补「活跃任务」唯一索引才能彻底兜住。
+   * 返回 null 表示已有活跃任务，调用方应跳过。
+   */
+  async createIfNoActive(jobType: string, resourceId: string): Promise<ProcessingJob | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const active = await tx.processingJob.findFirst({
+        where: {
+          resourceId,
+          jobType,
+          status: { in: [JobStatus.pending, JobStatus.processing] },
+        },
+        select: { id: true },
+      });
+      if (active) return null;
+      return tx.processingJob.create({
+        data: {
+          resource: { connect: { id: resourceId } },
+          jobType,
+          status: JobStatus.pending,
+        },
+      });
+    });
+  }
+
   findByResourceId(resourceId: string): Promise<ProcessingJob[]> {
     return this.prisma.processingJob.findMany({
       where: { resourceId },
@@ -28,6 +57,36 @@ export class ProcessingJobRepository {
 
   findById(id: string): Promise<ProcessingJob | null> {
     return this.prisma.processingJob.findUnique({ where: { id } });
+  }
+
+  /**
+   * 列出卡死的 processing 任务（启动 + 定期回收共用）
+   *
+   * 两个判定条件取并集：
+   * - updatedAt 早于 noHeartbeatBefore：执行中的任务会周期性续租，停止续租即视为进程已死；
+   * - startedAt 早于 startedBefore：兜底处理器 Promise 永久挂起的情况——此时事件循环
+   *   仍在跑、心跳照常刷新，只能靠单次执行时长上限识别。
+   * 按 id 稳定排序，并用「id > afterId」做键集分页：历史任务再多也只取一页。
+   * 不用 Prisma 的 cursor/skip：本页处理会把游标行改出 processing 集合，
+   * 依赖「游标行仍命中过滤条件」的翻页语义不够稳；纯条件比较没有这个前提。
+   */
+  findStaleProcessing(
+    noHeartbeatBefore: Date,
+    startedBefore: Date,
+    options: { take?: number; afterId?: string } = {},
+  ): Promise<ProcessingJob[]> {
+    return this.prisma.processingJob.findMany({
+      where: {
+        status: JobStatus.processing,
+        ...(options.afterId ? { id: { gt: options.afterId } } : {}),
+        OR: [
+          { updatedAt: { lte: noHeartbeatBefore } },
+          { startedAt: { lte: startedBefore } },
+        ],
+      },
+      orderBy: { id: 'asc' },
+      take: options.take,
+    });
   }
 
   /**
@@ -62,6 +121,11 @@ export class ProcessingJobRepository {
         data: {
           status: JobStatus.processing,
           startedAt: new Date(),
+          // 心跳租约从认领这一刻开始：显式续租而不是依赖 @updatedAt 隐式更新。
+          // 否则一个排队超过 staleTimeoutMs 才被认领的任务，认领后仍带着旧的
+          // updatedAt，另一个进程启动扫描时会立刻把它当成卡死任务重置，导致同一
+          // 任务被两个进程同时执行。
+          updatedAt: new Date(),
           finishedAt: null,
         },
       });
@@ -72,30 +136,79 @@ export class ProcessingJobRepository {
     });
   }
 
-  /** 更新任务状态，completed/failed 时自动设 finishedAt */
-  async updateStatus(
-    id: string,
-    status: string,
-    errorMessage?: string | null,
-  ): Promise<ProcessingJob> {
-    const data: Prisma.ProcessingJobUpdateInput = { status };
-    if (status === JobStatus.pending) {
-      data.startedAt = null;
-      data.finishedAt = null;
-      data.errorMessage = errorMessage ?? null;
-    } else if (status === JobStatus.completed || status === JobStatus.failed) {
-      data.finishedAt = new Date();
-      if (errorMessage !== undefined) {
-        data.errorMessage = errorMessage;
-      }
-    }
-    return this.prisma.processingJob.update({ where: { id }, data });
+  /**
+   * 手动重试：仅允许 failed/canceled → pending
+   *
+   * 单条 updateMany 完成状态检查与更新，避免「读到 failed 后任务已被认领/完成」
+   * 的竞态把正在执行的任务强行改回 pending。
+   * 手动重试是用户的明确决定，重置 retryCount 给一次完整的自动重试预算。
+   */
+  async requeueTerminal(id: string): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: {
+        id,
+        status: { in: [JobStatus.failed, JobStatus.canceled] },
+      },
+      data: {
+        status: JobStatus.pending,
+        retryCount: 0,
+        startedAt: null,
+        finishedAt: null,
+        errorMessage: null,
+      },
+    });
+    return result.count === 1;
   }
 
-  /** 增加重试次数并重置为 pending */
-  async incrementRetry(id: string): Promise<ProcessingJob> {
-    return this.prisma.processingJob.update({
-      where: { id },
+  /**
+   * 条件状态流转的 where 条件
+   *
+   * startedAt 是本次认领的「租约」：只更新仍处于 processing 且 startedAt 未变的任务。
+   * 这样任务被取消、或被 stale 回收后重新认领时，旧执行结果不会覆盖新状态。
+   * startedAt 为 null 时显式匹配 null（历史数据），不能退化成「只按 status 匹配」，
+   * 否则会误伤期间被重新认领的任务。
+   */
+  private processingWhere(
+    id: string,
+    startedAt: Date | null,
+  ): Prisma.ProcessingJobWhereInput {
+    return { id, status: JobStatus.processing, startedAt };
+  }
+
+  /** 仅当任务仍是本次认领的 processing 时标记完成，返回是否真的更新 */
+  async completeIfProcessing(id: string, startedAt: Date | null): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: this.processingWhere(id, startedAt),
+      data: {
+        status: JobStatus.completed,
+        finishedAt: new Date(),
+        errorMessage: null,
+      },
+    });
+    return result.count === 1;
+  }
+
+  /** 仅当任务仍是本次认领的 processing 时标记失败，返回是否真的更新 */
+  async failIfProcessing(
+    id: string,
+    errorMessage: string,
+    startedAt: Date | null,
+  ): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: this.processingWhere(id, startedAt),
+      data: {
+        status: JobStatus.failed,
+        finishedAt: new Date(),
+        errorMessage,
+      },
+    });
+    return result.count === 1;
+  }
+
+  /** 增加重试次数并重置为 pending；任务已被取消/重新认领时不再改动，返回是否更新 */
+  async retryIfProcessing(id: string, startedAt: Date | null): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: this.processingWhere(id, startedAt),
       data: {
         retryCount: { increment: 1 },
         status: JobStatus.pending,
@@ -104,6 +217,59 @@ export class ProcessingJobRepository {
         errorMessage: null,
       },
     });
+    return result.count === 1;
+  }
+
+  /**
+   * 正常退出时释放租约：processing → pending，不消耗重试次数
+   *
+   * 进程退出不是任务失败，不能走 retryIfProcessing（那样会吃掉重试预算）。
+   * 仍然用 startedAt 栅栏：期间被取消/重新认领的任务不会被改回去。
+   */
+  async releaseIfProcessing(id: string, startedAt: Date | null): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: this.processingWhere(id, startedAt),
+      data: {
+        status: JobStatus.pending,
+        startedAt: null,
+        finishedAt: null,
+        errorMessage: null,
+      },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * 续租：刷新 updatedAt，向其它进程证明任务仍在执行
+   *
+   * 只有仍处于 processing 且 startedAt 未变（没有丢失租约）时才算续租成功。
+   * 用显式 updatedAt 而不是依赖 @updatedAt 隐式更新，避免空 update 不生效。
+   */
+  async heartbeat(id: string, startedAt: Date | null): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: this.processingWhere(id, startedAt),
+      data: { updatedAt: new Date() },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * 取消活跃任务（pending/processing → canceled）
+   * 终态任务不会被改动，返回 false。
+   */
+  async cancelActive(id: string, errorMessage?: string | null): Promise<boolean> {
+    const result = await this.prisma.processingJob.updateMany({
+      where: {
+        id,
+        status: { in: [JobStatus.pending, JobStatus.processing] },
+      },
+      data: {
+        status: JobStatus.canceled,
+        finishedAt: new Date(),
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
+      },
+    });
+    return result.count === 1;
   }
 
   /** 分页查询任务列表 */

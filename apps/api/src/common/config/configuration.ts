@@ -25,6 +25,10 @@ export default () => ({
     pollIntervalMs: parseInt(process.env.WORKER_POLL_INTERVAL_MS || '5000', 10),
     maxRetry: parseInt(process.env.WORKER_MAX_RETRY || '3', 10),
     concurrency: parseInt(process.env.WORKER_CONCURRENCY || '2', 10),
+    // 处理任务超过该时长没有心跳视为卡死，自动回收（默认 5 分钟）
+    staleTimeoutMs: parseInt(process.env.WORKER_STALE_JOB_TIMEOUT_MS || '300000', 10),
+    // 兜底：处理器 Promise 卡住但事件循环仍能心跳时，超过该执行时长强制回收（默认 30 分钟）
+    maxExecutionMs: parseInt(process.env.WORKER_MAX_EXECUTION_MS || '1800000', 10),
   },
   /**
    * 本进程承担哪部分工作。单进程部署（默认）两者皆 true；
@@ -64,6 +68,11 @@ export default () => ({
     dnsMode: (process.env.SAFE_URL_DNS_MODE || 'auto').trim().toLowerCase(),
     dohUrl: process.env.SAFE_URL_DOH_URL || 'https://cloudflare-dns.com/dns-query',
     dohTimeoutMs: parseInt(process.env.SAFE_URL_DOH_TIMEOUT_MS || '3000', 10),
+  },
+  processing: {
+    // 单个 PDF 文本提取上限（MB）：pdf-parse 需要整份文件常驻内存，
+    // 超过该体积直接跳过解析，避免超大 PDF 撑垮处理进程
+    maxPdfParseMB: parseInt(process.env.MAX_PDF_PARSE_SIZE_MB || '100', 10),
   },
   ai: {
     // 环境变量回退配置：数据库未配置生效项时使用。
