@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Controller,
   Get,
+  HttpCode,
   Post,
   UploadedFile,
   UseInterceptors,
@@ -20,9 +21,20 @@ function getMaxStyleImageSize(): number {
 export class StyleController {
   constructor(private readonly styleService: StyleService) {}
 
-  /** AI 功能可用性（前端据此决定是否启用入口） */
+  /** AI 功能可用性（前端据此决定是否启用入口、以及提示「未配置」还是「临时降级」） */
   @Get('health')
   health() {
+    return this.styleService.availability;
+  }
+
+  /**
+   * 清除 AI 降级缓存（前端「立即重试 AI」）。
+   * 降级窗口内重试不会自动再调 AI，这里给用户一个显式跳过的入口。
+   */
+  @Post('ai-retry')
+  @HttpCode(200)
+  retryAi() {
+    this.styleService.resetAiFailure();
     return this.styleService.availability;
   }
 

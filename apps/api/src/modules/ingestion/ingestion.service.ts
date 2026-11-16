@@ -13,13 +13,16 @@ import {
   LocatorType,
   ProcessingStatus,
   ResourceType,
+  SourceType,
 } from '../../common/constants/enums';
 import { SafeUrlService } from '../../common/security/safe-url.service';
+import { isUrlWithinSourceBase } from '../../common/security/source-url-policy';
 import { IStorageService, STORAGE_SERVICE } from '../storage/interfaces/storage-service.interface';
 import { ResourceFileRepository } from '../file/repositories/resource-file.repository';
 import { JOB_SCHEDULER, IJobScheduler } from '../processing/interfaces/job-scheduler.interface';
 import { PrismaService } from '../prisma/prisma.service';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
+import { ResourceService } from '../resource/resource.service';
 import { SourceRepository } from '../source/repositories/source.repository';
 import { LinkMetadataConnector } from './connectors/link-metadata.connector';
 import { LocatorHealthChecker } from './connectors/locator-health-checker';
@@ -59,6 +62,32 @@ interface DownloadJobControl {
   completeOnCommit?: boolean;
 }
 
+/** 批量镜像时单个资源被跳过的原因，供前端分类提示 */
+export type MirrorSkipReason =
+  'not_found' | 'deleted' | 'already_local' | 'no_source_url' | 'no_source' | 'policy' | 'error';
+
+export interface MirrorSkipDetail {
+  id: string;
+  reason: MirrorSkipReason;
+  message: string;
+}
+
+/**
+ * 单资源预检失败：仍然按 400 返回给单资源接口（行为不变），
+ * 批量接口据此区分「已有本地文件 / 无下载地址 / 已删除」等跳过原因。
+ */
+class MirrorSkipException extends BadRequestException {
+  constructor(
+    readonly skipReason: Extract<
+      MirrorSkipReason,
+      'deleted' | 'already_local' | 'no_source_url' | 'no_source'
+    >,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** 来源同步时并发下载的文件数 */
 const SYNC_DOWNLOAD_CONCURRENCY = 4;
 /** 同步下载并发的上限（防止来源 maxConcurrency 误配导致打爆远程服务） */
@@ -67,6 +96,17 @@ const SYNC_DOWNLOAD_CONCURRENCY_CAP = 20;
 const SYNC_MAX_PAGES_CAP = 50;
 /** 单个远端文件的整体下载超时（DirectDownloadConnector 内部另有读写超时） */
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 180_000;
+/**
+ * 下载任务心跳间隔上限。stale 恢复默认按 60s 判断（INGESTION_STALE_JOB_TIMEOUT_MS），
+ * 下载本身允许 180s，因此必须周期性刷新 startedAt，否则长下载会被中途重置。
+ * 实际间隔会按配置的 stale 超时 / 3 收缩（见 downloadRemoteFile）。
+ */
+const JOB_HEARTBEAT_INTERVAL_MS = 5_000;
+/**
+ * 手动下载任务因限速被延后后，给该来源保留的优先窗口（在槽位时间之上额外留出）。
+ * 同步下载的等待循环会在这段时间内让出槽位，避免手动任务被同步的并发等待者饿死。
+ */
+const MANUAL_DOWNLOAD_PRIORITY_GRACE_MS = 10_000;
 /** 同步内瞬时网络错误的重试间隔（不含首次尝试） */
 const INLINE_DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000];
 /** 下载失败自动补漏的尝试上限（达到后不再自动重试，需手动触发） */
@@ -76,6 +116,17 @@ const DOWNLOAD_RETRY_BASE_MS = 30 * 60_000;
 const DOWNLOAD_RETRY_MAX_DELAY_MS = 24 * 60 * 60_000;
 /** 补漏只处理创建超过该时长的资源，避免与正在进行的同步抢同一条目 */
 const RETRY_SWEEP_MIN_AGE_MS = 10 * 60_000;
+/**
+ * 单次批量镜像最多接受的资源数。
+ * 服务端逐条走策略门禁与入队（每条多次数据库往返），限流避免单个请求
+ * 长时间占用连接；前端会按更小的分片自动提交，正常使用不会触及该上限。
+ */
+export const MAX_BATCH_MIRROR_RESOURCES = 500;
+/**
+ * 远端条目台账中表示「原文件已成功下载过」的状态。
+ * 另一个状态 metadata_only 表示只记录过元数据，不阻止后续下载。
+ */
+const SYNC_LEDGER_DOWNLOADED = 'downloaded';
 /**
  * 页面快照的响应体上限。现代新闻/社区站点的骨架 HTML 常在 0.5–2 MB，
  * 上限太小会让快照对真实页面失效；再大则说明抓到的不是页面本身。
@@ -93,6 +144,23 @@ export class IngestionService {
    * 都可能导致问题。任务已认领（processing + lease），由 touchJob 心跳保活。
    */
   private syncJobRunning = false;
+  /**
+   * 按来源的下载速率槽。自动同步与手动/批量镜像共用同一份预算，
+   * 避免两条链路各自按 rateLimitPerMinute 放行、叠加后超过来源限制。
+   *
+   * 自动同步在下载前阻塞等待槽位；手动下载任务走同一条摄入队列，
+   * 阻塞等待会卡住 import_url / check_locator 等其它任务，因此拿不到槽位时
+   * 把任务释放回 pending 并设置 nextRunAt。
+   */
+  private readonly sourceDownloadSlots = new Map<
+    string,
+    { intervalMs: number; nextAvailableAt: number }
+  >();
+  /**
+   * 手动下载任务被限速延后时，记录该来源的优先截止时间。
+   * 同步等待循环在此期间让出槽位，让调度器重新认领的手动任务先下载。
+   */
+  private readonly manualDownloadPriorityUntil = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -110,6 +178,7 @@ export class IngestionService {
     private readonly fileRepo: ResourceFileRepository,
     @Inject(JOB_SCHEDULER) private readonly scheduler: IJobScheduler,
     private readonly config: ConfigService,
+    private readonly resourceService: ResourceService,
   ) {}
 
   async createLinkImport(dto: CreateLinkImportDto) {
@@ -214,6 +283,41 @@ export class IngestionService {
     return { deleted };
   }
 
+  /**
+   * 清除远端条目台账（同步记录）。
+   *
+   * 台账默认阻止「已下载过的条目」再次下载，即使对应资源已被彻底删除。
+   * 用户想重新下载这些条目时调用本方法：删除后下次同步会重新抓取并下载。
+   * 传 sourceId 只清该来源的记录，并重置该来源的翻页游标（否则翻过的页不会再被抓到）；
+   * 不传则清空全部台账，但不改动任何来源的游标。
+   */
+  async clearSyncHistory(sourceId?: string) {
+    const result = await this.prisma.sourceItemLedger.deleteMany({
+      where: sourceId ? { sourceId } : {},
+    });
+    // 只清台账不够：游标还停在旧位置时，那些条目根本不会再被翻到。
+    // 因此按来源清理时一并清空游标，让下次同步从头翻页（已下载的条目仍被台账跳过）。
+    const cursorReset = sourceId ? await this.resetSourceCursor(sourceId) : false;
+    return { deleted: result.count, cursorReset };
+  }
+
+  /** 清空来源 config 里的翻页游标；返回是否真的改动了配置 */
+  private async resetSourceCursor(sourceId: string): Promise<boolean> {
+    const source = await this.sourceRepo.findById(sourceId).catch(() => null);
+    if (!source?.config) return false;
+    let config: Record<string, unknown>;
+    try {
+      config = JSON.parse(source.config) as Record<string, unknown>;
+    } catch {
+      // 配置损坏时不擅自覆盖，交给用户重新编辑来源
+      return false;
+    }
+    if (!('cursor' in config)) return false;
+    delete config.cursor;
+    await this.sourceRepo.update(sourceId, { config: JSON.stringify(config) });
+    return true;
+  }
+
   async runNextJob(): Promise<boolean> {
     const job = await this.jobRepo.claimNext();
     if (!job) return false;
@@ -241,10 +345,20 @@ export class IngestionService {
           // 释放时加退避（≥2 个轮询周期），避免该任务每次轮询都被重新认领、
           // 把排在它后面的 import_url / check_locator 任务饿死。
           const backoffMs = Math.max(this.pollIntervalMs() * 2, 5000);
-          await this.jobRepo.release(job.id, leaseToken, backoffMs);
-          this.logger.debug(
-            `Sync job ${job.id} deferred for ${backoffMs}ms (another sync is running)`,
-          );
+          try {
+            await this.jobRepo.release(job.id, leaseToken, backoffMs);
+            this.logger.debug(
+              `Sync job ${job.id} deferred for ${backoffMs}ms (another sync is running)`,
+            );
+          } catch (error) {
+            // 释放失败不能把任务标记为终态失败：保持 processing，
+            // 交给 stale 恢复重新排队即可自动重试。
+            this.logger.warn(
+              `Failed to defer sync job ${job.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
           return true;
         }
         this.syncJobRunning = true;
@@ -477,24 +591,89 @@ export class IngestionService {
       include: { locators: true, files: { where: { fileRole: FileRole.original, variant: '' } } },
     });
     if (!resource) throw new NotFoundException(`Resource ${resourceId} not found`);
-    if (resource.deletedAt) throw new BadRequestException('Cannot download a deleted resource');
+    if (resource.deletedAt) {
+      throw new MirrorSkipException('deleted', 'Cannot download a deleted resource');
+    }
     if (resource.files.length) {
-      throw new BadRequestException('Resource already has a local original file');
+      throw new MirrorSkipException('already_local', 'Resource already has a local original file');
     }
     const locator = resource.locators.find((item) => item.locatorType === LocatorType.download);
-    if (!locator) throw new BadRequestException('Resource has no downloadable source URL');
+    if (!locator) {
+      throw new MirrorSkipException('no_source_url', 'Resource has no downloadable source URL');
+    }
+    // 批量接口需要把「没有来源配置」与其它策略拒绝区分开；单资源接口的
+    // 状态码与文案保持不变（assertDownloadAllowed 内部同样会拒绝无来源的情况）。
+    if (!resource.sourceId) {
+      throw new MirrorSkipException('no_source', 'Download requires a source configuration');
+    }
 
     // Clicking "download locally" is the explicit manual review required by
     // metadata-only sources. The source's mirror_file policy is still enforced.
     await this.assertDownloadAllowed(resource.sourceId, AcquisitionMode.mirror_file, true);
-    return this.enqueueDownloadJob(resourceId, resource.sourceId);
+    return this.enqueueDownloadJob(resourceId, resource.sourceId, { resetAttempts: true });
+  }
+
+  /**
+   * 批量把用户选中的远程资源加入本地下载队列。
+   *
+   * 逐条复用单资源入口，来源限速、策略门禁与手动审核语义完全一致；
+   * 单个资源失败不影响其余资源，被跳过的资源会带上原因返回给前端提示。
+   */
+  async mirrorRemoteResources(resourceIds: string[]): Promise<{
+    resourceIds: string[];
+    queued: number;
+    skipped: number;
+    skippedResources: MirrorSkipDetail[];
+  }> {
+    const ids = [...new Set(resourceIds)];
+    if (ids.length > MAX_BATCH_MIRROR_RESOURCES) {
+      throw new BadRequestException(
+        `A single batch can mirror at most ${MAX_BATCH_MIRROR_RESOURCES} resources; split the selection into smaller batches`,
+      );
+    }
+    const skippedResources: MirrorSkipDetail[] = [];
+    let queued = 0;
+    for (const id of ids) {
+      try {
+        await this.mirrorRemoteResource(id);
+        queued += 1;
+      } catch (error) {
+        const detail = this.describeMirrorSkip(id, error);
+        if (detail.reason === 'error') {
+          this.logger.warn(`Failed to queue mirror for ${id}: ${detail.message}`);
+        }
+        skippedResources.push(detail);
+      }
+    }
+    return { resourceIds: ids, queued, skipped: skippedResources.length, skippedResources };
+  }
+
+  private describeMirrorSkip(id: string, error: unknown): MirrorSkipDetail {
+    if (error instanceof MirrorSkipException) {
+      return { id, reason: error.skipReason, message: error.message };
+    }
+    if (error instanceof NotFoundException) {
+      return { id, reason: 'not_found', message: error.message };
+    }
+    if (error instanceof BadRequestException) {
+      return { id, reason: 'policy', message: error.message };
+    }
+    return {
+      id,
+      reason: 'error',
+      message: error instanceof Error ? error.message : String(error),
+    };
   }
 
   /**
    * 后台补漏：重排到期（nextDownloadAttemptAt 已过）的失败下载。
    *
-   * 只处理无需人工审核、来源仍启用的资源；同一资源已有排队任务时
-   * 由幂等键复用，不会重复入队。返回本轮入队数量。
+   * 只处理无需人工审核、来源仍启用且策略允许 mirror_file 的资源；同一资源
+   * 已有排队任务时由幂等键复用，不会重复入队。返回本轮入队数量。
+   *
+   * 允许模式必须在这里过滤：任务执行时的 assertDownloadAllowed 一旦拒绝，
+   * 失败路径不会累加 downloadAttempts/nextDownloadAttemptAt，下一轮补漏会
+   * 再次为同一资源建出注定失败的任务。
    */
   async scheduleFailedDownloadRetries(batchSize = 20): Promise<number> {
     const now = new Date();
@@ -513,7 +692,13 @@ export class IngestionService {
           },
         },
         sourceId: { not: null },
-        sourceRecord: { enabled: true, requiresReview: false },
+        sourceRecord: {
+          enabled: true,
+          requiresReview: false,
+          // allowedModes 是逗号分隔字符串：contains 只做粗筛，值集合里没有
+          // 其他包含 "mirror_file" 的合法模式，因此不会误放行。
+          allowedModes: { contains: AcquisitionMode.mirror_file },
+        },
       },
       select: { id: true, sourceId: true },
       orderBy: { createdAt: 'asc' },
@@ -537,34 +722,82 @@ export class IngestionService {
   /**
    * 手动批量重试失败下载（超过自动补漏上限的资源也包含在内）。
    *
-   * 仍逐条走来源策略门禁：不允许镜像下载的来源记为 skipped，不会建任务。
+   * 候选集必须只含有资格入队的资源：
+   * - 来源策略门槛下沉到查询。被策略跳过的资源不会改变任何状态，若留在候选集里，
+   *   每次调用都会重新取到同一批头部资源，后面的可重试资源永远排不上。
+   * - 已有排队/执行中下载任务的资源不再进入候选集，否则同一批头部资源会反复占满
+   *   limit；它们的数量仍计入 queued（这些资源确实「已在队列里」）。
+   *
+   * 返回值保持原有语义：skipped 是策略不允许、根本无法重试的资源数量，
+   * 前端据此提示「来源已禁用或不允许镜像下载」。它统计所有匹配筛选的资源，
+   * 不受 limit 限制；queued 则包含本轮新入队和此前已在队列中的资源。
+   *
+   * 循环里仍逐条走来源策略门禁（查询与校验之间来源配置可能变化），
+   * 极端情况下的拒绝记为 skipped，不会建任务。
    */
   async retryFailedDownloads(params: { sourceId?: string; limit?: number } = {}): Promise<{
     queued: number;
     skipped: number;
   }> {
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
-    const candidates = await this.prisma.resource.findMany({
-      where: {
-        acquisitionMode: AcquisitionMode.metadata_only,
-        deletedAt: null,
-        files: { none: { fileRole: FileRole.original, variant: '' } },
-        locators: {
-          some: { locatorType: LocatorType.download, lastError: { not: null } },
-        },
-        sourceId: params.sourceId ?? { not: null },
+    const baseWhere: Prisma.ResourceWhereInput = {
+      acquisitionMode: AcquisitionMode.metadata_only,
+      deletedAt: null,
+      files: { none: { fileRole: FileRole.original, variant: '' } },
+      locators: {
+        some: { locatorType: LocatorType.download, lastError: { not: null } },
       },
-      select: { id: true, sourceId: true },
-      orderBy: { createdAt: 'asc' },
-      take: limit,
-    });
+      sourceId: params.sourceId ?? { not: null },
+    };
+    // 与 assertDownloadAllowed(..., manuallyReviewed=true) 的放行条件一致
+    const policyAllowed: Prisma.ResourceWhereInput = {
+      sourceRecord: {
+        enabled: true,
+        OR: [
+          { allowedModes: { contains: AcquisitionMode.mirror_file } },
+          // 手动重试视为显式审核，允许“需审核且仅元数据”的历史来源镜像下载
+          {
+            requiresReview: true,
+            allowedModes: { contains: AcquisitionMode.metadata_only },
+          },
+        ],
+      },
+    };
+    const activeDownloadJob: Prisma.IngestionJobWhereInput = {
+      jobType: IngestionJobType.download_file,
+      status: {
+        in: [IngestionJobStatus.pending, IngestionJobStatus.processing],
+      },
+    };
 
-    let queued = 0;
-    let skipped = 0;
+    const [total, policyEligible, alreadyQueued, candidates] = await Promise.all([
+      this.prisma.resource.count({ where: baseWhere }),
+      this.prisma.resource.count({ where: { ...baseWhere, ...policyAllowed } }),
+      this.prisma.resource.count({
+        where: {
+          ...baseWhere,
+          ...policyAllowed,
+          ingestionJobs: { some: activeDownloadJob },
+        },
+      }),
+      this.prisma.resource.findMany({
+        where: {
+          ...baseWhere,
+          ...policyAllowed,
+          ingestionJobs: { none: activeDownloadJob },
+        },
+        select: { id: true, sourceId: true },
+        orderBy: { createdAt: 'asc' },
+        take: limit,
+      }),
+    ]);
+
+    let queued = alreadyQueued;
+    let skipped = total - policyEligible;
     for (const candidate of candidates) {
       try {
         await this.assertDownloadAllowed(candidate.sourceId, AcquisitionMode.mirror_file, true);
-        await this.enqueueDownloadJob(candidate.id, candidate.sourceId);
+        await this.enqueueDownloadJob(candidate.id, candidate.sourceId, { resetAttempts: true });
         queued += 1;
       } catch (error) {
         skipped += 1;
@@ -577,7 +810,19 @@ export class IngestionService {
   }
 
   /** 下载任务入队（幂等：同一资源已有排队/执行中的任务时直接复用） */
-  private async enqueueDownloadJob(resourceId: string, sourceId: string | null) {
+  private async enqueueDownloadJob(
+    resourceId: string,
+    sourceId: string | null,
+    options: { resetAttempts?: boolean } = {},
+  ) {
+    if (options.resetAttempts) {
+      // 手动重试是用户的明确决定：清零自动补漏预算，失败后能重新走完整退避，
+      // 而不是卡在「已达到上限、nextDownloadAttemptAt = null」永远不再自动重试。
+      await this.prisma.resourceLocator.updateMany({
+        where: { resourceId, locatorType: LocatorType.download },
+        data: { downloadAttempts: 0, nextDownloadAttemptAt: null },
+      });
+    }
     const request: DownloadResourceRequest = { resourceId };
     const idempotencyKey = createHash('sha256')
       .update(`${IngestionJobType.download_file}:${resourceId}`)
@@ -832,6 +1077,51 @@ export class IngestionService {
       ? await this.sourceRepo.findById(resource.sourceId).catch(() => null)
       : null;
 
+    if (directorySource) {
+      const waitMs = this.reserveSourceDownloadSlot(directorySource);
+      if (waitMs > 0) {
+        // 手动任务只有调度器下一次认领时才能再抢槽位，先给同步等待者一个
+        // 让出窗口，避免它被同步的 250ms 轮询长期挤在后面。窗口要覆盖
+        // nextRunAt 到下一次轮询认领的时间（轮询间隔可配置）。
+        const priorityGraceMs = Math.max(
+          MANUAL_DOWNLOAD_PRIORITY_GRACE_MS,
+          this.pollIntervalMs() * 2 + 1_000,
+        );
+        this.manualDownloadPriorityUntil.set(
+          directorySource.id,
+          Date.now() + waitMs + priorityGraceMs,
+        );
+        // 不在摄入队列里阻塞等待：释放任务并延迟重排，让其它任务先执行。
+        // 批量镜像同一来源的大量资源时，这里保证仍按来源速率逐条下载。
+        try {
+          const released = await this.jobRepo.release(job.id, leaseToken, waitMs + 1_000);
+          if (released) {
+            this.logger.debug(
+              `Deferred manual download ${job.id} for ${waitMs}ms by source rate limit`,
+            );
+          }
+        } catch (error) {
+          // 释放失败（例如 SQLite busy）不能让任务被 runNextJob 标记为终态失败：
+          // 保持 processing，交给 stale 恢复重新排队即可自动重试。
+          this.logger.warn(
+            `Failed to defer rate-limited download ${job.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        return;
+      }
+      // 手动任务拿到槽位，解除优先窗口，同步等待者可以继续。
+      this.manualDownloadPriorityUntil.delete(directorySource.id);
+    }
+
+    // 手动镜像下载同样记账：这类资源常来自「需要人工审核」的来源，
+    // 审核通过后手动下载；记账后即使日后彻底删除，也不会被同步重新下载。
+    const ledger =
+      locator.externalId && directorySource
+        ? { sourceId: resource.sourceId, connectorType: directorySource.sourceType }
+        : undefined;
+
     const result = await this.downloadRemoteFile(
       resource.id,
       locator.id,
@@ -852,6 +1142,7 @@ export class IngestionService {
       },
       { id: job.id, leaseToken, completeOnCommit: true },
       directorySource?.downloadDirectory ?? null,
+      ledger,
     );
     if (result === 'failed') {
       const failedLocator = await this.prisma.resourceLocator.findUnique?.({
@@ -925,33 +1216,50 @@ export class IngestionService {
 
     await this.storage.put(storageKey, Buffer.from(html, 'utf-8'));
     const sizeBytes = BigInt(Buffer.byteLength(html, 'utf-8'));
-    await this.prisma.resourceFile.upsert({
-      where: {
-        resourceId_fileRole_variant: {
+    try {
+      await this.prisma.resourceFile.upsert({
+        where: {
+          resourceId_fileRole_variant: {
+            resourceId: resource.id,
+            fileRole: FileRole.snapshot,
+            variant: '',
+          },
+        },
+        create: {
           resourceId: resource.id,
           fileRole: FileRole.snapshot,
           variant: '',
+          storagePath: storageKey,
+          mimeType: 'text/html',
+          extension: 'html',
+          sizeBytes,
         },
-      },
-      create: {
-        resourceId: resource.id,
-        fileRole: FileRole.snapshot,
-        variant: '',
-        storagePath: storageKey,
-        mimeType: 'text/html',
-        extension: 'html',
-        sizeBytes,
-      },
-      update: {
-        storagePath: storageKey,
-        mimeType: 'text/html',
-        extension: 'html',
-        sizeBytes,
-      },
-    });
-    // 旧快照对象与新的 hash 不同才会残留，best-effort 清理
+        update: {
+          storagePath: storageKey,
+          mimeType: 'text/html',
+          extension: 'html',
+          sizeBytes,
+        },
+      });
+    } catch (error) {
+      // 对象已写入但记录未落库：与下载一致，按引用情况回收，避免留下孤儿快照。
+      await this.deleteStorageKeyIfUnreferenced(storageKey);
+      throw error;
+    }
+    // 旧快照对象与新的 hash 不同才会残留，best-effort 清理。
+    // 快照 key 按内容哈希生成：内容相同的快照可能被多条资源共用，仍有引用时保留。
+    // 引用查询失败时保守保留（宁可留孤儿文件，也不误删其它资源的快照）。
     if (existing && existing.storagePath !== storageKey) {
-      await this.storage.delete(existing.storagePath).catch(() => undefined);
+      let stillReferenced = true;
+      try {
+        const references = await this.fileRepo.findStoragePathReferences([existing.storagePath]);
+        stillReferenced = references.has(existing.storagePath);
+      } catch {
+        stillReferenced = true;
+      }
+      if (!stillReferenced) {
+        await this.storage.delete(existing.storagePath).catch(() => undefined);
+      }
     }
     await this.markLocatorSnapshotChecked(resource.locators, fetched.status);
 
@@ -1049,16 +1357,13 @@ export class IngestionService {
     if (!allowedModes.includes(AcquisitionMode.link_only)) {
       throw new BadRequestException('Source does not allow link-only imports');
     }
-    if (source.baseUrl) {
+    if (source.baseUrl && source.sourceType !== SourceType.rss) {
+      // RSS 来源的 baseUrl 是 Feed 地址（例如 https://example.com/feed.xml），
+      // 不构成站内路径范围；条目链接（文章页、附件）通常不在 /feed.xml 之下，
+      // 甚至可能由第三方 feed 托管在别的域名。对 RSS 来源不做路径/域名限制。
       const baseUrl = this.safeUrl.normalize(source.baseUrl);
       const target = this.safeUrl.normalize(targetUrl);
-      const normalizePath = (pathname: string) =>
-        pathname === '/' ? '/' : pathname.replace(/\/+$/, '');
-      const basePath = normalizePath(baseUrl.pathname);
-      const targetPath = normalizePath(target.pathname);
-      const pathMatches =
-        basePath === '/' || targetPath === basePath || targetPath.startsWith(`${basePath}/`);
-      if (target.origin !== baseUrl.origin || !pathMatches) {
+      if (!isUrlWithinSourceBase(baseUrl, target)) {
         throw new BadRequestException('URL is outside the configured source base URL');
       }
     }
@@ -1170,6 +1475,8 @@ export class IngestionService {
           category: request.categoryId ? { connect: { id: request.categoryId } } : undefined,
         },
       });
+      // 这条路径直接绕过 ResourceService 复活了回收站资源，统计缓存必须同步失效
+      if (deletedAt) this.resourceService.invalidateTrashStats();
     }
     return resourceId;
   }
@@ -1231,13 +1538,24 @@ export class IngestionService {
       typeof config.limit === 'number' && Number.isFinite(config.limit) ? config.limit : undefined;
     // 下载并发取自来源 maxConcurrency，未配置时用模块级默认
     const concurrency = this.resolveDownloadConcurrency(source.maxConcurrency);
-    const downloadIntervalMs = this.resolveDownloadInterval({
-      rateLimitPerMinute: source.rateLimitPerMinute,
-      downloadIntervalMs: (source as { downloadIntervalMs?: number }).downloadIntervalMs,
-    });
-    const waitForDownloadSlot = this.createDownloadThrottle(downloadIntervalMs, () =>
-      this.assertSyncJobActive(job.id, leaseToken),
-    );
+    // 与手动镜像共用同一份来源速率预算：同步下载在进程内阻塞等待槽位
+    const waitHeartbeatMs = this.resolveJobHeartbeatIntervalMs();
+    let lastWaitHeartbeatAt = Date.now();
+    const waitForDownloadSlot = () =>
+      this.waitForSourceDownloadSlot(source, async () => {
+        const now = Date.now();
+        if (now - lastWaitHeartbeatAt >= waitHeartbeatMs) {
+          lastWaitHeartbeatAt = now;
+          await this.touchJob(job.id, leaseToken).catch((error) => {
+            this.logger.warn(
+              `Failed to heartbeat waiting sync job ${job.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }
+        await this.assertSyncJobActive(job.id, leaseToken);
+      });
 
     try {
       // 逐页拉取，直到达到页数上限或 API 没有下一页。
@@ -1285,6 +1603,14 @@ export class IngestionService {
         totalItems = pageData.totalItems ?? totalItems;
         await saveProgress(true);
 
+        // 先批量查出本页哪些条目已经有预览定位器：存量补齐后，逐条 findFirst
+        // 会变成每次同步都要重复付的固定开销。
+        const previewReady = await this.findExternalIdsWithPreviewLocator(
+          pageData.items,
+          source.id,
+          connector.type,
+        );
+
         // 受控并发：同步 + 下载每条远端资源，单条失败不影响整页
         await this.mapWithConcurrency(pageData.items, concurrency, async (remote) => {
           await this.assertSyncJobActive(job.id, leaseToken);
@@ -1300,6 +1626,7 @@ export class IngestionService {
               await waitForDownloadSlot();
               await this.assertSyncJobActive(job.id, leaseToken);
             },
+            previewReady,
           );
           if (result === 'downloaded') downloadedCount++;
           else if (result === 'failed') failedCount++;
@@ -1391,6 +1718,7 @@ export class IngestionService {
   /**
    * 同步单条远端资源并下载原图
    *
+   * - 台账已记「下载过」→ skipped（资源被彻底删除后依然生效，见 SourceItemLedger）
    * - 需要人工审核的来源：只记录元数据，不自动下载文件
    * - 已存在且有原文件 → skipped
    * - 已存在但无原文件（上次下载失败）→ 重试下载
@@ -1403,13 +1731,27 @@ export class IngestionService {
       name: string;
       requiresReview?: boolean;
       downloadDirectory?: string | null;
+      downloadCategoryId?: string | null;
     },
     ingestionJobId: string,
     leaseToken: string,
     connectorType: string,
     waitForDownloadSlot: () => Promise<void>,
+    previewReady: ReadonlySet<string> = new Set(),
   ): Promise<'downloaded' | 'skipped' | 'failed'> {
     try {
+      // 补写历史资源缺失的远端预览定位器。必须放在台账判断之前：已下载过、
+      // 本次会被跳过的条目同样需要补齐缩略图。整页预取已确认有预览的条目跳过。
+      if (!previewReady.has(remote.externalId)) {
+        await this.ensureRemotePreviewLocator(remote, source.id, connectorType);
+      }
+
+      // 台账优先：该条目曾成功下载过，即使资源已被彻底删除也不再重复下载。
+      // 用户若想重新下载，清除同步记录（clearSyncHistory）即可。
+      if (await this.isLedgerDownloaded(connectorType, remote.externalId)) {
+        return 'skipped';
+      }
+
       const upserted = await this.upsertRemoteResource(
         remote,
         source,
@@ -1435,6 +1777,7 @@ export class IngestionService {
           leaseToken,
         },
         source.downloadDirectory,
+        { sourceId: source.id, connectorType },
       );
     } catch (error) {
       if (error instanceof SyncJobCanceledError) throw error;
@@ -1459,12 +1802,32 @@ export class IngestionService {
     remote: import('./connectors/resource-connector.interface').RemoteResource,
     jobControl?: DownloadJobControl,
     downloadDirectory?: string | null,
+    ledger?: { sourceId: string | null; connectorType: string },
   ): Promise<'downloaded' | 'failed'> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TOTAL_TIMEOUT_MS);
     let canceled = false;
+    // 心跳间隔跟随 stale 超时配置：默认 60s 时取 5s；配置被调小时（或非法值）
+    // 也不能让心跳失效，否则长下载又会被 stale 恢复中途重置。
+    const heartbeatIntervalMs = this.resolveJobHeartbeatIntervalMs();
+    // 任务刚被认领时 startedAt 已是新的，不需要立刻再写一次心跳
+    let lastHeartbeatAt = Date.now();
     const assertJobActive = async () => {
-      if (jobControl) await this.assertSyncJobActive(jobControl.id, jobControl.leaseToken);
+      if (!jobControl) return;
+      const now = Date.now();
+      if (now - lastHeartbeatAt >= heartbeatIntervalMs) {
+        lastHeartbeatAt = now;
+        // 心跳失败不直接中断下载：若任务确实被取消/重置，紧接着的
+        // assertSyncJobActive 会抛 SyncJobCanceledError，下载仍会停止。
+        await this.touchJob(jobControl.id, jobControl.leaseToken).catch((error) => {
+          this.logger.warn(
+            `Failed to heartbeat download job ${jobControl.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
+      await this.assertSyncJobActive(jobControl.id, jobControl.leaseToken);
     };
     // 每 500ms 探测一次任务是否已取消：取消时立即中止 fetch，
     // 否则要等到下一次读流才会发现。
@@ -1480,6 +1843,9 @@ export class IngestionService {
       : null;
 
     try {
+      // 本次尝试已成功写入正式存储、但尚未（或未能）落库的对象 key。
+      // 事务失败 / 取消 / 准备重试时必须回收，否则会留下没有 resource_files 引用的孤儿文件。
+      let downloadedStorageKey: string | null = null;
       for (let attempt = 0; ; attempt += 1) {
         try {
           const downloaded = await this.directDownload.download({
@@ -1490,9 +1856,13 @@ export class IngestionService {
             signal: controller.signal,
             onCheckpoint: assertJobActive,
           });
+          downloadedStorageKey = downloaded.storageKey;
+          // 下载期间（尤其是落盘阶段）可能已被取消：返回后立即再确认一次，
+          // 此时对象已写入，取消/异常由下面的 catch 按引用情况回收。
+          await assertJobActive();
 
           // 事务：更新资源元数据 + 建原文件记录 + 更新 locator + 按 sha256 查重
-          await this.commitDownloadedFile({
+          const commit = await this.commitDownloadedFile({
             resourceId,
             locatorId,
             remote,
@@ -1507,6 +1877,7 @@ export class IngestionService {
               remote.externalId,
               downloaded.extension,
             ),
+            ledger: ledger ? { ...ledger, externalId: remote.externalId } : undefined,
             completion: jobControl?.completeOnCommit
               ? {
                   id: jobControl.id,
@@ -1517,6 +1888,14 @@ export class IngestionService {
               : undefined,
           });
 
+          // 并发同步已创建同一条 resourceFile 时事务会继续提交（P2002 忽略），
+          // 但本次写入的 key 可能因下载目录不同而没有被任何记录引用，需按引用情况回收。
+          if (commit.fileAlreadyExisted) {
+            await this.deleteStorageKeyIfUnreferenced(downloaded.storageKey);
+          }
+          // 事务已提交：对象现在归数据库记录所有，后续失败不再回滚存储。
+          downloadedStorageKey = null;
+
           // 入队元数据检测（图片会链式生成缩略图），与上传流程一致
           await this.scheduler.enqueue(JobType.detect_metadata, resourceId).catch((error) => {
             this.logger.warn(
@@ -1526,6 +1905,12 @@ export class IngestionService {
 
           return 'downloaded';
         } catch (error) {
+          // 本次尝试写入的对象还没有数据库记录指向它（事务已回滚，或下载后的取消
+          // 检查失败）：无论取消、准备重试还是最终失败，都先按引用情况回收。
+          if (downloadedStorageKey) {
+            await this.deleteStorageKeyIfUnreferenced(downloadedStorageKey);
+            downloadedStorageKey = null;
+          }
           if (canceled || error instanceof SyncJobCanceledError) {
             throw new SyncJobCanceledError();
           }
@@ -1569,7 +1954,7 @@ export class IngestionService {
     );
   }
 
-  /** 事务提交下载结果：更新资源 + 建原文件 + 更新 locator + 按 sha256 查重 */
+  /** 事务提交下载结果：更新资源 + 建原文件 + 更新 locator + 按 sha256 查重 + 记台账 */
   private async commitDownloadedFile(args: {
     resourceId: string;
     locatorId: string | null;
@@ -1581,13 +1966,18 @@ export class IngestionService {
     sizeBytes: bigint;
     storageKey: string;
     originalFilename: string;
+    /** 下载成功后在台账里记一笔，保证删除资源后不再重复下载 */
+    ledger?: { sourceId: string | null; connectorType: string; externalId: string };
     completion?: {
       id: string;
       leaseToken: string;
       resourceId: string;
       result: string;
     };
-  }): Promise<void> {
+  }): Promise<{ fileAlreadyExisted: boolean }> {
+    // 并发同步已经建过原文件记录时不会报错，但本次写入的存储对象可能因此没有被引用，
+    // 由调用方据此决定是否回收。
+    let fileAlreadyExisted = false;
     await this.prisma.$transaction(async (tx) => {
       const duplicate = await tx.resource.findFirst({
         where: { sha256: args.sha256, deletedAt: null },
@@ -1626,10 +2016,39 @@ export class IngestionService {
         .catch((error) => {
           // 并发同步已创建该原文件记录（唯一约束 resourceId+fileRole+variant）→ 视为已下载，继续
           if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+            fileAlreadyExisted = true;
             return;
           }
           throw error;
         });
+
+      // 台账与文件记录同事务落库：要么「文件 + 已下载记录」都在，要么都不在，
+      // 不会出现文件已落盘但台账缺失、删除后又重复下载的情况。
+      if (args.ledger) {
+        await tx.sourceItemLedger.upsert({
+          where: {
+            connectorType_externalId: {
+              connectorType: args.ledger.connectorType,
+              externalId: args.ledger.externalId,
+            },
+          },
+          create: {
+            connectorType: args.ledger.connectorType,
+            externalId: args.ledger.externalId,
+            sourceId: args.ledger.sourceId,
+            resourceId: args.resourceId,
+            state: SYNC_LEDGER_DOWNLOADED,
+            sha256: args.sha256,
+            sizeBytes: args.sizeBytes,
+          },
+          update: {
+            state: SYNC_LEDGER_DOWNLOADED,
+            sha256: args.sha256,
+            sizeBytes: args.sizeBytes,
+            resourceId: args.resourceId,
+          },
+        });
+      }
 
       if (args.locatorId) {
         await tx.resourceLocator.update({
@@ -1663,6 +2082,35 @@ export class IngestionService {
         if (completed.count !== 1) throw new SyncJobCanceledError();
       }
     });
+    return { fileAlreadyExisted };
+  }
+
+  /**
+   * 存储写入早于数据库事务，失败路径需要兜底回收本次写入的对象。
+   *
+   * 上传/下载的 key 都按内容哈希生成，同一份文件可能被多条资源共用（例如重复上传、
+   * 相同快照、带不同下载目录的同步）。删除前必须确认没有任何 resource_files 引用，
+   * 否则会连带删掉别的资源的原文件。引用查询本身失败时保守保留——宁可留下孤儿，
+   * 也不能误删；残留对象可由一致性检查（ConsistencyService）列出并处理。
+   */
+  private async deleteStorageKeyIfUnreferenced(storageKey: string): Promise<void> {
+    try {
+      const references = await this.fileRepo.findStoragePathReferences([storageKey]);
+      const resourceIds = references.get(storageKey);
+      if (resourceIds && resourceIds.size > 0) {
+        this.logger.warn(
+          `Keep storage object ${storageKey}: still referenced by ${resourceIds.size} resource(s)`,
+        );
+        return;
+      }
+      await this.storage.delete(storageKey);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to clean up unreferenced storage object ${storageKey}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
@@ -1673,12 +2121,28 @@ export class IngestionService {
    */
   private async markLocatorError(locatorId: string | null, message: string): Promise<void> {
     if (!locatorId) return;
-    const locator = await this.prisma.resourceLocator.findUnique({
-      where: { id: locatorId },
-      select: { downloadAttempts: true },
-    });
-    if (!locator) return;
-    const attempts = locator.downloadAttempts + 1;
+    let attempts: number;
+    try {
+      // 用数据库自增而不是「先读后写」：后台补漏与手动重试可能同时失败，
+      // 读改写会丢掉一次计数，让退避与上限判断失真。
+      const updated = await this.prisma.resourceLocator.update({
+        where: { id: locatorId },
+        data: {
+          lastError: message,
+          lastCheckedAt: new Date(),
+          httpStatus: 0,
+          downloadAttempts: { increment: 1 },
+        },
+        select: { downloadAttempts: true },
+      });
+      attempts = updated.downloadAttempts;
+    } catch (error) {
+      // 定位器已被并发删除：错误日志没有落点，忽略
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+        return;
+      }
+      throw error;
+    }
     const delay =
       attempts >= DOWNLOAD_RETRY_MAX_ATTEMPTS
         ? null
@@ -1686,13 +2150,23 @@ export class IngestionService {
     await this.prisma.resourceLocator.update({
       where: { id: locatorId },
       data: {
-        lastError: message,
-        lastCheckedAt: new Date(),
-        httpStatus: 0,
-        downloadAttempts: attempts,
         nextDownloadAttemptAt: delay === null ? null : new Date(Date.now() + delay),
       },
     });
+  }
+
+  /**
+   * 该远端条目是否已成功下载过（台账视角）。
+   *
+   * 判重不依赖 ResourceLocator：locator 随资源级联删除，而台账不建外键，
+   * 因此「彻底删除后再同步」仍能命中，避免重复下载。
+   */
+  private async isLedgerDownloaded(connectorType: string, externalId: string): Promise<boolean> {
+    const entry = await this.prisma.sourceItemLedger.findUnique({
+      where: { connectorType_externalId: { connectorType, externalId } },
+      select: { state: true },
+    });
+    return entry?.state === SYNC_LEDGER_DOWNLOADED;
   }
 
   private async resourceHasOriginalFile(resourceId: string): Promise<boolean> {
@@ -1785,33 +2259,83 @@ export class IngestionService {
     return Math.max(rateLimitIntervalMs, configuredIntervalMs);
   }
 
-  private createDownloadThrottle(
-    intervalMs: number,
-    assertActive?: () => Promise<void>,
-  ): () => Promise<void> {
-    let nextAvailableAt = 0;
-    let queue = Promise.resolve();
+  /**
+   * 下载任务心跳间隔：不超过 5s，同时不超过 stale 超时的 1/3。
+   * stale 配置非法或缺失时回退默认 60s，保证心跳不会算成 NaN 而失效。
+   */
+  private resolveJobHeartbeatIntervalMs(): number {
+    const configured = this.config.get<number>('ingestion.staleJobTimeoutMs');
+    const staleTimeoutMs =
+      typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+        ? configured
+        : 60_000;
+    return Math.max(1_000, Math.min(JOB_HEARTBEAT_INTERVAL_MS, Math.floor(staleTimeoutMs / 3)));
+  }
 
-    return async () => {
-      const previous = queue;
-      let release!: () => void;
-      queue = new Promise<void>((resolve) => {
-        release = resolve;
+  /**
+   * 占用来源速率槽。
+   *
+   * 返回 0 表示已占用、可以立即下载；返回 >0 表示还需等待的毫秒数，
+   * 此时不会占用槽位。自动同步与手动/批量镜像共用同一份预算。
+   * 来源限速配置变化时只更新间隔，保留已有等待窗口，避免交替放行造成突发。
+   */
+  private reserveSourceDownloadSlot(source: {
+    id: string;
+    rateLimitPerMinute: number | null;
+    downloadIntervalMs?: number | null;
+  }): number {
+    const intervalMs = this.resolveDownloadInterval(source);
+    const now = Date.now();
+    const existing = this.sourceDownloadSlots.get(source.id);
+    if (!existing) {
+      this.sourceDownloadSlots.set(source.id, {
+        intervalMs,
+        nextAvailableAt: now + intervalMs,
       });
-      await previous;
-      try {
-        while (true) {
-          await assertActive?.();
-          const waitMs = Math.max(0, nextAvailableAt - Date.now());
-          if (waitMs === 0) break;
-          await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, 250)));
+      return 0;
+    }
+    if (existing.intervalMs !== intervalMs) {
+      // 同步任务持有启动时的来源快照，手动任务每次都重新读取。配置变更期间两边
+      // 的 interval 会持续不一致；如果每次都重置并立即放行，会交替产生突发下载。
+      // 这里只更新间隔，保留已有的等待窗口。
+      existing.intervalMs = intervalMs;
+    }
+    if (existing.nextAvailableAt <= now) {
+      existing.nextAvailableAt = now + intervalMs;
+      return 0;
+    }
+    return existing.nextAvailableAt - now;
+  }
+
+  /**
+   * 阻塞等待来源速率槽（自动同步路径使用）。
+   * 手动下载任务不能用它等待，否则会卡住整条摄入队列。
+   */
+  private async waitForSourceDownloadSlot(
+    source: {
+      id: string;
+      rateLimitPerMinute: number | null;
+      downloadIntervalMs?: number | null;
+    },
+    assertActive?: () => Promise<void>,
+  ): Promise<void> {
+    for (;;) {
+      await assertActive?.();
+      // 有手动任务刚被限速延后时，让出接下来的槽位。手动任务由调度器
+      // 每轮重新认领，只有一次抢占机会；同步等待者每 250ms 轮询，若不让出
+      // 会一直把槽位抢走，导致“下载到本地”长时间停在 pending。
+      const priorityUntil = this.manualDownloadPriorityUntil.get(source.id);
+      if (priorityUntil !== undefined) {
+        if (priorityUntil > Date.now()) {
+          await this.sleep(250);
+          continue;
         }
-        await assertActive?.();
-        nextAvailableAt = Date.now() + intervalMs;
-      } finally {
-        release();
+        this.manualDownloadPriorityUntil.delete(source.id);
       }
-    };
+      const waitMs = this.reserveSourceDownloadSlot(source);
+      if (waitMs === 0) return;
+      await this.sleep(Math.min(waitMs, 250));
+    }
   }
 
   private async assertSyncJobActive(id: string, leaseToken: string): Promise<void> {
@@ -1834,10 +2358,21 @@ export class IngestionService {
    */
   private async upsertRemoteResource(
     remote: import('./connectors/resource-connector.interface').RemoteResource,
-    source: { id: string; name: string },
+    source: { id: string; name: string; downloadCategoryId?: string | null },
     ingestionJobId: string,
     connectorType: string,
   ): Promise<{ resourceId: string; downloadLocatorId: string | null; isNew: boolean } | null> {
+    // 连接器解析出的远端预览图。feed 的 <img src> / media:thumbnail 可能是相对地址，
+    // 直接入库会让卡片和详情页拿到打不开的链接，这里统一转成绝对 HTTP(S) 地址。
+    const previewUrl = this.normalizeRemotePreviewUrl(remote);
+    // 预览与下载是同一地址（如 Civitai）时无需单独记录，列表/详情的回退逻辑本就能用。
+    // 下载地址只做比较，不改写下载定位器里保存的原始地址。
+    const distinctPreviewUrl =
+      previewUrl &&
+      previewUrl !==
+        (this.normalizeRemoteAssetUrl(remote.url, [remote.canonicalUrl, remote.url]) ?? remote.url)
+        ? previewUrl
+        : null;
     // Check for existing locator with this externalId under this source
     const existingLocator = await this.prisma.resourceLocator.findFirst({
       where: {
@@ -1897,6 +2432,10 @@ export class IngestionService {
           author: remote.authorName,
           acquisitionMode: AcquisitionMode.metadata_only,
           sourceRecord: { connect: { id: source.id } },
+          // 来源配置了下载文件夹时，新导入的资源直接归入该文件夹
+          category: source.downloadCategoryId
+            ? { connect: { id: source.downloadCategoryId } }
+            : undefined,
           processingStatus: ProcessingStatus.completed, // metadata is already captured
           width: remote.width,
           height: remote.height,
@@ -1914,6 +2453,19 @@ export class IngestionService {
                 contentType: remote.mimeType,
                 lastCheckedAt: new Date(),
               },
+              // 连接器解析出的远端预览图单独落一条 preview 定位器：列表卡片与详情页
+              // 据此展示缩略图。预览地址与下载地址相同时（如 Civitai）无需重复记录，
+              // 两处的回退逻辑本就会使用下载地址。不写 contentType，交给健康检查探测。
+              ...(distinctPreviewUrl
+                ? [
+                    {
+                      sourceId: source.id,
+                      locatorType: LocatorType.preview,
+                      url: distinctPreviewUrl,
+                      isPrimary: false,
+                    },
+                  ]
+                : []),
               ...(remote.additionalLocators ?? []).map((loc) => ({
                 sourceId: source.id,
                 locatorType: loc.locatorType,
@@ -1969,6 +2521,167 @@ export class IngestionService {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * 把连接器给出的 URL 转成可安全入库的绝对 HTTP(S) 地址
+   *
+   * feed 的 `<img src>` / media:thumbnail 可能是相对地址或协议相对地址（`//cdn/...`），
+   * 甚至 data: URI；原样写进 locator 会让列表卡片和详情页拿到打不开的链接。
+   * 无法解析成合法 HTTP(S) 地址时返回 null，按「没有预览」处理。
+   */
+  private normalizeRemoteAssetUrl(
+    rawUrl: string | null | undefined,
+    baseUrls: Array<string | null | undefined>,
+  ): string | null {
+    const value = rawUrl?.trim();
+    if (!value) return null;
+    // 绝对地址与任何基准无关；相对地址按顺序尝试条目页面、下载地址。
+    // 基准本身也可能是相对串（少见），解析失败就换下一个，最后再按纯绝对地址解析。
+    for (const baseUrl of [...baseUrls, undefined]) {
+      try {
+        const resolved = new URL(value, baseUrl ?? undefined).toString();
+        return this.safeUrl.normalize(resolved).toString();
+      } catch {
+        // 换下一个基准
+      }
+    }
+    return null;
+  }
+
+  /** 连接器的预览地址优先按条目页面（canonicalUrl）解析相对路径 */
+  private normalizeRemotePreviewUrl(
+    remote: import('./connectors/resource-connector.interface').RemoteResource,
+  ): string | null {
+    return this.normalizeRemoteAssetUrl(remote.previewUrl, [remote.canonicalUrl, remote.url]);
+  }
+
+  /**
+   * 给同步前就已存在的资源补写远端预览定位器
+   *
+   * 旧版本同步把连接器解析出的 previewUrl 丢掉了，只保存下载/页面定位器，
+   * 导致列表卡片和详情页都没有缩略图。新资源在 upsertRemoteResource 创建时
+   * 已直接带上 preview 定位器；这里负责历史资源，且不覆盖已有的 preview。
+   */
+  private async ensureRemotePreviewLocator(
+    remote: import('./connectors/resource-connector.interface').RemoteResource,
+    sourceId: string,
+    connectorType: string,
+  ): Promise<void> {
+    const previewUrl = this.normalizeRemotePreviewUrl(remote);
+    const downloadUrl =
+      this.normalizeRemoteAssetUrl(remote.url, [remote.canonicalUrl, remote.url]) ?? remote.url;
+    // 预览地址与下载地址相同（如 Civitai）时，列表/详情的回退逻辑本就能用
+    if (!previewUrl || previewUrl === downloadUrl) return;
+
+    try {
+      const downloadLocator = await this.prisma.resourceLocator.findFirst({
+        where: {
+          OR: [
+            { sourceId, externalId: remote.externalId },
+            // 同一内容可能已由其它来源同步过（identityUrl 全局去重），一并补写
+            { identityUrl: `${connectorType}://image/${remote.externalId}` },
+          ],
+        },
+        select: {
+          resourceId: true,
+          resource: {
+            select: {
+              locators: {
+                where: { locatorType: LocatorType.preview },
+                select: { id: true },
+                take: 1,
+              },
+            },
+          },
+        },
+      });
+      // 新资源：创建时已经带上 preview 定位器
+      if (!downloadLocator) return;
+      if (downloadLocator.resource?.locators.length) return;
+
+      await this.prisma.resourceLocator.create({
+        data: {
+          resourceId: downloadLocator.resourceId,
+          sourceId,
+          locatorType: LocatorType.preview,
+          url: previewUrl,
+          isPrimary: false,
+        },
+      });
+    } catch (error) {
+      // 缩略图只是展示优化，补写失败不应影响该条目的同步与下载
+      this.logger.warn(
+        `Failed to backfill preview locator for ${remote.externalId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * 批量预取本页哪些远端条目已经有 preview 定位器。
+   *
+   * 与 ensureRemotePreviewLocator 的定位规则保持一致（来源 + externalId，或
+   * 跨来源的 identityUrl 去重）。一次 IN 查询替代整页 N 次 findFirst，已补齐
+   * 的条目在后续同步中完全不再产生查询。
+   */
+  private async findExternalIdsWithPreviewLocator(
+    remotes: Array<{ externalId: string }>,
+    sourceId: string,
+    connectorType: string,
+  ): Promise<Set<string>> {
+    if (remotes.length === 0) return new Set();
+    const externalIds = [...new Set(remotes.map((remote) => remote.externalId))];
+    const ready = new Set<string>();
+    // 分块：SQLite 的绑定变量上限约 999，两个 IN 列表会翻倍。任何一块失败都
+    // 整体退回逐条检查，宁可多查也不能漏补。
+    const CHUNK_SIZE = 200;
+    try {
+      for (let offset = 0; offset < externalIds.length; offset += CHUNK_SIZE) {
+        const chunk = externalIds.slice(offset, offset + CHUNK_SIZE);
+        const externalIdByIdentity = new Map(
+          chunk.map((externalId) => [`${connectorType}://image/${externalId}`, externalId]),
+        );
+        const rows = await this.prisma.resourceLocator.findMany({
+          where: {
+            OR: [
+              { sourceId, externalId: { in: chunk } },
+              { identityUrl: { in: [...externalIdByIdentity.keys()] } },
+            ],
+          },
+          select: {
+            externalId: true,
+            identityUrl: true,
+            resource: {
+              select: {
+                locators: {
+                  where: { locatorType: LocatorType.preview },
+                  select: { id: true },
+                  take: 1,
+                },
+              },
+            },
+          },
+        });
+        for (const row of rows) {
+          if (!row.resource?.locators.length) continue;
+          const externalId =
+            row.externalId ??
+            (row.identityUrl ? externalIdByIdentity.get(row.identityUrl) : undefined);
+          if (externalId) ready.add(externalId);
+        }
+      }
+      return ready;
+    } catch (error) {
+      // 预取只是优化：失败就退化为逐条检查，不能影响同步本身
+      this.logger.warn(
+        `Failed to prefetch preview locators for source ${sourceId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return new Set();
     }
   }
 

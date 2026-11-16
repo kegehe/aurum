@@ -17,6 +17,7 @@ export async function startWorker(): Promise<void> {
   // 必须在加载 AppModule 之前定好：ConfigModule 的 Joi 默认值会回写 process.env，
   // 一旦模块被 require，这里再改就来不及了。
   process.env.INGESTION_ENABLED ??= 'false';
+  process.env.SNAPSHOT_JOB_WORKER ??= 'true';
   const logger = new Logger('Worker');
   logger.log(
     `启动 Worker（处理任务执行=${process.env.EXECUTION_ENABLED ?? 'true'}，摄入调度=${process.env.INGESTION_ENABLED}）`,

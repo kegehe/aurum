@@ -13,7 +13,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
-import { analyzeStyle, getStyleHealth } from '@/lib/api/style';
+import { analyzeStyle, getStyleHealth, retryStyleAi } from '@/lib/api/style';
 import { createReferenceDraft, listDesignDocuments } from '@/lib/api/design';
 import type { DesignDocument } from '@/lib/api/design';
 import type { StyleAnalyzeResult, StyleHealth, StyleVariation } from '@/lib/types';
@@ -27,6 +27,11 @@ const DENSITY_LABELS: Record<string, string> = {
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
   return `${(bytes / 1024).toFixed(0)}KB`;
+}
+
+/** 降级剩余时间：不足 1 分钟按 1 分钟展示，避免出现「0 分钟后重试」 */
+function formatRetryAfter(ms: number): string {
+  return `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
 }
 
 function CopyButton({ text, label }: { text: string; label: string }) {
@@ -106,6 +111,7 @@ export default function StyleLabPage() {
   const analyzeSeqRef = useRef(0);
 
   const [health, setHealth] = useState<StyleHealth | null>(null);
+  const [retryingAi, setRetryingAi] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -120,6 +126,16 @@ export default function StyleLabPage() {
     getStyleHealth().then(setHealth).catch(() => undefined);
     listDesignDocuments('theme').then(setThemeDocuments).catch(() => undefined);
   }, []);
+
+  // 降级退避窗口是服务端状态，会自己到期。只在降级期间轮询，让倒计时跟着走、
+  // 窗口过期后横幅自动消失 —— 否则它会一直挂着一个早已作废的剩余时间。
+  useEffect(() => {
+    if (!health?.degraded) return;
+    const timer = window.setInterval(() => {
+      getStyleHealth().then(setHealth).catch(() => undefined);
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [health?.degraded]);
 
   useEffect(
     () => () => {
@@ -188,7 +204,44 @@ export default function StyleLabPage() {
         description="上传一张截图或图片，提取它的样式（配色 / 字体 / 排版 / 布局），生成多种布局变体，并导出可在其它系统还原样式的提示词。AI 可用时优先 AI 分析，未配置或失败时自动降级为本地分析。"
       />
 
-      {health && health.source === 'local' && (
+      {health && health.source === 'local' && health.degraded && (
+        <Card className="border-amber-200 bg-amber-50">
+          <CardContent className="flex flex-wrap items-center gap-3 p-4 text-sm text-amber-900">
+            <div className="min-w-48 flex-1">
+              <p>
+                AI 已配置（{health.model || '当前模型'}），但最近一次调用失败，已临时降级为
+                <strong>本地分析</strong>。约{' '}
+                {formatRetryAfter(health.degradation?.retryAfterMs ?? 0)}后恢复尝试 AI ——
+                届时下一次分析会重新调用它，也可点右侧按钮立即重试。
+              </p>
+              <p className="mt-1 text-xs text-amber-800">
+                失败原因：{health.degradation?.reason || '未知错误'}
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={retryingAi}
+              onClick={async () => {
+                setRetryingAi(true);
+                try {
+                  setHealth(await retryStyleAi());
+                  toast.success('已清除降级状态，下次分析会重新尝试 AI');
+                } catch (error) {
+                  toast.error(error instanceof Error ? error.message : '重试失败');
+                } finally {
+                  setRetryingAi(false);
+                }
+              }}
+            >
+              {retryingAi && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              立即重试 AI
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {health && health.source === 'local' && !health.degraded && (
         <Card className="border-sky-200 bg-sky-50">
           <CardContent className="p-4 text-sm text-sky-800">
             当前使用<strong>本地分析</strong>模式（无需 AI、零费用，色板取自图片像素）。配置 AI Key
@@ -316,7 +369,11 @@ export default function StyleLabPage() {
               <div className="flex items-center justify-between gap-2">
                 <CardTitle className="text-base">样式档案</CardTitle>
                 <Badge variant={result.source === 'ai' ? 'default' : 'secondary'}>
-                  {result.source === 'ai' ? 'AI 分析' : '本地分析'}
+                  {result.source === 'ai'
+                    ? result.variationsSource === 'ai'
+                      ? 'AI 分析'
+                      : 'AI 档案 · 本地变体'
+                    : '本地分析'}
                 </Badge>
               </div>
             </CardHeader>

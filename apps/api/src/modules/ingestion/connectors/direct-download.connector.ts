@@ -65,6 +65,9 @@ export class DirectDownloadConnector {
    *
    * 失败一律抛错，由调用方决定如何记录（locator.lastError / 任务失败），
    * 错误文本即用户可见的原因。
+   *
+   * 成功返回的 storageKey 归调用方所有：返回后对象已落盘，若调用方随后的
+   * 取消检查 / 数据库事务失败，需要自行（按引用情况）回收该对象。
    */
   async download(input: DirectDownloadInput): Promise<DirectDownloadResult> {
     const maxBytes = this.maxFileSizeBytes();
@@ -127,7 +130,6 @@ export class DirectDownloadConnector {
       }
       await input.onCheckpoint?.();
       await this.storage.put(storageKey, createReadStream(tempPath));
-      await input.onCheckpoint?.();
 
       return { storageKey, sha256, mimeType, extension, resourceType, sizeBytes: downloadedBytes };
     } finally {

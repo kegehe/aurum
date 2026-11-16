@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { toast } from 'sonner';
 import {
@@ -9,28 +10,28 @@ import {
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  CloudDownload,
   Download,
   ExternalLink,
   Folder,
   FolderOpen,
   FolderPlus,
   Globe,
-  Grid3X3,
   Heart,
   HeartOff,
-  List,
   Pencil,
+  SlidersHorizontal,
   SquareCheck,
   Trash2,
+  Wand2,
   X,
 } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
 import { ResourceGrid } from '@/components/shared/resource-grid';
 import { DataTable, type Column } from '@/components/shared/data-table';
-import { LoadingState } from '@/components/shared/loading-state';
 import { ErrorState } from '@/components/shared/error-state';
 import { EmptyState } from '@/components/shared/empty-state';
-import { ResourceTypeIcon } from '@/components/shared/resource-type-icon';
+import { ResourcePreview } from '@/components/shared/resource-preview';
 import { ResourceTypeBadge } from '@/components/shared/resource-type-badge';
 import { SearchInput } from '@/components/shared/search-input';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -46,7 +47,6 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Select,
   SelectContent,
@@ -56,22 +56,46 @@ import {
 } from '@/components/ui/select';
 import {
   batchDeleteResources,
+  batchMirrorResources,
   batchSetResourceCategory,
   batchSetResourceFavorite,
+  canStreamZipToDisk,
   downloadResourcesZip,
+  listResourceIds,
   listResources,
+  restoreResource,
   softDeleteResource,
+  type BatchMirrorSkipReason,
 } from '@/lib/api/resources';
-import { createCategory, deleteCategory, listCategories, updateCategory } from '@/lib/api/categories';
-import { formatByteString, formatDate } from '@/lib/format';
+import {
+  createCategory,
+  deleteCategory,
+  listCategories,
+  updateCategory,
+} from '@/lib/api/categories';
+import { formatBytes, formatByteString, formatDate } from '@/lib/format';
+import { cn } from '@/lib/utils';
+import { readViewMemory, writeViewMemory } from '@/lib/view-memory';
+import {
+  buildFilterParams,
+  filterSignature,
+  filtersFromSearchParams,
+  selectionScopeKey,
+  hasAdvancedFilters,
+  hasAdvancedFiltersInUrl,
+  writeFilterParams,
+  type DateField,
+  type ResourceFilterState,
+} from '@/lib/resource-filters';
 import { RESOURCE_TYPE_LABELS } from '@/lib/constants';
+import { designMediaHref, isDesignMediaType } from '@/lib/resource';
+import { ResourceListSkeleton, ResourceViewPanels, ResourceViewToggle } from './resource-views';
 import type { ResourceListItem, CategoryTreeNode } from '@/lib/types';
 import type { ResourceType } from '@aurum/shared-types';
 
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [20, 50, 100] as const;
 const PAGE_SIZE_STORAGE_KEY = 'aurum.resources.page-size';
-type ViewMode = 'grid' | 'table';
 const ALL_RESOURCE_TYPES_VALUE = '__all_resource_types__';
 const ALL_CATEGORIES_VALUE = '__all_categories__';
 const UNCATEGORIZED_CATEGORY_VALUE = '__uncategorized__';
@@ -80,9 +104,46 @@ const ROOT_FOLDER_VALUE = '__root_folder__';
 const NO_FOLDER_VALUE = '__no_folder__';
 const DRAG_DATA_TYPE = 'application/x-aurum';
 
-type DragPayload =
-  | { type: 'resources'; ids: string[] }
-  | { type: 'folder'; id: string };
+/** 批量下载到本地时，被跳过资源的提示文案 */
+const BATCH_MIRROR_SKIP_LABELS: Record<BatchMirrorSkipReason, string> = {
+  not_found: '资源或来源不存在',
+  deleted: '已删除',
+  already_local: '已有本地原文件',
+  no_source_url: '没有下载地址',
+  no_source: '缺少来源配置',
+  policy: '来源策略不允许',
+  error: '提交失败',
+};
+
+function describeBatchMirrorSkips(
+  skippedResources: Array<{ reason: BatchMirrorSkipReason }>,
+): string {
+  const counts = new Map<BatchMirrorSkipReason, number>();
+  for (const { reason } of skippedResources) {
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  return Array.from(
+    counts,
+    ([reason, count]) => `${BATCH_MIRROR_SKIP_LABELS[reason]} ${count} 个`,
+  ).join('、');
+}
+
+/**
+ * 批量下载到本地时每个请求的最大资源数。
+ * 服务端逐条走策略门禁与入队，单个请求太小会多几次往返，太大会长时间占用连接；
+ * 100 与服务端的批量上限配合，正常使用不会触发服务端 400。
+ */
+const BATCH_MIRROR_CHUNK_SIZE = 100;
+
+function chunkIds(ids: string[], size: number): string[][] {
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += size) {
+    chunks.push(ids.slice(i, i + size));
+  }
+  return chunks;
+}
+
+type DragPayload = { type: 'resources'; ids: string[] } | { type: 'folder'; id: string };
 
 type PaginationItem = number | 'start-ellipsis' | 'end-ellipsis';
 
@@ -93,21 +154,6 @@ function getStoredPageSize(): number {
   return PAGE_SIZE_OPTIONS.includes(storedValue as (typeof PAGE_SIZE_OPTIONS)[number])
     ? storedValue
     : DEFAULT_PAGE_SIZE;
-}
-
-function isResourceType(value: string | null): value is ResourceType {
-  return !!value && value in RESOURCE_TYPE_LABELS;
-}
-
-const SORT_FIELD_VALUES = ['createdAt', 'title', 'sizeBytes'] as const;
-const SORT_ORDER_VALUES = ['asc', 'desc'] as const;
-
-function parseSortField(value: string | null): string {
-  return (SORT_FIELD_VALUES as readonly string[]).includes(value ?? '') ? (value as string) : 'createdAt';
-}
-
-function parseSortOrder(value: string | null): string {
-  return (SORT_ORDER_VALUES as readonly string[]).includes(value ?? '') ? (value as string) : 'desc';
 }
 
 function flattenCategories(categories: CategoryTreeNode[]): CategoryTreeNode[] {
@@ -133,7 +179,9 @@ function getCategoryPath(categories: CategoryTreeNode[], id: string): CategoryTr
 }
 
 function containsCategory(categories: CategoryTreeNode[], id: string): boolean {
-  return categories.some((category) => category.id === id || containsCategory(category.children, id));
+  return categories.some(
+    (category) => category.id === id || containsCategory(category.children, id),
+  );
 }
 
 export default function ResourcesPage() {
@@ -144,6 +192,10 @@ export default function ResourcesPage() {
   // 数据
   const [resources, setResources] = useState<ResourceListItem[]>([]);
   const [loading, setLoading] = useState(true);
+  // 已有数据时的再次拉取（搜索/筛选/翻页）：不卸载列表，只在顶部显示细进度条。
+  // 用骨架屏替换整块列表会让内容高度骤降（滚动位被夹回顶部），并让 50 张缩略图重新解码。
+  const [refreshing, setRefreshing] = useState(false);
+  const loadedOnceRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -153,6 +205,15 @@ export default function ResourcesPage() {
   const [urlParamsApplied, setUrlParamsApplied] = useState(false);
   // 请求序号：用于忽略过期响应，避免慢的旧请求后返回时用旧数据覆盖新结果（竞态）。
   const requestIdRef = useRef(0);
+  // 列表顶部锚点：翻页/换筛选后滚到这里，而不是整页跳回顶部
+  const listAnchorRef = useRef<HTMLDivElement>(null);
+  // 位置恢复：等对应页的数据回来、列表渲染出来后，再滚回上次的位置
+  const restoreRef = useRef<{ pending: boolean; page: number; scrollY: number; key: string }>({
+    pending: false,
+    page: 1,
+    scrollY: 0,
+    key: '',
+  });
   // 上一次由“状态→URL”同步 effect 写入的查询串：监听 effect 据此识别自身写入，跳过重复应用。
   const lastSyncedSearchRef = useRef<string | null>(null);
   // 最新 URL 查询串：供“状态→URL”effect 作为基底读取。该 effect 刻意不依赖 searchParams，
@@ -160,24 +221,79 @@ export default function ResourcesPage() {
   const searchParamsRef = useRef(searchParams.toString());
 
   // 搜索/筛选
-  // 关键词初始值直接取自 URL，避免挂载时从空值起步造成一次防抖滞后请求。
-  const [keyword, setKeyword] = useState(() => searchParams.get('keyword') ?? '');
+  // 首屏筛选值直接从 URL 取（懒初始化只算一次），避免挂载时先从空条件起步
+  // 造成一次防抖滞后请求、或让深链里的条件短暂显示为空。
+  const [initialFilters] = useState(() => filtersFromSearchParams(searchParams));
+  const [keyword, setKeyword] = useState(initialFilters.keyword);
   // 页内输入走防抖；URL 跳转的关键词由 URL-sync effect 直接同步 debouncedKeyword，避免滞后请求。
-  const [debouncedKeyword, setDebouncedKeyword] = useState(() => searchParams.get('keyword') ?? '');
+  const [debouncedKeyword, setDebouncedKeyword] = useState(initialFilters.keyword);
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedKeyword(keyword), 300);
     return () => clearTimeout(timer);
   }, [keyword]);
-  const [resourceType, setResourceType] = useState<ResourceType | ''>('');
-  const [categoryId, setCategoryId] = useState('');
-  const [categoryScope, setCategoryScope] = useState<'root' | 'all'>('root');
-  const [acquisitionMode, setAcquisitionMode] = useState('');
-  const [sortBy, setSortBy] = useState<string>('createdAt');
-  const [sortOrder, setSortOrder] = useState<string>('desc');
+  const [resourceType, setResourceType] = useState<ResourceType | ''>(initialFilters.resourceType);
+  const [categoryId, setCategoryId] = useState(initialFilters.categoryId);
+  const [categoryScope, setCategoryScope] = useState<'root' | 'all'>(initialFilters.categoryScope);
+  const [acquisitionMode, setAcquisitionMode] = useState(initialFilters.acquisitionMode);
+  // 只看收藏：与其它筛选叠加，开启时会离开当前文件夹、跨文件夹查看收藏过的资源
+  const [favoriteOnly, setFavoriteOnly] = useState(initialFilters.favoriteOnly);
+  // 开启收藏视图时被清掉的文件夹位置：关闭时若用户没有主动换过文件夹，就还原回去。
+  const favoriteReturnRef = useRef<{ categoryId: string; categoryScope: 'root' | 'all' } | null>(
+    null,
+  );
+  const [sortBy, setSortBy] = useState<string>(initialFilters.sortBy);
+  const [sortOrder, setSortOrder] = useState<string>(initialFilters.sortOrder);
 
-  // 视图
-  const [viewMode, setViewMode] = useState<ViewMode>('grid');
-  const [mountedViewModes, setMountedViewModes] = useState<Set<ViewMode>>(() => new Set(['grid']));
+  // 更多筛选（后端已支持，但默认收起，避免筛选栏过挤）
+  const [author, setAuthor] = useState(initialFilters.author);
+  const [debouncedAuthor, setDebouncedAuthor] = useState(initialFilters.author);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedAuthor(author), 300);
+    return () => clearTimeout(timer);
+  }, [author]);
+  const [dateField, setDateField] = useState<DateField>(initialFilters.dateField);
+  const [dateFrom, setDateFrom] = useState(initialFilters.dateFrom);
+  const [dateTo, setDateTo] = useState(initialFilters.dateTo);
+  const [minSizeMb, setMinSizeMb] = useState(initialFilters.minSizeMb);
+  const [maxSizeMb, setMaxSizeMb] = useState(initialFilters.maxSizeMb);
+  const [filtersOpen, setFiltersOpen] = useState(() => hasAdvancedFiltersInUrl(searchParams));
+
+  // 所有会影响结果集的筛选集中到一处：请求参数、URL、位置记忆、全选上下文都从这里取，
+  // 新增条件时不必再逐个改 4 份重复的拼接逻辑。
+  const filterState = useMemo<ResourceFilterState>(
+    () => ({
+      keyword: debouncedKeyword,
+      resourceType,
+      categoryId,
+      categoryScope,
+      acquisitionMode,
+      favoriteOnly,
+      author: debouncedAuthor,
+      dateField,
+      dateFrom,
+      dateTo,
+      minSizeMb,
+      maxSizeMb,
+      sortBy,
+      sortOrder,
+    }),
+    [
+      debouncedKeyword,
+      resourceType,
+      categoryId,
+      categoryScope,
+      acquisitionMode,
+      favoriteOnly,
+      debouncedAuthor,
+      dateField,
+      dateFrom,
+      dateTo,
+      minSizeMb,
+      maxSizeMb,
+      sortBy,
+      sortOrder,
+    ],
+  );
 
   // 批量编辑模式：开启后点击卡片为选中而非跳转，按住拖拽可扫选多个资源
   const [selectionMode, setSelectionMode] = useState(false);
@@ -187,27 +303,34 @@ export default function ResourcesPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
-  const selectionContextKey = [
-    debouncedKeyword,
-    resourceType,
-    categoryId,
-    categoryScope,
-    acquisitionMode,
-    sortBy,
-    sortOrder,
-  ].join('|');
+  const selectionContextKey = selectionScopeKey(filterState);
   const selectionContextKeyRef = useRef(selectionContextKey);
   selectionContextKeyRef.current = selectionContextKey;
   const selectAllRequestIdRef = useRef(0);
   useEffect(() => {
-    // Invalidate an in-flight directory selection whenever the active view changes.
+    // 筛选条件变化后，旧选择可能已不可见；作废进行中的全选并清空勾选。
     selectAllRequestIdRef.current += 1;
+    setSelectedIds(new Set());
   }, [selectionContextKey]);
   const [moveDialogOpen, setMoveDialogOpen] = useState(false);
   const [moveTargetCategoryId, setMoveTargetCategoryId] = useState(NO_FOLDER_VALUE);
 
-  // 删除确认
-  const [deleteTarget, setDeleteTarget] = useState<{ type: 'single' | 'batch'; id?: string } | null>(null);
+  // 批量删除确认（单条删除直接执行，靠 toast 撤销）
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+
+  // 批量下载：边收边写盘时在右下角显示进度，可随时取消；native 模式交给浏览器下载列表。
+  // 离开本页不中断传输（与浏览器下载一致，完成后照常 toast），主动取消只走进度卡按钮
+  const [zipDownloading, setZipDownloading] = useState<{
+    loadedBytes: number;
+    totalResources: number;
+  } | null>(null);
+  const zipAbortRef = useRef<AbortController | null>(null);
+  // 批量“下载到本地”的提交进度：避免重复点击为同一批资源反复入队；
+  // 大选择集按 BATCH_MIRROR_CHUNK_SIZE 分批提交，这里记录已完成/总批次数。
+  const [batchMirroring, setBatchMirroring] = useState<{
+    completed: number;
+    total: number;
+  } | null>(null);
 
   // 下拉选项
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
@@ -220,38 +343,71 @@ export default function ResourcesPage() {
   const [folderDeleteTarget, setFolderDeleteTarget] = useState<CategoryTreeNode | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
 
-  const fetchResources = useCallback(async () => {
-    const requestId = ++requestIdRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const params: Record<string, unknown> = {
-        page,
-        pageSize,
-        sortBy,
-        sortOrder,
-      };
-      if (debouncedKeyword) params.keyword = debouncedKeyword;
-      if (resourceType) params.resourceType = resourceType;
-      if (categoryId) params.categoryId = categoryId;
-      else if (categoryScope === 'root') params.uncategorized = true;
-      if (acquisitionMode) params.acquisitionMode = acquisitionMode;
+  /**
+   * 拉取列表。
+   * silent=true 用于操作成功后的补偿刷新：保留当前列表、不切加载态。
+   * 首次加载才用整块骨架；之后（搜索/筛选/翻页）保留旧列表 + refreshing 指示，
+   * 避免每次操作都卸载 50 张卡片、把滚动位置弹回顶部。
+   */
+  const fetchResources = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent === true;
+      const requestId = ++requestIdRef.current;
+      if (!silent) {
+        if (loadedOnceRef.current) setRefreshing(true);
+        else setLoading(true);
+        setError(null);
+      }
+      try {
+        // 筛选/排序条件由 buildFilterParams 统一产生，这里只补分页
+        const params: Parameters<typeof listResources>[0] = {
+          ...buildFilterParams(filterState),
+          page,
+          pageSize,
+        };
 
-      const data = await listResources(params as Parameters<typeof listResources>[0]);
-      if (requestId !== requestIdRef.current) return; // 已被更新的请求取代，丢弃过期结果
-      setResources(data.items);
-      setTotal(data.total);
-    } catch (e) {
-      if (requestId !== requestIdRef.current) return;
-      setError(e instanceof Error ? e.message : '加载失败');
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false);
-    }
-  }, [page, pageSize, sortBy, sortOrder, debouncedKeyword, resourceType, categoryId, categoryScope, acquisitionMode]);
+        const data = await listResources(params);
+        if (requestId !== requestIdRef.current) return; // 已被更新的请求取代，丢弃过期结果
+        setResources(data.items);
+        setTotal(data.total);
+        loadedOnceRef.current = true;
+        // 位置恢复：等这一页的数据落地并渲染后再滚，避免被后续布局变化打断。
+        // 记忆键也要一致：筛选变了说明恢复目标已失效，直接丢弃，避免下次翻到同一页时误滚。
+        if (restoreRef.current.pending) {
+          const restore = restoreRef.current;
+          if (restore.key !== viewMemoryKeyRef.current) {
+            restoreRef.current.pending = false;
+          } else if (restore.page === page) {
+            restoreRef.current.pending = false;
+            window.requestAnimationFrame(() => window.scrollTo(0, restore.scrollY));
+          }
+        }
+      } catch (e) {
+        if (requestId !== requestIdRef.current) return;
+        // 静默刷新失败时保留上一份数据，不把列表替换成错误页
+        if (!silent) setError(e instanceof Error ? e.message : '加载失败');
+      } finally {
+        if (requestId === requestIdRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      }
+    },
+    [page, pageSize, filterState],
+  );
+
+  // 最近一次 fetchResources：批量任务可能持续数秒，期间用户可能翻页或改筛选。
+  // 完成后的补偿刷新必须用当前视图，而不是提交时捕获的旧闭包。
+  const fetchResourcesRef = useRef(fetchResources);
+  useEffect(() => {
+    fetchResourcesRef.current = fetchResources;
+  }, [fetchResources]);
 
   // 初始加载选项
   useEffect(() => {
-    listCategories().then((d) => setCategories(d.items)).catch(() => {});
+    listCategories()
+      .then((d) => setCategories(d.items))
+      .catch(() => {});
   }, []);
 
   // URL 是筛选状态的权威来源：?keyword=（顶栏全局搜索）、?resourceType=/?categoryId=/?scope=（仪表盘深链）。
@@ -266,34 +422,33 @@ export default function ResourcesPage() {
     // 否则前进/后退回到一个“此前曾写入过”的 URL 时，会被误判为自写而跳过应用，
     // 导致筛选状态停留在上一个视图、与 URL 不一致。
     lastSyncedSearchRef.current = null;
+    // 外部导航后不再知道用户是从哪个文件夹进入收藏视图的，丢弃待还原的位置。
+    favoriteReturnRef.current = null;
 
-    const keywordFromUrl = searchParams.get('keyword') ?? '';
-    const type = searchParams.get('resourceType');
-    const categoryIdFromUrl = searchParams.get('categoryId') ?? '';
+    // URL → 筛选状态（含 scope 推导）由 resource-filters 统一解释，
+    // 详情页的相邻导航用的也是同一份规则。
+    const filters = filtersFromSearchParams(searchParams);
+    setKeyword(filters.keyword);
+    // 关键词/作者来自 URL 跳转时立即同步防抖值，避免先发一次带旧值的请求。
+    setDebouncedKeyword(filters.keyword);
+    setDebouncedAuthor(filters.author);
+    setAuthor(filters.author);
+    setResourceType(filters.resourceType);
+    setCategoryId(filters.categoryId);
+    setCategoryScope(filters.categoryScope);
+    setAcquisitionMode(filters.acquisitionMode);
+    setFavoriteOnly(filters.favoriteOnly);
+    setSortBy(filters.sortBy);
+    setSortOrder(filters.sortOrder);
+    setDateField(filters.dateField);
+    setDateFrom(filters.dateFrom);
+    setDateTo(filters.dateTo);
+    setMinSizeMb(filters.minSizeMb);
+    setMaxSizeMb(filters.maxSizeMb);
 
-    setKeyword(keywordFromUrl);
-    // 关键词来自 URL 跳转时立即同步防抖值，避免先发一次携带旧关键词的请求。
-    setDebouncedKeyword(keywordFromUrl);
-    setResourceType(isResourceType(type) ? type : '');
-    setCategoryId(categoryIdFromUrl);
+    // 带更多筛选条件的链接进来时直接展开面板，否则条件生效了却看不见入口。
+    if (hasAdvancedFilters(filters)) setFiltersOpen(true);
 
-    // 文件夹深链 → 限定在该文件夹；scope 参数显式指定作用域（scope=root 可保留“仅根目录+关键词”的视图）；
-    // 顶栏全局搜索 / 类型深链（无 scope）→ 全库范围；否则回到根目录默认视图。
-    if (categoryIdFromUrl) {
-      setCategoryScope('root');
-    } else if (searchParams.get('scope') === 'all') {
-      setCategoryScope('all');
-    } else if (searchParams.get('scope') === 'root') {
-      setCategoryScope('root');
-    } else if (keywordFromUrl || isResourceType(type)) {
-      setCategoryScope('all');
-    } else {
-      setCategoryScope('root');
-    }
-
-    setAcquisitionMode(searchParams.get('acquisitionMode') ?? '');
-    setSortBy(parseSortField(searchParams.get('sortBy')));
-    setSortOrder(parseSortOrder(searchParams.get('sortOrder')));
     setUrlParamsApplied(true);
   }, [searchParams]);
 
@@ -306,29 +461,7 @@ export default function ResourcesPage() {
     if (!urlParamsApplied) return;
 
     const params = new URLSearchParams(searchParamsRef.current);
-    if (debouncedKeyword) params.set('keyword', debouncedKeyword);
-    else params.delete('keyword');
-    if (resourceType) params.set('resourceType', resourceType);
-    else params.delete('resourceType');
-    if (categoryId) params.set('categoryId', categoryId);
-    else params.delete('categoryId');
-    if (categoryScope === 'all') {
-      params.set('scope', 'all');
-    } else if (categoryScope === 'root' && !categoryId && (debouncedKeyword || resourceType)) {
-      // 关键词/类型在 URL 读取时会被推断为全库范围，需显式 scope=root 保持“仅根目录”语义。
-      params.set('scope', 'root');
-    } else {
-      params.delete('scope');
-    }
-    if (acquisitionMode) params.set('acquisitionMode', acquisitionMode);
-    else params.delete('acquisitionMode');
-    if (sortBy !== 'createdAt' || sortOrder !== 'desc') {
-      params.set('sortBy', sortBy);
-      params.set('sortOrder', sortOrder);
-    } else {
-      params.delete('sortBy');
-      params.delete('sortOrder');
-    }
+    writeFilterParams(params, filterState);
     // 分页仍是本地状态，不从 URL 读取，同步时移除 page 参数避免链接里的页码与实际结果不一致。
     params.delete('page');
 
@@ -337,31 +470,12 @@ export default function ResourcesPage() {
       lastSyncedSearchRef.current = next;
       router.replace(next ? `?${next}` : pathname, { scroll: false });
     }
-  }, [
-    urlParamsApplied,
-    debouncedKeyword,
-    resourceType,
-    categoryId,
-    categoryScope,
-    acquisitionMode,
-    sortBy,
-    sortOrder,
-    router,
-    pathname,
-  ]);
+  }, [urlParamsApplied, filterState, router, pathname]);
 
   // 上一次触发获取的筛选签名：用于区分“筛选变化”（需重置页码）与“页码变化”（直接获取）。
   const prevFiltersKeyRef = useRef('');
   // 筛选/排序签名：任一变化都会让 key 变化，从而触发重新获取。
-  const filtersKey = [
-    debouncedKeyword,
-    resourceType,
-    categoryId,
-    categoryScope,
-    acquisitionMode,
-    sortBy,
-    sortOrder,
-  ].join('|');
+  const filtersKey = filterSignature(filterState);
 
   // 首次获取等 URL 参数应用后再请求。筛选变化时先重置页码到第 1 页再获取，
   // 避免先按旧页码发一次请求；页码单独变化时直接获取。
@@ -376,6 +490,95 @@ export default function ResourcesPage() {
     }
     fetchResources();
   }, [fetchResources, filtersKey, page, urlParamsApplied]);
+
+  // 位置记忆的键：规范化后的筛选签名 + 每页条数（页码单独存，不参与键）。
+  // 不能直接用 searchParams：同一组条件可能写作 ?resourceType=image，也可能写作
+  // ?resourceType=image&scope=all；首帧 URL 尚未规范化时键不一致，会让一次性的
+  // 恢复机会被白白用掉，页码与滚动位置都恢复不了。
+  const viewMemoryKey = `${filtersKey}|${pageSize}`;
+  // 渲染期同步到 ref：滚动/页码回调读最新键，避免键变化重建 effect 导致误写
+  const viewMemoryKeyRef = useRef(viewMemoryKey);
+  viewMemoryKeyRef.current = viewMemoryKey;
+
+  // 滚动时记录位置（按帧节流 + 最小写入间隔）；离开页面时兜底保存
+  useEffect(() => {
+    let frame = 0;
+    let lastWrite = 0;
+    const now = () => window.performance?.now() ?? Date.now();
+    const save = () => {
+      writeViewMemory({
+        query: viewMemoryKeyRef.current,
+        page,
+        scrollY: window.scrollY,
+      });
+    };
+    const onScroll = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        if (now() - lastWrite < 150) return;
+        lastWrite = now();
+        save();
+      });
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      if (frame) window.cancelAnimationFrame(frame);
+      save();
+    };
+  }, [page]);
+
+  // 页码变化（非首屏）时记下当前页：避免“翻页后立刻点开详情”被记成上一页。
+  // 首屏不写，否则会覆盖掉待恢复的位置。
+  const savedPageRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (savedPageRef.current === null || savedPageRef.current === page) {
+      savedPageRef.current = page;
+      return;
+    }
+    savedPageRef.current = page;
+    // 正在等待位置恢复时不要用当前（顶部）位置覆盖记忆，否则慢网下会把原位置冲掉
+    if (restoreRef.current.pending) return;
+    writeViewMemory({ query: viewMemoryKeyRef.current, page, scrollY: window.scrollY });
+  }, [page]);
+
+  // 首次进入：同一筛选条件下恢复上次的页码与滚动位置（只在挂载后执行一次）
+  const restoreTriedRef = useRef(false);
+  useEffect(() => {
+    if (!urlParamsApplied || restoreTriedRef.current) return;
+    restoreTriedRef.current = true;
+    const memory = readViewMemory();
+    if (!memory || memory.query !== viewMemoryKey) return;
+    restoreRef.current = {
+      pending: true,
+      page: memory.page,
+      scrollY: memory.scrollY,
+      key: memory.query,
+    };
+    if (memory.page !== page) setPage(memory.page);
+  }, [urlParamsApplied, viewMemoryKey, page]);
+
+  // 翻页或切换筛选后滚到列表顶部，而不是被加载态带回整页顶部
+  const prevListKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = `${filtersKey}|${page}`;
+    if (prevListKeyRef.current === null) {
+      prevListKeyRef.current = key;
+      return;
+    }
+    if (prevListKeyRef.current === key) return;
+    prevListKeyRef.current = key;
+    // 注意：这里不因“位置恢复待执行”而跳过——恢复要在数据回来后才能滚动，
+    // 若在此return，一旦恢复目标失效（如随后切换筛选），pending 会永久为真并吞掉后续所有滚动定位。
+    // 平滑滚动即便先发生，也会被后面的恢复 scrollTo 立即打断，最终落点仍然是恢复位置。
+    const anchor = listAnchorRef.current;
+    if (!anchor) return;
+    window.scrollTo({
+      top: anchor.getBoundingClientRect().top + window.scrollY - 72,
+      behavior: 'smooth',
+    });
+  }, [filtersKey, page]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const paginationItems = useMemo<PaginationItem[]>(() => {
@@ -395,9 +598,12 @@ export default function ResourcesPage() {
     setPageInput(String(page));
   }, [page]);
 
-  const goToPage = useCallback((value: number) => {
-    setPage(Math.min(Math.max(1, value), totalPages));
-  }, [totalPages]);
+  const goToPage = useCallback(
+    (value: number) => {
+      setPage(Math.min(Math.max(1, value), totalPages));
+    },
+    [totalPages],
+  );
 
   const handlePageJump = useCallback(() => {
     const target = Number(pageInput);
@@ -421,10 +627,12 @@ export default function ResourcesPage() {
   // 回退到末页，否则会停留在空页且分页栏（totalPages > 1）消失，用户无法返回。
   useEffect(() => {
     if (!urlParamsApplied) return;
-    if (page > 1 && page > totalPages) {
+    // total 为 0 时说明数据还没回来（例如恢复页码后首次请求在途），此时不能按末页夹取，
+    // 否则会把刚恢复的页码打回第 1 页
+    if (page > 1 && total > 0 && page > totalPages) {
       setPage(Math.max(1, totalPages));
     }
-  }, [page, totalPages, urlParamsApplied]);
+  }, [page, totalPages, total, urlParamsApplied]);
   const flatCategories = useMemo(() => flattenCategories(categories), [categories]);
   const currentCategory = useMemo(
     () => (categoryId ? findCategory(categories, categoryId) : null),
@@ -435,54 +643,103 @@ export default function ResourcesPage() {
     [categories, categoryId],
   );
   const visibleFolders = currentCategory?.children ?? categories;
-  const hasActiveFilters = !!(debouncedKeyword || resourceType || categoryId || acquisitionMode);
+  const hasActiveFilters = !!(
+    filterState.keyword ||
+    filterState.resourceType ||
+    filterState.categoryId ||
+    filterState.acquisitionMode ||
+    filterState.favoriteOnly ||
+    filterState.author ||
+    filterState.dateFrom ||
+    filterState.dateTo ||
+    filterState.minSizeMb ||
+    filterState.maxSizeMb
+  );
+  // “更多筛选”面板里的条件条目数（日期/大小各算一条，便于收起时提示还有几项生效）
+  const advancedFilterCount =
+    (filterState.author ? 1 : 0) +
+    (filterState.dateFrom || filterState.dateTo ? 1 : 0) +
+    (filterState.minSizeMb || filterState.maxSizeMb ? 1 : 0);
+  // “只看收藏”且没有其他条件：空列表说明还没收藏过，提示引导收藏而不是让用户改搜索词
+  const favoriteOnlyView =
+    filterState.favoriteOnly &&
+    filterState.categoryScope === 'all' &&
+    !filterState.keyword &&
+    !filterState.resourceType &&
+    !filterState.categoryId &&
+    !filterState.acquisitionMode &&
+    advancedFilterCount === 0;
 
-  // 详情页相邻导航的筛选/排序上下文：镜像下方 URL-sync 的序列化规则，
-  // 使详情页 URL 查询串与当前视图（关键字/类型/分类/来源/排序）一致，左右箭头在相同视图内切换。
-  // 默认根目录视图（scope 隐含）不产生任何参数，详情页按同样规则回退为根目录。
+  // 详情页相邻导航的筛选/排序上下文：与下方 URL-sync 共用同一套序列化规则，
+  // 使详情页 URL 查询串与当前视图（关键字/类型/分类/来源/更多筛选/排序）一致，
+  // 左右箭头在相同视图内切换。默认根目录视图（scope 隐含）不产生任何参数，
+  // 详情页按同样规则回退为根目录。
   const contextQuery = useMemo(() => {
     const params = new URLSearchParams();
-    if (debouncedKeyword) params.set('keyword', debouncedKeyword);
-    if (resourceType) params.set('resourceType', resourceType);
-    if (categoryId) {
-      params.set('categoryId', categoryId);
-    } else if (categoryScope === 'all') {
-      params.set('scope', 'all');
-    } else if (categoryScope === 'root' && (debouncedKeyword || resourceType)) {
-      params.set('scope', 'root');
-    }
-    if (acquisitionMode) params.set('acquisitionMode', acquisitionMode);
-    if (sortBy !== 'createdAt' || sortOrder !== 'desc') {
-      params.set('sortBy', sortBy);
-      params.set('sortOrder', sortOrder);
-    }
+    writeFilterParams(params, filterState);
     return params.toString();
-  }, [debouncedKeyword, resourceType, categoryId, categoryScope, acquisitionMode, sortBy, sortOrder]);
+  }, [filterState]);
 
   // 删除操作
-  const handleSingleDelete = useCallback((id: string) => {
-    setDeleteTarget({ type: 'single', id });
-  }, []);
+  /** 删除后的「撤销」：批量恢复并静默刷新，列表不重建，滚动位置不变 */
+  const handleUndoDelete = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      try {
+        await Promise.all(ids.map((id) => restoreResource(id)));
+        toast.success(ids.length > 1 ? `已恢复 ${ids.length} 个资源` : '已恢复资源');
+        await fetchResources({ silent: true });
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : '撤销失败，请到回收站手动恢复');
+      }
+    },
+    [fetchResources],
+  );
+
+  // 单条删除：不再二次确认，直接删除并给出可撤销的提示
+  const deletingIdsRef = useRef<Set<string>>(new Set());
+  const handleSingleDelete = useCallback(
+    async (id: string) => {
+      // 防抖：连点同一个垃圾桶时不重复发请求
+      if (deletingIdsRef.current.has(id)) return;
+      deletingIdsRef.current.add(id);
+      try {
+        await softDeleteResource(id);
+        toast.success('已移到回收站', {
+          action: { label: '撤销', onClick: () => void handleUndoDelete([id]) },
+        });
+        setSelectedIds((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        // 先本地移除再静默刷新：列表不卸载，滚动位置保持
+        setResources((prev) => prev.filter((item) => item.id !== id));
+        setTotal((prev) => Math.max(0, prev - 1));
+        // 当前页只剩这一条且不在第一页时回退一页，避免停在空列表
+        if (page > 1 && resources.length === 1) setPage(page - 1);
+        await fetchResources({ silent: true });
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : '删除失败');
+      } finally {
+        deletingIdsRef.current.delete(id);
+      }
+    },
+    [fetchResources, handleUndoDelete, page, resources.length],
+  );
 
   const handleBatchDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
-    setDeleteTarget({ type: 'batch' });
+    setBatchDeleteOpen(true);
   }, [selectedIds.size]);
 
-  const handleViewModeChange = useCallback((value: string) => {
-    const nextViewMode = value as ViewMode;
-    setViewMode(nextViewMode);
-    setMountedViewModes((prev) => {
-      if (prev.has(nextViewMode)) return prev;
-      const next = new Set(prev);
-      next.add(nextViewMode);
-      return next;
-    });
-  }, []);
-
-  const navigateToResource = useCallback((id: string) => {
-    router.push(`/resources/${id}${contextQuery ? `?${contextQuery}` : ''}`);
-  }, [router, contextQuery]);
+  const navigateToResource = useCallback(
+    (id: string) => {
+      router.push(`/resources/${id}${contextQuery ? `?${contextQuery}` : ''}`);
+    },
+    [router, contextQuery],
+  );
 
   const resourceKeyExtractor = useCallback((r: ResourceListItem) => r.id, []);
 
@@ -506,14 +763,28 @@ export default function ResourcesPage() {
   // 卡片交互，避免点击图片跳转详情或触发浏览器原生图片拖拽。
   const isSelectionActive = selectionMode || selectedIds.size > 0;
 
-  const handleRowClick = useCallback((resource: ResourceListItem) => {
-    // 批量编辑模式下点击行是选中/取消选中，而不是打开详情
-    if (isSelectionActive) {
-      toggleSelection(resource.id);
-      return;
-    }
-    navigateToResource(resource.id);
-  }, [isSelectionActive, navigateToResource, toggleSelection]);
+  // 当前页已选资源：用于判断“下载到本地”是否有意义。
+  // 选择可能来自“全选当前目录”而跨页；不在当前页的 ID 无法判断类型，此时保守显示。
+  const selectedResourcesOnPage = useMemo(
+    () => resources.filter((resource) => selectedIds.has(resource.id)),
+    [resources, selectedIds],
+  );
+  const showBatchMirror =
+    selectedIds.size === 0 ||
+    selectedResourcesOnPage.some((resource) => resource.acquisitionMode !== 'local_upload') ||
+    selectedIds.size > selectedResourcesOnPage.length;
+
+  const handleRowClick = useCallback(
+    (resource: ResourceListItem) => {
+      // 批量编辑模式下点击行是选中/取消选中，而不是打开详情
+      if (isSelectionActive) {
+        toggleSelection(resource.id);
+        return;
+      }
+      navigateToResource(resource.id);
+    },
+    [isSelectionActive, navigateToResource, toggleSelection],
+  );
 
   const handleSortChange = useCallback((value: string) => {
     const [field, order] = value.split(':');
@@ -526,6 +797,8 @@ export default function ResourcesPage() {
   }, []);
 
   const handleCategoryChange = useCallback((value: string) => {
+    // 用户显式选了分类：以当前选择为准，退出收藏视图时不要再还原到进入前的文件夹。
+    favoriteReturnRef.current = null;
     if (value === ALL_CATEGORIES_VALUE) {
       setCategoryId('');
       setCategoryScope('all');
@@ -538,6 +811,37 @@ export default function ResourcesPage() {
     }
     setCategoryId(value);
     setCategoryScope('root');
+  }, []);
+
+  const toggleFavoriteOnly = useCallback(() => {
+    if (favoriteOnly) {
+      setFavoriteOnly(false);
+      // 退出收藏视图时还原进入前的文件夹；期间用户若自己换过文件夹（categoryId 不再为空），
+      // 或主动选了根目录，就以当前选择为准，不覆盖。
+      const saved = favoriteReturnRef.current;
+      favoriteReturnRef.current = null;
+      if (saved && !categoryId && categoryScope === 'all') {
+        setCategoryId(saved.categoryId);
+        setCategoryScope(saved.categoryScope);
+      }
+      return;
+    }
+    // 收藏是跨文件夹的视角：开启时必须连 categoryId 一起清掉。
+    // 只切 scope=all 不够——buildFilterParams 在 categoryId 非空时优先发 categoryId，
+    // 请求会同时带 categoryId 与 isFavorite=true，只能看到当前文件夹里的收藏。
+    favoriteReturnRef.current = { categoryId, categoryScope };
+    setFavoriteOnly(true);
+    setCategoryId('');
+    setCategoryScope('all');
+  }, [favoriteOnly, categoryId, categoryScope]);
+
+  const clearAdvancedFilters = useCallback(() => {
+    setAuthor('');
+    setDebouncedAuthor('');
+    setDateFrom('');
+    setDateTo('');
+    setMinSizeMb('');
+    setMaxSizeMb('');
   }, []);
 
   const clearSelection = useCallback(() => {
@@ -565,67 +869,33 @@ export default function ResourcesPage() {
     const requestContextKey = selectionContextKey;
     setSelectingAllDirectory(true);
     try {
-      const pageSizeForSelection = 100;
-      const allIds: string[] = [];
-      let selectionPage = 1;
-      let totalForSelection = 0;
+      // 服务端用同一套筛选条件一次返回全部 ID：以前要按 pageSize 上限逐页拉，
+      // 几千个资源时得发几十次请求、按钮一直转圈。
+      const { ids } = await listResourceIds(buildFilterParams(filterState));
 
-      // The API caps pageSize at 100, so walk every page in the current directory.
-      do {
-        const params: Record<string, unknown> = {
-          page: selectionPage,
-          pageSize: pageSizeForSelection,
-          sortBy,
-          sortOrder,
-        };
-        if (debouncedKeyword) params.keyword = debouncedKeyword;
-        if (resourceType) params.resourceType = resourceType;
-        if (categoryId) params.categoryId = categoryId;
-        else if (categoryScope === 'root') params.uncategorized = true;
-        if (acquisitionMode) params.acquisitionMode = acquisitionMode;
-
-        const data = await listResources(params as Parameters<typeof listResources>[0]);
-        allIds.push(...data.items.map((resource) => resource.id));
-        totalForSelection = data.total;
-        selectionPage += 1;
-        // Stop if the directory changed while pages were being fetched.
-        if (data.items.length === 0) break;
-      } while (allIds.length < totalForSelection);
-
-      // Do not commit a partial or stale result after the view changed during the request.
+      // 视图在请求期间变过就丢弃结果，避免把旧目录的选择集套到新视图上。
       if (
         requestId !== selectAllRequestIdRef.current ||
-        requestContextKey !== selectionContextKeyRef.current ||
-        (totalForSelection > 0 && allIds.length < totalForSelection)
+        requestContextKey !== selectionContextKeyRef.current
       ) {
-        if (requestContextKey === selectionContextKeyRef.current && totalForSelection > 0 && allIds.length < totalForSelection) {
-          toast.error('目录内容已变化，请重试全选');
-        }
         return;
       }
 
       const currentSelectedIds = selectedIdsRef.current;
-      const allSelected = allIds.length > 0 && allIds.every((id) => currentSelectedIds.has(id));
-      setSelectedIds(allSelected ? new Set() : new Set(allIds));
+      const allSelected = ids.length > 0 && ids.every((id) => currentSelectedIds.has(id));
+      setSelectedIds(allSelected ? new Set() : new Set(ids));
     } catch (e) {
-      if (requestId !== selectAllRequestIdRef.current || requestContextKey !== selectionContextKeyRef.current) {
+      if (
+        requestId !== selectAllRequestIdRef.current ||
+        requestContextKey !== selectionContextKeyRef.current
+      ) {
         return;
       }
       toast.error(e instanceof Error ? e.message : '全选当前目录失败');
     } finally {
       setSelectingAllDirectory(false);
     }
-  }, [
-    selectingAllDirectory,
-    sortBy,
-    sortOrder,
-    debouncedKeyword,
-    resourceType,
-    categoryId,
-    categoryScope,
-    acquisitionMode,
-    selectionContextKey,
-  ]);
+  }, [selectingAllDirectory, filterState, selectionContextKey]);
 
   const openMoveResources = useCallback(() => {
     // 默认目标要安全，避免误点“移动”把所选资源移出原分类：
@@ -645,8 +915,7 @@ export default function ResourcesPage() {
       const selectionCategoryId = selectedResources[0].categoryId;
       // 仅当该分类仍存在时才预设，避免资源数据滞后时指向已删除的文件夹
       const categoryStillExists =
-        selectionCategoryId === null ||
-        flatCategories.some((c) => c.id === selectionCategoryId);
+        selectionCategoryId === null || flatCategories.some((c) => c.id === selectionCategoryId);
       defaultTarget = categoryStillExists ? (selectionCategoryId ?? NO_FOLDER_VALUE) : categoryId;
     } else {
       defaultTarget = categoryId;
@@ -656,13 +925,16 @@ export default function ResourcesPage() {
     setMoveDialogOpen(true);
   }, [resources, selectedIds, categoryId, flatCategories]);
 
-  const openCreateFolder = useCallback((parentId?: string | null) => {
-    const parent = parentId === undefined ? (currentCategory?.id ?? null) : parentId;
-    setEditingFolder(null);
-    setFolderName('');
-    setFolderParentId(parent);
-    setFolderDialogOpen(true);
-  }, [currentCategory]);
+  const openCreateFolder = useCallback(
+    (parentId?: string | null) => {
+      const parent = parentId === undefined ? (currentCategory?.id ?? null) : parentId;
+      setEditingFolder(null);
+      setFolderName('');
+      setFolderParentId(parent);
+      setFolderDialogOpen(true);
+    },
+    [currentCategory],
+  );
 
   const openEditFolder = useCallback((folder: CategoryTreeNode) => {
     setEditingFolder(folder);
@@ -677,8 +949,16 @@ export default function ResourcesPage() {
     return data.items;
   }, []);
 
-  const moveResourcesToCategory = async (ids: string[], targetCategoryId: string): Promise<boolean> => {
-    let result: { resourceIds: string[]; categoryId: string | null; updated: number; failed: number };
+  const moveResourcesToCategory = async (
+    ids: string[],
+    targetCategoryId: string,
+  ): Promise<boolean> => {
+    let result: {
+      resourceIds: string[];
+      categoryId: string | null;
+      updated: number;
+      failed: number;
+    };
     try {
       result = await batchSetResourceCategory(ids, targetCategoryId || null);
     } catch (e) {
@@ -699,7 +979,8 @@ export default function ResourcesPage() {
     setSelectedIds(new Set());
     // 移动已成功，刷新列表/文件夹树属于尽力而为的后置刷新；刷新失败不应让移动看起来失败
     await reloadCategories().catch(() => {});
-    await fetchResources().catch(() => {});
+    // 静默刷新：移动后列表就地更新，不打断当前滚动位置
+    await fetchResources({ silent: true }).catch(() => {});
     return true;
   };
 
@@ -739,7 +1020,10 @@ export default function ResourcesPage() {
     try {
       await deleteCategory(folderDeleteTarget.id);
       toast.success(`已删除文件夹 "${folderDeleteTarget.name}"`);
-      if (categoryId === folderDeleteTarget.id || getCategoryPath([folderDeleteTarget], categoryId).length > 0) {
+      if (
+        categoryId === folderDeleteTarget.id ||
+        getCategoryPath([folderDeleteTarget], categoryId).length > 0
+      ) {
         setCategoryId(folderDeleteTarget.parentId ?? '');
         setCategoryScope('root');
       }
@@ -769,12 +1053,14 @@ export default function ResourcesPage() {
     try {
       const result = await batchSetResourceFavorite(ids, isFavorite);
       if (result.failed > 0) {
-        toast.success(`${isFavorite ? '已收藏' : '已取消收藏'} ${result.updated} 个资源，${result.failed} 个失败`);
+        toast.success(
+          `${isFavorite ? '已收藏' : '已取消收藏'} ${result.updated} 个资源，${result.failed} 个失败`,
+        );
       } else {
         toast.success(`${isFavorite ? '已收藏' : '已取消收藏'} ${result.updated} 个资源`);
       }
       setSelectedIds(new Set());
-      await fetchResources();
+      await fetchResources({ silent: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '批量收藏操作失败');
     }
@@ -782,22 +1068,132 @@ export default function ResourcesPage() {
 
   const handleBatchDownload = async () => {
     const ids = Array.from(selectedIds);
-    if (ids.length === 0) return;
+    // 同一时间只跑一次：重复点击会弹第二个保存对话框，两个流抢同一批资源
+    if (ids.length === 0 || zipAbortRef.current) return;
+
+    const controller = new AbortController();
+    zipAbortRef.current = controller;
+    // 只有流式写盘才有进度可看；原生下载一提交就交给浏览器，不显示进度
+    if (canStreamZipToDisk()) setZipDownloading({ loadedBytes: 0, totalResources: ids.length });
+
+    let lastProgressAt = 0;
+    try {
+      const result = await downloadResourcesZip(ids, {
+        filename: `resources-${new Date().toISOString().slice(0, 10)}.zip`,
+        signal: controller.signal,
+        // 分片很小且很多，节流到 200ms 一次，避免每块都触发整页重渲染
+        onProgress: ({ loadedBytes }) => {
+          const now = Date.now();
+          if (now - lastProgressAt < 200) return;
+          lastProgressAt = now;
+          setZipDownloading((prev) => (prev ? { ...prev, loadedBytes } : prev));
+        },
+      });
+
+      if (result.mode === 'cancelled') {
+        toast.info('已取消下载');
+        return;
+      }
+      if (result.mode === 'browser') {
+        // 原生下载读不到响应头，数量未知；进度与取消在浏览器的下载列表里
+        toast.success(`已开始打包 ${ids.length} 个资源`, {
+          description: '进度与取消请见浏览器下载列表；若始终没有开始，说明所选资源都没有本地原文件',
+        });
+        return;
+      }
+
+      if (result.missingResources === null) {
+        // 响应头被代理剥离时数量未知；压缩包里的跳过清单仍然可信
+        toast.success('打包完成', {
+          description:
+            '未能从响应头读取跳过数量；若需确认被跳过的资源，请查看压缩包内 _skipped-resources.txt（若有）',
+        });
+      } else if (result.missingResources > 0) {
+        toast.warning(
+          `已打包 ${result.foundResources} 个资源，${result.missingResources} 个已跳过`,
+          {
+            description:
+              '链接资源、仅元数据资源没有本地原文件，需先下载到本地；跳过清单见压缩包内 _skipped-resources.txt',
+          },
+        );
+      } else {
+        toast.success(`已下载 ${result.foundResources} 个资源`);
+      }
+    } catch (e) {
+      if (controller.signal.aborted) {
+        toast.info('已取消下载');
+        return;
+      }
+      toast.error(e instanceof Error ? e.message : '批量下载失败');
+    } finally {
+      zipAbortRef.current = null;
+      setZipDownloading(null);
+    }
+  };
+
+  const handleCancelZipDownload = () => {
+    zipAbortRef.current?.abort();
+  };
+
+  /**
+   * 批量下载到本地：为选中的远程资源逐个创建 download_file 任务。
+   * 大选择集按分片提交，避免单个请求长时间占用连接；分片失败时保留已入队数量。
+   */
+  const handleBatchMirror = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0 || batchMirroring) return;
+
+    const chunks = chunkIds(ids, BATCH_MIRROR_CHUNK_SIZE);
+    setBatchMirroring({ completed: 0, total: chunks.length });
+
+    let queued = 0;
+    let skipped = 0;
+    const skippedResources: Array<{
+      id: string;
+      reason: BatchMirrorSkipReason;
+      message: string;
+    }> = [];
 
     try {
-      const blob = await downloadResourcesZip(ids);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `resources-${new Date().toISOString().slice(0, 10)}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      toast.success(`已开始下载 ${ids.length} 个资源`);
+      for (let i = 0; i < chunks.length; i += 1) {
+        const result = await batchMirrorResources(chunks[i]);
+        queued += result.queued;
+        skipped += result.skipped;
+        skippedResources.push(...result.skippedResources);
+        setBatchMirroring({ completed: i + 1, total: chunks.length });
+      }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : '批量下载失败');
+      const message = e instanceof Error ? e.message : '提交本地下载任务失败';
+      // 分批提交时前面的批次可能已经入队：明确告知已成功的数量，避免用户误以为全部失败
+      toast.error(
+        queued > 0 ? `已加入下载队列 ${queued} 个资源，后续批次提交失败` : '提交本地下载任务失败',
+        {
+          description: `${
+            skipped > 0 ? `${message}；已跳过 ${skipped} 个资源` : message
+          }；任务状态可在任务页查看`,
+        },
+      );
+      // 已成功的批次仍要反映到列表上（用最新视图，避免覆盖用户已切换的页码/筛选）
+      await fetchResourcesRef.current({ silent: true });
+      return;
+    } finally {
+      setBatchMirroring(null);
     }
+
+    const skipSummary = describeBatchMirrorSkips(skippedResources);
+    if (queued === 0) {
+      toast.warning('没有资源加入下载队列', {
+        description: skipSummary || undefined,
+      });
+    } else if (skipped > 0) {
+      toast.success(`已加入下载队列 ${queued} 个资源，${skipped} 个被跳过`, {
+        description: skipSummary,
+      });
+    } else {
+      toast.success(`已加入下载队列 ${queued} 个资源`);
+    }
+    // 下载任务异步执行：刷新列表，让已经完成/失败的状态尽快反映出来
+    await fetchResourcesRef.current({ silent: true });
   };
 
   const readDragPayload = (event: React.DragEvent): DragPayload | null => {
@@ -815,13 +1211,19 @@ export default function ResourcesPage() {
     return null;
   };
 
-  const handleResourceDragStart = useCallback((resource: ResourceListItem, event: React.DragEvent) => {
-    const ids = selectedIds.has(resource.id) ? Array.from(selectedIds) : [resource.id];
-    const payload: DragPayload = { type: 'resources', ids };
-    event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData(DRAG_DATA_TYPE, JSON.stringify(payload));
-    event.dataTransfer.setData('text/plain', ids.length === 1 ? resource.title || resource.originalFilename : `${ids.length} 个资源`);
-  }, [selectedIds]);
+  const handleResourceDragStart = useCallback(
+    (resource: ResourceListItem, event: React.DragEvent) => {
+      const ids = selectedIds.has(resource.id) ? Array.from(selectedIds) : [resource.id];
+      const payload: DragPayload = { type: 'resources', ids };
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData(DRAG_DATA_TYPE, JSON.stringify(payload));
+      event.dataTransfer.setData(
+        'text/plain',
+        ids.length === 1 ? resource.title || resource.originalFilename : `${ids.length} 个资源`,
+      );
+    },
+    [selectedIds],
+  );
 
   const handleFolderDragStart = (folder: CategoryTreeNode, event: React.DragEvent) => {
     const payload: DragPayload = { type: 'folder', id: folder.id };
@@ -861,118 +1263,144 @@ export default function ResourcesPage() {
 
   const isUnavailableFolderParent = (category: CategoryTreeNode) => {
     if (!editingFolder) return false;
-    return category.id === editingFolder.id || containsCategory(editingFolder.children, category.id);
+    return (
+      category.id === editingFolder.id || containsCategory(editingFolder.children, category.id)
+    );
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget) return;
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) {
+      setBatchDeleteOpen(false);
+      return;
+    }
     try {
-      if (deleteTarget.type === 'single' && deleteTarget.id) {
-        await softDeleteResource(deleteTarget.id);
-        toast.success('已移到回收站');
-        setSelectedIds((prev) => {
-          const next = new Set(prev);
-          next.delete(deleteTarget.id!);
-          return next;
+      const result = await batchDeleteResources(ids);
+      if (result.deleted > 0 && result.failed === 0) {
+        toast.success(`已将 ${result.deleted} 个资源移到回收站`, {
+          action: { label: '撤销', onClick: () => void handleUndoDelete(ids) },
         });
+      } else if (result.deleted > 0 && result.failed > 0) {
+        // 部分失败时无法确定具体是哪几条，交给下面的静默刷新对齐
+        toast.success(`已将 ${result.deleted} 个资源移到回收站，${result.failed} 个失败`);
       } else {
-        const ids = Array.from(selectedIds);
-        const result = await batchDeleteResources(ids);
-        if (result.deleted > 0 && result.failed === 0) {
-          toast.success(`已将 ${result.deleted} 个资源移到回收站`);
-        } else if (result.deleted > 0 && result.failed > 0) {
-          toast.success(`已将 ${result.deleted} 个资源移到回收站，${result.failed} 个失败`);
-        } else {
-          toast.error(`删除失败，${result.failed} 个资源未能删除`);
-        }
-        setSelectedIds(new Set());
+        toast.error(`删除失败，${result.failed} 个资源未能删除`);
       }
-      await fetchResources();
+      setSelectedIds(new Set());
+
+      // 全部成功时先本地移除，列表不卸载 → 滚动位置保持
+      if (result.deleted > 0 && result.failed === 0) {
+        const removed = new Set(ids);
+        setResources((prev) => prev.filter((item) => !removed.has(item.id)));
+        setTotal((prev) => Math.max(0, prev - removed.size));
+        if (page > 1 && resources.every((item) => removed.has(item.id))) {
+          setPage(page - 1);
+        }
+      }
+      await fetchResources({ silent: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '删除失败');
     } finally {
-      setDeleteTarget(null);
+      setBatchDeleteOpen(false);
     }
   };
 
-  const columns: Column<ResourceListItem>[] = useMemo(() => [
-    {
-      key: 'title',
-      header: '资源名称',
-      render: (r) => (
-        <div className="flex items-center gap-2">
-          {r.acquisitionMode === 'link_only' ? (
-            <ExternalLink className="h-5 w-5 text-primary" />
-          ) : r.acquisitionMode === 'metadata_only' ? (
-            <Globe className="h-5 w-5 text-blue-500" />
+  const columns: Column<ResourceListItem>[] = useMemo(
+    () => [
+      {
+        key: 'title',
+        header: '资源名称',
+        render: (r) => (
+          <div className="flex items-center gap-2">
+            {r.acquisitionMode === 'link_only' ? (
+              <ExternalLink className="h-5 w-5 text-primary" />
+            ) : r.acquisitionMode === 'metadata_only' ? (
+              <Globe className="h-5 w-5 text-blue-500" />
+            ) : (
+              <ResourcePreview resource={r} variant="compact" className="h-9 w-12" />
+            )}
+            {/* 点击行为统一交给行级 onRowClick，避免 columns 依赖 isSelectionActive 而整表重建 */}
+            <span className="font-medium">{r.title || r.originalFilename}</span>
+          </div>
+        ),
+      },
+      {
+        key: 'isFavorite',
+        header: '收藏',
+        className: 'w-14 text-center',
+        render: (r) =>
+          r.isFavorite ? (
+            <Heart className="mx-auto h-4 w-4 fill-rose-500 text-rose-500" aria-label="已收藏" />
           ) : (
-            <ResourceTypeIcon type={r.resourceType} className="h-5 w-5 text-muted-foreground" />
-          )}
+            <span className="text-muted-foreground">—</span>
+          ),
+      },
+      {
+        key: 'resourceType',
+        header: '类型',
+        className: 'w-24',
+        render: (r) => <ResourceTypeBadge type={r.resourceType} />,
+      },
+      {
+        key: 'sizeBytes',
+        header: '大小',
+        className: 'w-24 text-right',
+        render: (r) => (
           <span
-            className="cursor-pointer font-medium hover:text-primary"
-            onClick={(event) => {
-              event.stopPropagation();
-              if (isSelectionActive) {
-                toggleSelection(r.id);
-              } else {
-                navigateToResource(r.id);
-              }
-            }}
+            className={r.downloadError ? 'text-destructive' : 'text-muted-foreground'}
+            title={
+              r.downloadError ??
+              (r.acquisitionMode === 'metadata_only' ? '尚未下载到本地' : undefined)
+            }
           >
-            {r.title || r.originalFilename}
+            {r.acquisitionMode === 'link_only'
+              ? '链接'
+              : r.acquisitionMode === 'metadata_only'
+                ? r.downloadError
+                  ? '下载失败'
+                  : '待下载'
+                : formatByteString(r.sizeBytes)}
           </span>
-        </div>
-      ),
-    },
-    {
-      key: 'resourceType',
-      header: '类型',
-      className: 'w-24',
-      render: (r) => <ResourceTypeBadge type={r.resourceType} />,
-    },
-    {
-      key: 'sizeBytes',
-      header: '大小',
-      className: 'w-24 text-right',
-      render: (r) => (
-        <span
-          className={r.downloadError ? 'text-destructive' : 'text-muted-foreground'}
-          title={
-            r.downloadError ??
-            (r.acquisitionMode === 'metadata_only' ? '尚未下载到本地' : undefined)
-          }
-        >
-          {r.acquisitionMode === 'link_only'
-            ? '链接'
-            : r.acquisitionMode === 'metadata_only'
-              ? r.downloadError
-                ? '下载失败'
-                : '待下载'
-              : formatByteString(r.sizeBytes)}
-        </span>
-      ),
-    },
-    {
-      key: 'createdAt',
-      header: '上传日期',
-      className: 'w-28',
-      render: (r) => <span className="text-muted-foreground">{formatDate(r.createdAt)}</span>,
-    },
-  ], [isSelectionActive, navigateToResource, toggleSelection]);
+        ),
+      },
+      {
+        key: 'createdAt',
+        header: '上传日期',
+        className: 'w-28',
+        render: (r) => <span className="text-muted-foreground">{formatDate(r.createdAt)}</span>,
+      },
+    ],
+    [],
+  );
 
-  const rowActions = useCallback((r: ResourceListItem) => (
-    <button
-      onClick={() => handleSingleDelete(r.id)}
-      className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-      title="删除"
-    >
-      <Trash2 className="h-4 w-4" />
-    </button>
-  ), [handleSingleDelete]);
+  const rowActions = useCallback(
+    (r: ResourceListItem) => (
+      <div className="flex items-center justify-end gap-1">
+        {isDesignMediaType(r) && !r.deletedAt && (
+          <Link
+            href={designMediaHref(r.id)}
+            className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-primary/10 hover:text-primary"
+            title="用于设计"
+            aria-label="用于设计"
+          >
+            <Wand2 className="h-4 w-4" />
+          </Link>
+        )}
+        <button
+          onClick={() => handleSingleDelete(r.id)}
+          className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+          title="删除"
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
+      </div>
+    ),
+    [handleSingleDelete],
+  );
 
   return (
     <div>
-      <PageHeader title="资源库" description="按文件夹、类型和标签浏览资源">
+      <PageHeader title="资源库" description="按文件夹、类型和来源浏览资源">
         <Button size="sm" className="gap-1" onClick={() => openCreateFolder(null)}>
           <FolderPlus className="h-4 w-4" />
           新建文件夹
@@ -999,13 +1427,18 @@ export default function ResourcesPage() {
             <SelectContent>
               <SelectItem value={ALL_RESOURCE_TYPES_VALUE}>全部类型</SelectItem>
               {(Object.keys(RESOURCE_TYPE_LABELS) as ResourceType[]).map((t) => (
-                <SelectItem key={t} value={t}>{RESOURCE_TYPE_LABELS[t]}</SelectItem>
+                <SelectItem key={t} value={t}>
+                  {RESOURCE_TYPE_LABELS[t]}
+                </SelectItem>
               ))}
             </SelectContent>
           </Select>
 
           <Select
-            value={categoryId || (categoryScope === 'root' ? UNCATEGORIZED_CATEGORY_VALUE : ALL_CATEGORIES_VALUE)}
+            value={
+              categoryId ||
+              (categoryScope === 'root' ? UNCATEGORIZED_CATEGORY_VALUE : ALL_CATEGORIES_VALUE)
+            }
             onValueChange={handleCategoryChange}
           >
             <SelectTrigger className="w-32">
@@ -1025,7 +1458,9 @@ export default function ResourcesPage() {
 
           <Select
             value={acquisitionMode || ALL_ACQUISITION_MODES_VALUE}
-            onValueChange={(value) => setAcquisitionMode(value === ALL_ACQUISITION_MODES_VALUE ? '' : value)}
+            onValueChange={(value) =>
+              setAcquisitionMode(value === ALL_ACQUISITION_MODES_VALUE ? '' : value)
+            }
           >
             <SelectTrigger className="w-28">
               <SelectValue placeholder="来源" />
@@ -1037,6 +1472,18 @@ export default function ResourcesPage() {
               <SelectItem value="metadata_only">仅元数据</SelectItem>
             </SelectContent>
           </Select>
+
+          <Button
+            variant={favoriteOnly ? 'secondary' : 'outline'}
+            size="sm"
+            className="gap-1"
+            aria-pressed={favoriteOnly}
+            title={favoriteOnly ? '退出收藏视图' : '跨文件夹显示所有已收藏的资源'}
+            onClick={toggleFavoriteOnly}
+          >
+            <Heart className={cn('h-4 w-4', favoriteOnly && 'fill-rose-500 text-rose-500')} />
+            只看收藏
+          </Button>
 
           <Select value={`${sortBy}:${sortOrder}`} onValueChange={handleSortChange}>
             <SelectTrigger className="w-36">
@@ -1052,6 +1499,22 @@ export default function ResourcesPage() {
             </SelectContent>
           </Select>
 
+          <Button
+            variant={filtersOpen || advancedFilterCount > 0 ? 'secondary' : 'outline'}
+            size="sm"
+            className="gap-1"
+            aria-expanded={filtersOpen}
+            onClick={() => setFiltersOpen((open) => !open)}
+          >
+            <SlidersHorizontal className="h-4 w-4" />
+            更多筛选
+            {advancedFilterCount > 0 && (
+              <Badge variant="outline" className="px-1 py-0 text-[10px] leading-4">
+                {advancedFilterCount}
+              </Badge>
+            )}
+          </Button>
+
           <div className="ml-auto flex items-center gap-1">
             <Button
               variant={isSelectionActive ? 'default' : 'outline'}
@@ -1063,18 +1526,103 @@ export default function ResourcesPage() {
               <SquareCheck className="h-4 w-4" />
               {isSelectionActive ? '退出批量编辑' : '批量编辑'}
             </Button>
-            <Tabs value={viewMode} onValueChange={handleViewModeChange}>
-              <TabsList>
-                <TabsTrigger value="grid" className="px-2">
-                  <Grid3X3 className="h-4 w-4" />
-                </TabsTrigger>
-                <TabsTrigger value="table" className="px-2">
-                  <List className="h-4 w-4" />
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+            <ResourceViewToggle />
           </div>
         </div>
+
+        {/* 更多筛选：默认收起，避免筛选栏过挤；这里对应后端已有的作者/日期/大小筛选能力 */}
+        {filtersOpen && (
+          <div className="flex flex-wrap items-end gap-x-5 gap-y-3 rounded-lg border bg-muted/30 px-3 py-2.5">
+            <div className="space-y-1">
+              <Label htmlFor="resource-filter-author" className="text-xs text-muted-foreground">
+                作者
+              </Label>
+              <Input
+                id="resource-filter-author"
+                value={author}
+                onChange={(event) => setAuthor(event.target.value)}
+                placeholder="按作者筛选"
+                className="h-8 w-40"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">时间范围</Label>
+              <div className="flex items-center gap-1.5">
+                <Select
+                  value={dateField}
+                  onValueChange={(value) => setDateField(value as DateField)}
+                >
+                  <SelectTrigger className="h-8 w-32" aria-label="时间字段">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="createdAt">创建时间</SelectItem>
+                    <SelectItem value="updatedAt">更新时间</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Input
+                  type="date"
+                  aria-label="起始日期"
+                  value={dateFrom}
+                  max={dateTo || undefined}
+                  onChange={(event) => setDateFrom(event.target.value)}
+                  className="h-8 w-40"
+                />
+                <span className="text-xs text-muted-foreground">至</span>
+                <Input
+                  type="date"
+                  aria-label="结束日期"
+                  value={dateTo}
+                  min={dateFrom || undefined}
+                  onChange={(event) => setDateTo(event.target.value)}
+                  className="h-8 w-40"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">文件大小（MB）</Label>
+              <div className="flex items-center gap-1.5">
+                <Input
+                  type="number"
+                  min={0}
+                  step="any"
+                  inputMode="decimal"
+                  aria-label="最小文件大小（MB）"
+                  value={minSizeMb}
+                  onChange={(event) => setMinSizeMb(event.target.value)}
+                  placeholder="最小"
+                  className="h-8 w-24"
+                />
+                <span className="text-xs text-muted-foreground">至</span>
+                <Input
+                  type="number"
+                  min={0}
+                  step="any"
+                  inputMode="decimal"
+                  aria-label="最大文件大小（MB）"
+                  value={maxSizeMb}
+                  onChange={(event) => setMaxSizeMb(event.target.value)}
+                  placeholder="最大"
+                  className="h-8 w-24"
+                />
+              </div>
+            </div>
+
+            {advancedFilterCount > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1"
+                onClick={clearAdvancedFilters}
+              >
+                <X className="h-3.5 w-3.5" />
+                清除条件
+              </Button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 文件夹导航 */}
@@ -1150,7 +1698,9 @@ export default function ResourcesPage() {
                   void handleDropOnFolder(folder, event);
                 }}
                 className={`group relative min-h-20 rounded-lg border bg-card transition-colors hover:border-primary/40 hover:bg-accent ${
-                  dragOverFolderId === folder.id ? 'border-primary bg-accent ring-2 ring-primary/30' : ''
+                  dragOverFolderId === folder.id
+                    ? 'border-primary bg-accent ring-2 ring-primary/30'
+                    : ''
                 }`}
               >
                 <button
@@ -1165,12 +1715,14 @@ export default function ResourcesPage() {
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{folder.name}</div>
                     <div className="mt-1 flex items-center gap-2">
-                      <Badge variant="secondary" className="text-xs">{folder.resourceCount}</Badge>
+                      <Badge variant="secondary" className="text-xs">
+                        {folder.resourceCount}
+                      </Badge>
                       <span className="text-xs text-muted-foreground">项资源</span>
                     </div>
                   </div>
                 </button>
-                <div className="absolute right-2 top-2 flex gap-1 opacity-100 md:opacity-0 md:transition-opacity md:group-hover:opacity-100">
+                <div className="hover-reveal absolute right-2 top-2 flex gap-1">
                   <button
                     type="button"
                     className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
@@ -1221,7 +1773,8 @@ export default function ResourcesPage() {
               onClick={() => handleSelectionModeChange(false)}
               disabled={selectingAllDirectory}
             >
-              <Check className="mr-1 h-3 w-3" />完成
+              <Check className="mr-1 h-3 w-3" />
+              完成
             </Button>
           )}
           <span className="text-sm text-muted-foreground">
@@ -1254,57 +1807,127 @@ export default function ResourcesPage() {
             disabled={selectingAllDirectory || selectedIds.size === 0}
             title="清除所有已选择的资源"
           >
-            <X className="mr-1 h-3 w-3" />清除选择
+            <X className="mr-1 h-3 w-3" />
+            清除选择
           </Button>
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button variant="outline" size="sm" onClick={handleBatchDownload} disabled={selectedIds.size === 0}>
-              <Download className="mr-1 h-4 w-4" />下载
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleBatchDownload}
+              disabled={selectedIds.size === 0 || zipDownloading !== null}
+              title={zipDownloading ? '正在下载上一个压缩包，可先在右下角取消' : undefined}
+            >
+              <Download className="mr-1 h-4 w-4" />
+              下载
             </Button>
-            <Button variant="outline" size="sm" onClick={openMoveResources} disabled={selectedIds.size === 0}>
-              <Folder className="mr-1 h-4 w-4" />移动到
+            {showBatchMirror && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleBatchMirror}
+                disabled={selectedIds.size === 0 || batchMirroring !== null}
+                title="为选中的远程资源创建本地下载任务；没有下载地址或来源策略不允许的资源会被跳过"
+              >
+                <CloudDownload className="mr-1 h-4 w-4" />
+                {batchMirroring
+                  ? `正在提交 ${Math.min(batchMirroring.completed + 1, batchMirroring.total)}/${batchMirroring.total}`
+                  : '下载到本地'}
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openMoveResources}
+              disabled={selectedIds.size === 0}
+            >
+              <Folder className="mr-1 h-4 w-4" />
+              移动到
             </Button>
-            <Button variant="outline" size="sm" onClick={() => handleBatchFavorite(true)} disabled={selectedIds.size === 0}>
-              <Heart className="mr-1 h-4 w-4" />收藏
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleBatchFavorite(true)}
+              disabled={selectedIds.size === 0}
+            >
+              <Heart className="mr-1 h-4 w-4" />
+              收藏
             </Button>
-            <Button variant="outline" size="sm" onClick={() => handleBatchFavorite(false)} disabled={selectedIds.size === 0}>
-              <HeartOff className="mr-1 h-4 w-4" />取消收藏
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleBatchFavorite(false)}
+              disabled={selectedIds.size === 0}
+            >
+              <HeartOff className="mr-1 h-4 w-4" />
+              取消收藏
             </Button>
-            <Button variant="destructive" size="sm" onClick={handleBatchDelete} disabled={selectedIds.size === 0}>
-              <Trash2 className="mr-1 h-4 w-4" />批量删除
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={handleBatchDelete}
+              disabled={selectedIds.size === 0}
+            >
+              <Trash2 className="mr-1 h-4 w-4" />
+              批量删除
             </Button>
           </div>
         </div>
       )}
 
-      {/* 加载/错误/列表 */}
+      {/* 列表顶部锚点：翻页/换筛选后滚到这里 */}
+      <div ref={listAnchorRef} aria-hidden="true" />
+
+      {/* 首次加载用骨架；之后翻页/筛选保留旧列表，只在顶部给一条细进度条 */}
       {loading ? (
-        <LoadingState variant={viewMode === 'grid' ? 'card' : 'table'} count={8} />
-      ) : error ? (
-        <ErrorState message={error} onRetry={fetchResources} />
+        <ResourceListSkeleton />
+      ) : error && resources.length === 0 ? (
+        <ErrorState message={error} onRetry={() => void fetchResources()} />
+      ) : resources.length === 0 && refreshing ? (
+        <ResourceListSkeleton />
       ) : resources.length === 0 ? (
         <EmptyState
           title="暂无资源"
-          description={hasActiveFilters
-            ? '没有匹配的资源，请调整搜索条件'
-            : categoryScope === 'root'
-              ? '根目录暂无资源，可切换到全部资源查看已放入文件夹的资源'
-            : '上传文件以开始管理您的资源库'}
+          description={
+            hasActiveFilters
+              ? favoriteOnlyView
+                ? '还没有收藏的资源：在全部资源里勾选后点“收藏”，就能在这里集中查看'
+                : '没有匹配的资源，请调整搜索条件'
+              : categoryScope === 'root'
+                ? '根目录暂无资源，可切换到全部资源查看已放入文件夹的资源'
+                : '上传文件以开始管理您的资源库'
+          }
         />
       ) : (
-        <div>
-          <div hidden={viewMode !== 'grid'}>
-            <ResourceGrid
-              resources={resources}
-              selectedIds={selectedIds}
-              onSelectionChange={setSelectedIds}
-              onDelete={handleSingleDelete}
-              onResourceDragStart={isSelectionActive ? undefined : handleResourceDragStart}
-              selectMode={isSelectionActive}
-              contextQuery={contextQuery}
-            />
-          </div>
-          {mountedViewModes.has('table') && (
-            <div hidden={viewMode !== 'table'}>
+        <div className="relative" aria-busy={refreshing}>
+          {error && (
+            <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              列表刷新失败：{error}
+            </div>
+          )}
+          {/* 进度条绝对定位，避免刷新时把列表整体下推造成抖动 */}
+          {refreshing && (
+            <div
+              className="pointer-events-none absolute -top-2 left-0 right-0 z-10 h-0.5 overflow-hidden rounded bg-primary/10"
+              role="progressbar"
+              aria-label="正在更新资源列表"
+            >
+              <div className="h-full w-1/3 animate-pulse rounded bg-primary/70" />
+            </div>
+          )}
+          <ResourceViewPanels
+            grid={
+              <ResourceGrid
+                resources={resources}
+                selectedIds={selectedIds}
+                onSelectionChange={setSelectedIds}
+                onDelete={handleSingleDelete}
+                onResourceDragStart={isSelectionActive ? undefined : handleResourceDragStart}
+                selectMode={isSelectionActive}
+                contextQuery={contextQuery}
+              />
+            }
+            table={
               <DataTable
                 columns={columns}
                 data={resources}
@@ -1314,26 +1937,25 @@ export default function ResourcesPage() {
                 onRowClick={handleRowClick}
                 rowActions={rowActions}
               />
-            </div>
-          )}
+            }
+          />
         </div>
       )}
 
       {/* 分页 */}
-      {total > 0 && !loading && !error && (
+      {total > 0 && !loading && (
         <div className="mt-4 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <span>每页</span>
-            <Select
-              value={String(pageSize)}
-              onValueChange={handlePageSizeChange}
-            >
+            <Select value={String(pageSize)} onValueChange={handlePageSizeChange}>
               <SelectTrigger className="h-8 w-[76px]" aria-label="每页显示数量">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 {PAGE_SIZE_OPTIONS.map((size) => (
-                  <SelectItem key={size} value={String(size)}>{size} 条</SelectItem>
+                  <SelectItem key={size} value={String(size)}>
+                    {size} 条
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -1341,10 +1963,24 @@ export default function ResourcesPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            <Button variant="outline" size="icon" title="首页" aria-label="首页" disabled={page === 1} onClick={() => goToPage(1)}>
+            <Button
+              variant="outline"
+              size="icon"
+              title="首页"
+              aria-label="首页"
+              disabled={page === 1}
+              onClick={() => goToPage(1)}
+            >
               <ChevronsLeft className="h-4 w-4" />
             </Button>
-            <Button variant="outline" size="icon" title="上一页" aria-label="上一页" disabled={page === 1} onClick={() => goToPage(page - 1)}>
+            <Button
+              variant="outline"
+              size="icon"
+              title="上一页"
+              aria-label="上一页"
+              disabled={page === 1}
+              onClick={() => goToPage(page - 1)}
+            >
               <ChevronLeft className="h-4 w-4" />
             </Button>
             {paginationItems.map((item) =>
@@ -1360,13 +1996,32 @@ export default function ResourcesPage() {
                   {item}
                 </Button>
               ) : (
-                <span key={item} className="flex h-8 w-5 items-center justify-center text-muted-foreground">...</span>
+                <span
+                  key={item}
+                  className="flex h-8 w-5 items-center justify-center text-muted-foreground"
+                >
+                  ...
+                </span>
               ),
             )}
-            <Button variant="outline" size="icon" title="下一页" aria-label="下一页" disabled={page === totalPages} onClick={() => goToPage(page + 1)}>
+            <Button
+              variant="outline"
+              size="icon"
+              title="下一页"
+              aria-label="下一页"
+              disabled={page === totalPages}
+              onClick={() => goToPage(page + 1)}
+            >
               <ChevronRight className="h-4 w-4" />
             </Button>
-            <Button variant="outline" size="icon" title="末页" aria-label="末页" disabled={page === totalPages} onClick={() => goToPage(totalPages)}>
+            <Button
+              variant="outline"
+              size="icon"
+              title="末页"
+              aria-label="末页"
+              disabled={page === totalPages}
+              onClick={() => goToPage(totalPages)}
+            >
               <ChevronsRight className="h-4 w-4" />
             </Button>
             <div className="ml-1 flex items-center gap-1 text-sm text-muted-foreground">
@@ -1393,14 +2048,10 @@ export default function ResourcesPage() {
 
       {/* 删除确认 */}
       <ConfirmDialog
-        open={deleteTarget !== null}
-        onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
-        title={deleteTarget?.type === 'batch' ? '批量删除资源' : '删除资源'}
-        description={
-          deleteTarget?.type === 'batch'
-            ? `确定要将选中的 ${selectedIds.size} 个资源移到回收站吗？你可以从回收站恢复。`
-            : '确定要将此资源移到回收站吗？你可以从回收站恢复。'
-        }
+        open={batchDeleteOpen}
+        onOpenChange={setBatchDeleteOpen}
+        title="批量删除资源"
+        description={`确定要将选中的 ${selectedIds.size} 个资源移到回收站吗？你可以从回收站恢复。`}
         variant="destructive"
         confirmLabel="删除"
         onConfirm={confirmDelete}
@@ -1421,9 +2072,7 @@ export default function ResourcesPage() {
           <DialogHeader>
             <DialogTitle>{editingFolder ? '编辑文件夹' : '新建文件夹'}</DialogTitle>
             {editingFolder && (
-              <DialogDescription>
-                修改名称，或调整上级文件夹来移动此文件夹。
-              </DialogDescription>
+              <DialogDescription>修改名称，或调整上级文件夹来移动此文件夹。</DialogDescription>
             )}
           </DialogHeader>
           <div className="space-y-4">
@@ -1446,7 +2095,9 @@ export default function ResourcesPage() {
               <Label>上级文件夹</Label>
               <Select
                 value={folderParentId ?? ROOT_FOLDER_VALUE}
-                onValueChange={(value) => setFolderParentId(value === ROOT_FOLDER_VALUE ? null : value)}
+                onValueChange={(value) =>
+                  setFolderParentId(value === ROOT_FOLDER_VALUE ? null : value)
+                }
               >
                 <SelectTrigger>
                   <SelectValue placeholder="无（作为根文件夹）" />
@@ -1467,7 +2118,9 @@ export default function ResourcesPage() {
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setFolderDialogOpen(false)}>取消</Button>
+            <Button variant="outline" onClick={() => setFolderDialogOpen(false)}>
+              取消
+            </Button>
             <Button onClick={handleSaveFolder} disabled={!folderName.trim()}>
               {editingFolder ? '保存' : '创建'}
             </Button>
@@ -1477,7 +2130,9 @@ export default function ResourcesPage() {
 
       <ConfirmDialog
         open={!!folderDeleteTarget}
-        onOpenChange={(open) => { if (!open) setFolderDeleteTarget(null); }}
+        onOpenChange={(open) => {
+          if (!open) setFolderDeleteTarget(null);
+        }}
         title="删除文件夹"
         description={`确定要删除文件夹 "${folderDeleteTarget?.name}" 吗？子文件夹将变为根文件夹，关联的资源将移出该文件夹。`}
         variant="destructive"
@@ -1519,12 +2174,56 @@ export default function ResourcesPage() {
             </Select>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setMoveDialogOpen(false)}>取消</Button>
-            <Button onClick={handleMoveResources} disabled={selectedIds.size === 0 || !moveTargetCategoryId}>移动</Button>
+            <Button variant="outline" onClick={() => setMoveDialogOpen(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={handleMoveResources}
+              disabled={selectedIds.size === 0 || !moveTargetCategoryId}
+            >
+              移动
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
+      {/* 下载进度：非模态浮层，下载期间页面照常可用；压缩包边生成边写盘，所以只有已写入字节数 */}
+      {zipDownloading && (
+        <div className="fixed bottom-4 right-4 z-50 w-72 rounded-lg border bg-background/95 p-3 shadow-lg backdrop-blur">
+          <div className="mb-2 flex items-baseline justify-between gap-2">
+            {/* role=status：卡片出现时播报一次；里面的字节数在变，不能给它加 aria-live 否则会刷屏 */}
+            <span role="status" className="text-sm font-medium">
+              正在打包下载
+            </span>
+            <span className="text-xs text-muted-foreground">
+              已写入 {formatBytes(zipDownloading.loadedBytes)}
+            </span>
+          </div>
+          {/* 压缩流没有 Content-Length，进度只报已写入字节数，条形保持不定长 */}
+          <div
+            role="progressbar"
+            aria-label="批量下载进度"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+          >
+            <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
+          </div>
+          <div className="mt-2 flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">
+              {zipDownloading.totalResources} 个资源 · 边生成边写入磁盘
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={handleCancelZipDownload}
+            >
+              取消下载
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -9,8 +9,14 @@ import {
   Cpu,
   Trash2,
   Globe,
-  Palette,
+  Wand2,
+  Library,
+  BarChart3,
   Settings,
+  Sparkles,
+  ClipboardCheck,
+  Palette,
+  ShieldCheck,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
@@ -27,8 +33,14 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Cpu,
   Trash2,
   Globe,
-  Palette,
+  Wand2,
+  Library,
+  BarChart3,
   Settings,
+  Sparkles,
+  ClipboardCheck,
+  Palette,
+  ShieldCheck,
 };
 
 export function Sidebar() {

@@ -23,7 +23,10 @@ function createService() {
     findBySha256: vi.fn(),
     create: vi.fn(),
   };
-  const fileRepo = { create: vi.fn() };
+  const fileRepo = {
+    create: vi.fn(),
+    findStoragePathReferences: vi.fn().mockResolvedValue(new Map()),
+  };
   const jobRepo = { create: vi.fn() };
   const prisma = {
     category: { findUnique: vi.fn() },
@@ -40,7 +43,7 @@ function createService() {
     prisma as never,
     config as never,
   );
-  return { service, storage, resourceRepo, prisma };
+  return { service, storage, resourceRepo, fileRepo, prisma };
 }
 
 /** 创建一个真实存在的临时文件，供 sha256 / MIME 检测读取；返回清理函数 */
@@ -100,6 +103,73 @@ describe('UploadService category validation', () => {
       ).rejects.toThrow(BadRequestException);
       // 竞态窗口下应清理已移入正式存储的孤儿文件
       expect(storage.delete).toHaveBeenCalledWith('originals/abc');
+    } finally {
+      temp.cleanup();
+    }
+  });
+
+  it('cleans up the stored object when the transaction fails for any other reason', async () => {
+    const { service, storage, resourceRepo, fileRepo, prisma } = createService();
+    prisma.category.findUnique.mockResolvedValue({ id: 'cat-1' });
+    // 非分类竞态：例如 SQLite busy / 约束错误。事务回滚后不应留下存储孤儿。
+    prisma.$transaction.mockRejectedValue(new Error('database is locked'));
+    storage.generateKey.mockReturnValue('originals/abc');
+
+    const temp = createTempFile();
+    try {
+      await expect(
+        service.handleUpload(makeFile(temp.path), { categoryId: 'cat-1' }),
+      ).rejects.toThrow('database is locked');
+
+      expect(fileRepo.findStoragePathReferences).toHaveBeenCalledWith(['originals/abc']);
+      expect(storage.delete).toHaveBeenCalledWith('originals/abc');
+      // 不是分类问题，不应改写成 400
+      expect(resourceRepo.create).not.toHaveBeenCalled();
+    } finally {
+      temp.cleanup();
+    }
+  });
+
+  it('keeps an unreferenced-check failure conservative (no delete when the check throws)', async () => {
+    const { service, storage, fileRepo, prisma } = createService();
+    prisma.category.findUnique.mockResolvedValue({ id: 'cat-1' });
+    prisma.$transaction.mockRejectedValue(new Error('database is locked'));
+    storage.generateKey.mockReturnValue('originals/abc');
+    // 引用查询本身失败：无法确认是否共用，保守保留，交由一致性检查回收
+    fileRepo.findStoragePathReferences.mockRejectedValue(new Error('db unavailable'));
+
+    const temp = createTempFile();
+    try {
+      await expect(
+        service.handleUpload(makeFile(temp.path), { categoryId: 'cat-1' }),
+      ).rejects.toThrow('database is locked');
+      expect(storage.delete).not.toHaveBeenCalled();
+    } finally {
+      temp.cleanup();
+    }
+  });
+
+  it('does not delete an object still referenced by an existing duplicate', async () => {
+    const { service, storage, fileRepo, prisma } = createService();
+    prisma.category.findUnique.mockResolvedValue({ id: 'cat-1' });
+    prisma.$transaction.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError(
+        "An operation failed because it depends on one or more records that were required but not found.\nCause: No 'Category' record(s) was found for a nested connect on 'Resource#r1'.",
+        { code: 'P2025', clientVersion: 'test' },
+      ),
+    );
+    storage.generateKey.mockReturnValue('originals/abc');
+    // 上传的是已存在的重复文件：这个 storage key 仍被已有资源引用
+    fileRepo.findStoragePathReferences.mockResolvedValue(
+      new Map([['originals/abc', new Set(['existing-resource'])]]),
+    );
+
+    const temp = createTempFile();
+    try {
+      await expect(
+        service.handleUpload(makeFile(temp.path), { categoryId: 'cat-1' }),
+      ).rejects.toThrow(BadRequestException);
+      expect(storage.delete).not.toHaveBeenCalled();
     } finally {
       temp.cleanup();
     }

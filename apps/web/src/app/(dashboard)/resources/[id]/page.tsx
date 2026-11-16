@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { toast } from 'sonner';
 import {
@@ -14,15 +15,20 @@ import {
   RotateCcw,
   RefreshCw,
   FileText,
+  Heart,
   Image,
   Video,
   Loader2,
   Square,
   Camera,
+  Wand2,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  Expand,
 } from 'lucide-react';
 import { LoadingState } from '@/components/shared/loading-state';
 import { ErrorState } from '@/components/shared/error-state';
-import { ConfirmDialog } from '@/components/shared/confirm-dialog';
 import { ResourceTypeBadge } from '@/components/shared/resource-type-badge';
 import { ResourceTypeIcon } from '@/components/shared/resource-type-icon';
 import { Button } from '@/components/ui/button';
@@ -50,6 +56,7 @@ import {
   getResource,
   getResourceNeighbors,
   updateResource,
+  batchSetResourceFavorite,
   softDeleteResource,
   restoreResource,
   reprocessResource,
@@ -64,7 +71,10 @@ import {
 import { cancelIngestionJob, listIngestionJobs } from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
 import { formatByteString, formatDateTime } from '@/lib/format';
+import { buildFilterParams, filtersFromSearchParams } from '@/lib/resource-filters';
+import { cn } from '@/lib/utils';
 import { PROCESSING_STATUS_LABELS, LOCATOR_TYPE_LABELS } from '@/lib/constants';
+import { designMediaHref, isDesignMediaType } from '@/lib/resource';
 import type { ResourceDetail, CategoryTreeNode, IngestionJobItem } from '@/lib/types';
 import { IngestionJobStatus, IngestionJobType, type ResourceType } from '@aurum/shared-types';
 
@@ -93,6 +103,8 @@ const FILE_ROLE_LABELS: Record<string, string> = {
 };
 
 const TEXT_PREVIEW_MAX_CHARS = 200_000;
+/** 详情页图片预览的缩放上限（长边像素）：不做缩放时会直接下发 43MB 级的原图 */
+const DETAIL_PREVIEW_MAX_EDGE = 2560;
 
 /** 预览失败 / 无可用预览时的类型图标占位 */
 function PreviewIconFallback({ type }: { type: ResourceType }) {
@@ -101,6 +113,17 @@ function PreviewIconFallback({ type }: { type: ResourceType }) {
       <ResourceTypeIcon type={type} className="h-24 w-24 text-muted-foreground" />
     </div>
   );
+}
+
+/** 详情页视频静音自动循环：补写 muted 并主动起播，与列表卡片行为一致，无需再点一次 */
+function handleDetailVideoRef(el: HTMLVideoElement | null) {
+  if (!el) return;
+  el.muted = true;
+  try {
+    void Promise.resolve(el.play()).catch(() => undefined);
+  } catch {
+    // 浏览器不支持该视频格式时保持 poster 展示，交给 onError 兜底
+  }
 }
 
 /** 文本在线预览：流式拉取原文件内容以 <pre> 展示（React 自动转义，避免 XSS） */
@@ -211,9 +234,515 @@ function TextViewer({
   );
 }
 
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 8;
+const ZOOM_STEP = 1.4;
+/** 页内画布最大高度，避免超大屏上图片把页面撑得太长 */
+const MAX_FRAME_HEIGHT = 760;
+
+type ZoomView = { scale: number; x: number; y: number };
+
+/**
+ * 可缩放图片查看器：
+ * - 滚轮 / 触控板捏合 / 双指捏合缩放，均以操作点为锚（1x ~ 8x）
+ * - 放大后按住拖拽平移
+ * - 双击在「适应窗口」与 2x 之间切换
+ * - 大图加载时显示转圈，加载完成后淡入
+ * 缩放用 CSS transform 实现（不改变布局盒尺寸），平移边界按图片实际布局尺寸计算，
+ * 保证图片不会被拖出可视区域。
+ */
+function ZoomableImage({
+  src,
+  alt,
+  referrerPolicy,
+  onError,
+  className,
+  fitToImage = false,
+  enableEscapeReset = true,
+  onRequestFullscreen,
+}: {
+  src: string;
+  alt: string;
+  referrerPolicy?: 'no-referrer';
+  onError?: () => void;
+  /** 外层容器尺寸类，默认 65vh 视口高度；全屏查看时传 h-full */
+  className?: string;
+  /** 让画布尺寸贴合图片比例（页内查看用）：小图不放大、比例不符不留大片空白 */
+  fitToImage?: boolean;
+  /** 全屏场景下 Esc 交给外层弹层关闭，不再拦截 */
+  enableEscapeReset?: boolean;
+  /** 传入即显示「全屏查看」按钮 */
+  onRequestFullscreen?: () => void;
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const [view, setView] = useState<ZoomView>({ scale: MIN_ZOOM, x: 0, y: 0 });
+  const viewRef = useRef(view);
+  const [dragging, setDragging] = useState(false);
+  // 加载态：大图首屏先显示转圈，加载完成后淡入
+  const [loaded, setLoaded] = useState(false);
+  const [natural, setNatural] = useState<{ width: number; height: number } | null>(null);
+  const [fitSize, setFitSize] = useState<{ width: number; height: number } | null>(null);
+  // 当前按下的指针（用于识别双指捏合）
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{
+    distance: number;
+    scale: number;
+    x: number;
+    y: number;
+    midX: number;
+    midY: number;
+  } | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+
+  // 统一入口：写入前把平移量约束在可拖动范围内
+  const commit = useCallback((next: ZoomView) => {
+    const frame = frameRef.current;
+    const img = imgRef.current;
+    let { scale, x, y } = next;
+    if (scale <= MIN_ZOOM) {
+      // 回到原始比例时完全居中
+      scale = MIN_ZOOM;
+      x = 0;
+      y = 0;
+    } else if (frame && img) {
+      // offsetWidth/offsetHeight 是未经 transform 的布局尺寸
+      const maxX = Math.max(0, (img.offsetWidth * scale - frame.clientWidth) / 2);
+      const maxY = Math.max(0, (img.offsetHeight * scale - frame.clientHeight) / 2);
+      x = Math.min(Math.max(x, -maxX), maxX);
+      y = Math.min(Math.max(y, -maxY), maxY);
+    }
+    viewRef.current = { scale, x, y };
+    setView({ scale, x, y });
+  }, []);
+
+  // 切换资源（上一个/下一个）时复位
+  useEffect(() => {
+    const reset = { scale: MIN_ZOOM, x: 0, y: 0 };
+    viewRef.current = reset;
+    setView(reset);
+    dragRef.current = null;
+    pinchRef.current = null;
+    pointersRef.current.clear();
+    setDragging(false);
+    setLoaded(false);
+    // 保留上一张图的 natural/fitSize：切换相邻资源时画布不会先塌回 65vh 再撑开，
+    // 新图加载完成后再按实际比例重算
+    // 命中缓存时 onLoad 可能早于挂载，补一次状态同步
+    const img = imgRef.current;
+    if (img?.complete && img.naturalWidth > 0) {
+      setLoaded(true);
+      setNatural({ width: img.naturalWidth, height: img.naturalHeight });
+    }
+  }, [src]);
+
+  // 页内查看时按图片比例计算画布尺寸：小图保持原始尺寸，极宽/极窄图不再留大片空白
+  useEffect(() => {
+    if (!fitToImage || !natural) {
+      setFitSize(null);
+      return;
+    }
+    const update = () => {
+      const wrapper = wrapperRef.current;
+      if (!wrapper) return;
+      const availableWidth = wrapper.clientWidth;
+      if (!availableWidth) return;
+      const ratio = natural.width / natural.height;
+      const maxHeight = Math.min(window.innerHeight * 0.65, MAX_FRAME_HEIGHT);
+      // 先受高度限制，再受原始像素与可用宽度限制：小图不放大，大图不留黑边
+      const height = Math.min(maxHeight, natural.height, availableWidth / ratio);
+      const width = Math.min(availableWidth, natural.width, height * ratio);
+      if (height < 1 || width < 1) return;
+      setFitSize({ width: Math.round(width), height: Math.round(height) });
+    };
+    update();
+    window.addEventListener('resize', update);
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.removeEventListener('resize', update);
+    }
+    const observer = new ResizeObserver(update);
+    if (wrapperRef.current) observer.observe(wrapperRef.current);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', update);
+    };
+  }, [fitToImage, natural]);
+
+  // 滚轮缩放：必须用非 passive 监听，否则无法阻止整页滚动
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const { scale, x, y } = viewRef.current;
+      // deltaMode: 0=像素(Chrome)、1=行(Firefox)、2=页，先归一到像素再算缩放
+      const delta =
+        event.deltaMode === 1
+          ? event.deltaY * 16
+          : event.deltaMode === 2
+            ? event.deltaY * 100
+            : event.deltaY;
+      // 触控板捏合会以 ctrlKey + 小 deltaY 的形式派发，灵敏度需要单独放大
+      const sensitivity = event.ctrlKey ? 0.01 : 0.0015;
+      const target = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, scale * Math.exp(-delta * sensitivity)));
+      if (Math.abs(target - scale) < 0.001) return;
+      const rect = frame.getBoundingClientRect();
+      // 光标相对容器中心的坐标，缩放后该点保持不动
+      const px = event.clientX - rect.left - rect.width / 2;
+      const py = event.clientY - rect.top - rect.height / 2;
+      const ratio = target / scale;
+      commit({
+        scale: target,
+        x: px - (px - x) * ratio,
+        y: py - (py - y) * ratio,
+      });
+    };
+    frame.addEventListener('wheel', handleWheel, { passive: false });
+    return () => frame.removeEventListener('wheel', handleWheel);
+  }, [commit]);
+
+  // 容器尺寸变化（窗口缩放、侧栏折叠）后重新约束平移量，避免图片被留在视口外
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => commit(viewRef.current));
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, [commit]);
+
+  // 双指手势必须阻止页面滚动，否则捏合会被页面滚动手势打断
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const handleTouchMove = (event: TouchEvent) => {
+      if (event.touches.length >= 2) event.preventDefault();
+    };
+    frame.addEventListener('touchmove', handleTouchMove, { passive: false });
+    return () => frame.removeEventListener('touchmove', handleTouchMove);
+  }, []);
+
+  // 按钮 / 双击缩放：未指定坐标时以容器中心为锚点
+  const zoomAt = useCallback(
+    (nextScale: number, clientX?: number, clientY?: number) => {
+      const frame = frameRef.current;
+      if (!frame) return;
+      const { scale, x, y } = viewRef.current;
+      const target = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, nextScale));
+      if (Math.abs(target - scale) < 0.001) return;
+      const rect = frame.getBoundingClientRect();
+      const px = (clientX ?? rect.left + rect.width / 2) - rect.left - rect.width / 2;
+      const py = (clientY ?? rect.top + rect.height / 2) - rect.top - rect.height / 2;
+      const ratio = target / scale;
+      commit({
+        scale: target,
+        x: px - (px - x) * ratio,
+        y: py - (py - y) * ratio,
+      });
+    },
+    [commit],
+  );
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    const frame = event.currentTarget;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    frame.setPointerCapture(event.pointerId);
+
+    // 第二根手指落下 → 进入捏合，放弃单指拖拽
+    if (pointersRef.current.size === 2) {
+      const [a, b] = Array.from(pointersRef.current.values());
+      const rect = frame.getBoundingClientRect();
+      const { scale, x, y } = viewRef.current;
+      dragRef.current = null;
+      setDragging(false);
+      pinchRef.current = {
+        distance: Math.hypot(b.x - a.x, b.y - a.y) || 1,
+        scale,
+        x,
+        y,
+        // 两指中点（相对容器中心）
+        midX: (a.x + b.x) / 2 - rect.left - rect.width / 2,
+        midY: (a.y + b.y) / 2 - rect.top - rect.height / 2,
+      };
+      return;
+    }
+
+    // 只响应主键拖拽；原始比例下无需拖动，保持图片居中
+    if (event.button !== 0 || viewRef.current.scale <= MIN_ZOOM) return;
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: viewRef.current.x,
+      originY: viewRef.current.y,
+    };
+    setDragging(true);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const tracked = pointersRef.current.get(event.pointerId);
+    if (!tracked) return;
+    tracked.x = event.clientX;
+    tracked.y = event.clientY;
+
+    // 双指捏合：距离比决定缩放倍数，中点位移决定平移，锚点保持在中点下方
+    const pinch = pinchRef.current;
+    if (pinch && pointersRef.current.size >= 2) {
+      const [a, b] = Array.from(pointersRef.current.values());
+      const rect = event.currentTarget.getBoundingClientRect();
+      const distance = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const scale = Math.min(
+        MAX_ZOOM,
+        Math.max(MIN_ZOOM, (pinch.scale * distance) / pinch.distance),
+      );
+      const ratio = scale / pinch.scale;
+      const midX = (a.x + b.x) / 2 - rect.left - rect.width / 2;
+      const midY = (a.y + b.y) / 2 - rect.top - rect.height / 2;
+      commit({
+        scale,
+        x: midX - (pinch.midX - pinch.x) * ratio,
+        y: midY - (pinch.midY - pinch.y) * ratio,
+      });
+      return;
+    }
+
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    commit({
+      scale: viewRef.current.scale,
+      x: drag.originX + (event.clientX - drag.startX),
+      y: drag.originY + (event.clientY - drag.startY),
+    });
+  };
+
+  const handlePointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    pointersRef.current.delete(event.pointerId);
+    if (pointersRef.current.size < 2) pinchRef.current = null;
+    if (dragRef.current?.pointerId === event.pointerId) {
+      dragRef.current = null;
+      setDragging(false);
+    }
+    // 松开一根手指后，剩下那根继续可以拖动，避免手势中断
+    const remaining = Array.from(pointersRef.current.entries());
+    if (remaining.length === 1 && viewRef.current.scale > MIN_ZOOM) {
+      const [pointerId, point] = remaining[0];
+      dragRef.current = {
+        pointerId,
+        startX: point.x,
+        startY: point.y,
+        originX: viewRef.current.x,
+        originY: viewRef.current.y,
+      };
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  // 键盘操作：+/- 缩放、0/Esc 复位（容器可聚焦，配合 tabIndex 使用）
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const { scale } = viewRef.current;
+    switch (event.key) {
+      case '+':
+      case '=':
+        event.preventDefault();
+        zoomAt(scale * ZOOM_STEP);
+        break;
+      case '-':
+      case '_':
+        event.preventDefault();
+        zoomAt(scale / ZOOM_STEP);
+        break;
+      case '0':
+        event.preventDefault();
+        zoomAt(MIN_ZOOM);
+        break;
+      case 'Escape':
+        // 仅在放大时拦截，未放大时不吞掉 Esc（可能用于关闭外层弹层）
+        if (enableEscapeReset && scale > MIN_ZOOM) {
+          event.preventDefault();
+          zoomAt(MIN_ZOOM);
+        }
+        break;
+    }
+  };
+
+  const zoomed = view.scale > MIN_ZOOM + 0.001;
+
+  return (
+    <div
+      ref={wrapperRef}
+      className={cn(
+        'relative flex w-full flex-col',
+        // 页内查看跟随画布高度；全屏用传入的 h-full
+        fitToImage ? null : (className ?? 'h-[65vh] max-h-[760px] min-h-[320px]'),
+      )}
+      // 键盘事件挂在容器上：焦点在控制栏按钮时也能继续用 +/- 缩放
+      onKeyDown={handleKeyDown}
+    >
+      <div
+        ref={frameRef}
+        tabIndex={0}
+        role="group"
+        aria-label="图片预览，可滚轮、加减键或双指缩放，放大后拖拽移动，双击或按 0 复位"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+        onDoubleClick={(event) => zoomAt(zoomed ? MIN_ZOOM : 2, event.clientX, event.clientY)}
+        className={cn(
+          'relative flex w-full select-none items-center justify-center overflow-hidden rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+          fitToImage ? 'mx-auto h-[65vh] shrink-0' : 'min-h-0 flex-1',
+          zoomed ? (dragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-zoom-in',
+        )}
+        style={{
+          // 页内查看：画布尺寸贴合图片比例（优先于类名里的兜底高度）
+          ...(fitToImage && fitSize ? { width: fitSize.width, height: fitSize.height } : null),
+          // 未放大时保留竖向滚动，双指捏合由 touchmove 拦截
+          touchAction: zoomed ? 'none' : 'pan-y',
+        }}
+      >
+        <img
+          ref={imgRef}
+          src={src}
+          alt={alt}
+          referrerPolicy={referrerPolicy}
+          draggable={false}
+          onError={onError}
+          onLoad={(event) => {
+            setLoaded(true);
+            setNatural({
+              width: event.currentTarget.naturalWidth,
+              height: event.currentTarget.naturalHeight,
+            });
+          }}
+          className={cn(
+            'max-h-full max-w-full object-contain transition-opacity duration-300 will-change-transform',
+            loaded ? 'opacity-100' : 'opacity-0',
+          )}
+          style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
+        />
+        {!loaded && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          </div>
+        )}
+      </div>
+      {/* 控制条放在图片下方，不遮挡画面 */}
+      <div className="flex items-center justify-between gap-2 pt-1.5">
+        <span className="hidden pl-1 text-xs text-muted-foreground sm:inline">
+          滚轮或双指缩放 · 拖拽移动 · 双击复位 · +/- 键缩放
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-1.5"
+            title="缩小"
+            aria-label="缩小"
+            disabled={!zoomed}
+            onClick={() => zoomAt(viewRef.current.scale / ZOOM_STEP)}
+          >
+            <ZoomOut className="h-4 w-4" />
+          </Button>
+          <span className="w-11 text-center text-xs tabular-nums text-muted-foreground">
+            {Math.round(view.scale * 100)}%
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-1.5"
+            title="放大"
+            aria-label="放大"
+            disabled={view.scale >= MAX_ZOOM}
+            onClick={() => zoomAt(viewRef.current.scale * ZOOM_STEP)}
+          >
+            <ZoomIn className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-1.5"
+            title="适应窗口"
+            aria-label="适应窗口"
+            disabled={!zoomed}
+            onClick={() => zoomAt(MIN_ZOOM)}
+          >
+            <Maximize2 className="h-4 w-4" />
+          </Button>
+          {onRequestFullscreen && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-1.5"
+              title="全屏查看"
+              aria-label="全屏查看"
+              onClick={onRequestFullscreen}
+            >
+              <Expand className="h-4 w-4" />
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 页内查看 + 全屏查看：两处图片预览（本地原文件、外部资源）共用同一套缩放交互。
+ * 全屏态用 Dialog 承载，Esc 或右上角关闭；两个实例各自持有缩放状态，
+ * 关闭全屏后回到页内仍是原来的视图。
+ */
+function ImageViewer({
+  src,
+  alt,
+  referrerPolicy,
+  onError,
+}: {
+  src: string;
+  alt: string;
+  referrerPolicy?: 'no-referrer';
+  onError?: () => void;
+}) {
+  const [fullscreenOpen, setFullscreenOpen] = useState(false);
+
+  return (
+    <>
+      <ZoomableImage
+        src={src}
+        alt={alt}
+        referrerPolicy={referrerPolicy}
+        onError={onError}
+        fitToImage
+        onRequestFullscreen={() => setFullscreenOpen(true)}
+      />
+      <Dialog open={fullscreenOpen} onOpenChange={setFullscreenOpen}>
+        <DialogContent className="flex h-[100dvh] max-w-none flex-col gap-0 rounded-none border-0 bg-background p-0 sm:rounded-none">
+          <DialogTitle className="sr-only">{alt}</DialogTitle>
+          {/* 全屏态 Esc 直接关闭弹层，缩放复位用 0 键或双击 */}
+          <ZoomableImage
+            src={src}
+            alt={alt}
+            referrerPolicy={referrerPolicy}
+            onError={onError}
+            className="h-full"
+            enableEscapeReset={false}
+          />
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 /**
  * 内联预览查看器：按资源类型渲染对应元素
- * - 图片 → <img>
+ * - 图片 → 可缩放查看器（滚轮/键盘缩放、拖拽平移、可全屏）
  * - 视频 → <video>（HTML5 播放器，可显示封面）
  * - 音频 → <audio>
  * - PDF → <iframe>（浏览器内置 PDF 查看器）
@@ -266,11 +795,16 @@ function InlinePreview({
     return (
       <div className="flex w-full items-center justify-center py-8">
         <video
+          ref={handleDetailVideoRef}
           controls
+          autoPlay
+          muted
+          loop
+          playsInline
           preload="metadata"
           src={previewUrl}
           poster={posterUrl ?? undefined}
-          className="max-h-[480px] max-w-full rounded-md bg-black/5"
+          className="max-h-[65vh] max-w-full rounded-md bg-black/5"
           onError={onError}
         />
       </div>
@@ -293,14 +827,11 @@ function InlinePreview({
 
   if (type === 'image') {
     return (
-      <div className="flex items-center justify-center py-16">
-        <img
-          src={previewUrl}
-          alt={resource.title || resource.originalFilename}
-          className="max-h-[480px] max-w-full rounded object-contain"
-          onError={onError}
-        />
-      </div>
+      <ImageViewer
+        src={previewUrl}
+        alt={resource.title || resource.originalFilename}
+        onError={onError}
+      />
     );
   }
 
@@ -309,7 +840,7 @@ function InlinePreview({
 
 /**
  * 外部资源预览：根据预览定位器的实际 Content-Type 决定查看器
- * 图片/未知类型保持原有 <img> 行为（多为缩略图），video/audio/pdf 用对应播放器
+ * 图片/未知类型用可缩放查看器（多为缩略图），video/audio/pdf 用对应播放器
  */
 function ExternalPreview({
   url,
@@ -327,10 +858,15 @@ function ExternalPreview({
     return (
       <div className="flex w-full items-center justify-center py-8">
         <video
+          ref={handleDetailVideoRef}
           controls
+          autoPlay
+          muted
+          loop
+          playsInline
           preload="metadata"
           src={url}
-          className="max-h-[480px] max-w-full rounded-md bg-black/5"
+          className="max-h-[65vh] max-w-full rounded-md bg-black/5"
           onError={onError}
         />
       </div>
@@ -363,48 +899,25 @@ function ExternalPreview({
     );
   }
 
-  // 图片缩略图 / 未知类型：保持原有 <img> 行为
+  // 图片缩略图 / 未知类型：用可缩放查看器展示
   return (
-    <div className="flex items-center justify-center py-16">
-      <img
-        src={url}
-        alt={resource.title || resource.originalFilename}
-        referrerPolicy="no-referrer"
-        className="max-h-[480px] max-w-full rounded object-contain"
-        onError={onError}
-      />
-    </div>
+    <ImageViewer
+      src={url}
+      alt={resource.title || resource.originalFilename}
+      referrerPolicy="no-referrer"
+      onError={onError}
+    />
   );
 }
 
 /**
  * 从详情页 URL 的查询串还原"相邻资源"接口所需的筛选/排序参数。
- * 与资源库列表页的 URL↔筛选状态映射保持一致：
- * - 有关键字/类型/categoryId/acquisitionMode 时原样传递；
- * - 无 categoryId 且 scope !== 'all'（即根目录默认视图）→ uncategorized=true；
- * - 排序参数缺省时保持默认（createdAt desc）。
+ * 直接用资源库列表页的同一套 URL ↔ 筛选状态规则（含根目录/全库作用域推导），
+ * 保证左右箭头始终在列表当前展示的那个结果集里切换（关键词、类型、来源、
+ * 作者、时间范围、文件大小、排序全部生效）。
  */
-function neighborsParamsFromUrl(searchParams: URLSearchParams): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  const keyword = searchParams.get('keyword');
-  if (keyword) params.keyword = keyword;
-  const resourceType = searchParams.get('resourceType');
-  if (resourceType) params.resourceType = resourceType;
-  const categoryId = searchParams.get('categoryId');
-  const scope = searchParams.get('scope');
-  if (categoryId) {
-    params.categoryId = categoryId;
-  } else if (scope !== 'all') {
-    // 无分类且非"全部资源"：即根目录视图，与列表页对空 URL 的默认一致
-    params.uncategorized = true;
-  }
-  const acquisitionMode = searchParams.get('acquisitionMode');
-  if (acquisitionMode) params.acquisitionMode = acquisitionMode;
-  const sortBy = searchParams.get('sortBy');
-  const sortOrder = searchParams.get('sortOrder');
-  if (sortBy) params.sortBy = sortBy;
-  if (sortOrder) params.sortOrder = sortOrder;
-  return params;
+function neighborsParamsFromUrl(searchParams: URLSearchParams) {
+  return buildFilterParams(filtersFromSearchParams(searchParams));
 }
 
 /** 返回资源库按钮 */
@@ -441,11 +954,16 @@ export default function ResourceDetailPage() {
   }, [router]);
 
   // 在筛选上下文中切换相邻资源：保留当前查询串，使箭头状态与列表持续性保持一致
+  const neighborUrl = useCallback(
+    (neighborId: string) => `/resources/${neighborId}${contextQuery ? `?${contextQuery}` : ''}`,
+    [contextQuery],
+  );
+
   const goToNeighbor = useCallback(
     (neighborId: string) => {
-      router.push(`/resources/${neighborId}${contextQuery ? `?${contextQuery}` : ''}`);
+      router.push(neighborUrl(neighborId));
     },
-    [router, contextQuery],
+    [router, neighborUrl],
   );
 
   const [resource, setResource] = useState<ResourceDetail | null>(null);
@@ -472,23 +990,37 @@ export default function ResourceDetailPage() {
   const [categories, setCategories] = useState<CategoryTreeNode[]>([]);
   const flatCategories = useMemo(() => flattenCategories(categories), [categories]);
 
-  // 确认
-  const [deleteOpen, setDeleteOpen] = useState(false);
-
-  const fetchResource = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    setPreviewError(false);
-    setExternalPreviewError(false);
-    try {
-      const data = await getResource(id);
-      setResource(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '加载失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [id]);
+  /**
+   * 拉取详情。
+   * silent=true：保存/恢复/重新处理/任务结束后的补偿刷新。保留当前页面与预览节点，
+   * 不切 loading，否则整页会被骨架替换、图片重新请求和解码（大图尤其明显）。
+   */
+  const resourceSeqRef = useRef(0);
+  const fetchResource = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent === true;
+      const seq = ++resourceSeqRef.current;
+      if (!silent) {
+        setLoading(true);
+        setError(null);
+        setPreviewError(false);
+        setExternalPreviewError(false);
+      }
+      try {
+        const data = await getResource(id);
+        if (seq !== resourceSeqRef.current) return;
+        setResource(data);
+        setError(null);
+      } catch (e) {
+        if (seq !== resourceSeqRef.current) return;
+        // 静默刷新失败时保留当前内容，避免把已有页面替换成错误页
+        if (!silent) setError(e instanceof Error ? e.message : '加载失败');
+      } finally {
+        if (seq === resourceSeqRef.current) setLoading(false);
+      }
+    },
+    [id],
+  );
 
   useEffect(() => {
     fetchResource();
@@ -573,7 +1105,7 @@ export default function ResourceDetailPage() {
     }
     if (hadMirrorJobRef.current) {
       hadMirrorJobRef.current = false;
-      void fetchResource();
+      void fetchResource({ silent: true });
     }
   }, [fetchResource, mirrorJob]);
 
@@ -585,7 +1117,7 @@ export default function ResourceDetailPage() {
     }
     if (hadSnapshotJobRef.current) {
       hadSnapshotJobRef.current = false;
-      void fetchResource();
+      void fetchResource({ silent: true });
     }
   }, [fetchResource, snapshotJob]);
 
@@ -610,18 +1142,68 @@ export default function ResourceDetailPage() {
       });
       toast.success('已更新');
       setEditOpen(false);
-      await fetchResource();
+      await fetchResource({ silent: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '保存失败');
     }
   };
 
+  // 收藏/取消收藏：没有单条接口，复用批量接口只传当前 id，成功后就地更新，不重拉整页
+  const favoritePendingRef = useRef(false);
+  const handleToggleFavorite = async () => {
+    if (!resource || favoritePendingRef.current) return;
+    const next = !resource.isFavorite;
+    favoritePendingRef.current = true;
+    try {
+      const result = await batchSetResourceFavorite([resource.id], next);
+      // 批量接口对「资源已被删除/不存在」返回 200 + updated=0，不能当成功处理。
+      if (result.updated < 1) {
+        toast.error('收藏失败：资源可能已被删除');
+        await fetchResource({ silent: true });
+        return;
+      }
+      setResource((current) => (current ? { ...current, isFavorite: next } : current));
+      toast.success(next ? '已收藏' : '已取消收藏');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '收藏操作失败');
+    } finally {
+      favoritePendingRef.current = false;
+    }
+  };
+
+  /** 删除后的「撤销」：直接恢复，不打断当前浏览位置 */
+  const handleUndoDelete = async () => {
+    try {
+      await restoreResource(id);
+      toast.success('已恢复');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '撤销失败，请到回收站手动恢复');
+    }
+  };
+
+  // 删除：不再二次确认，直接执行并给出可撤销的提示
+  const deletingRef = useRef(false);
   const handleDelete = async () => {
+    if (deletingRef.current) return;
+    deletingRef.current = true;
     try {
       await softDeleteResource(id);
-      toast.success('已移到回收站');
-      router.push('/resources');
+      toast.success('已移到回收站', {
+        action: { label: '撤销', onClick: () => void handleUndoDelete() },
+      });
+      // 删除后留在浏览流里，而不是弹回列表：优先跳下一个资源，没有下一个就跳上一个。
+      // 都没有（筛选结果中仅此一条、或相邻资源接口尚未返回）才回列表，并带上当前筛选串 ——
+      // 否则用户会被踢出所在分类，落到未筛选的全量列表。
+      // 两条路径都用 replace：push 会把刚删掉的详情页留在历史里，后退会落回去。
+      const adjacentId = nextId ?? previousId;
+      if (adjacentId) {
+        router.replace(neighborUrl(adjacentId));
+        return;
+      }
+      router.replace(contextQuery ? `/resources?${contextQuery}` : '/resources');
     } catch (e) {
+      // 失败时允许重试；成功时页面会离开，无需重置
+      deletingRef.current = false;
       toast.error(e instanceof Error ? e.message : '删除失败');
     }
   };
@@ -630,7 +1212,7 @@ export default function ResourceDetailPage() {
     try {
       await restoreResource(id);
       toast.success('已恢复');
-      await fetchResource();
+      await fetchResource({ silent: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '恢复失败');
     }
@@ -640,7 +1222,10 @@ export default function ResourceDetailPage() {
     try {
       await reprocessResource(id);
       toast.success('已提交重新处理');
-      await fetchResource();
+      // 重新处理可能产出新的缩略图/预览：清掉旧的失败态，让预览重新尝试
+      setPreviewError(false);
+      setExternalPreviewError(false);
+      await fetchResource({ silent: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '重新处理失败');
     }
@@ -725,7 +1310,7 @@ export default function ResourceDetailPage() {
         <div className="mb-6">
           <BackButton onClick={handleBack} />
         </div>
-        <ErrorState message={error ?? '未找到资源'} onRetry={fetchResource} />
+        <ErrorState message={error ?? '未找到资源'} onRetry={() => void fetchResource()} />
       </div>
     );
   }
@@ -841,6 +1426,26 @@ export default function ResourceDetailPage() {
                 {snapshotting ? '正在提交' : hasSnapshot ? '更新快照' : '生成快照'}
               </Button>
             ))}
+          {isDesignMediaType(resource) && !resource.deletedAt && (
+            <Button variant="outline" size="sm" className="gap-1" asChild>
+              <Link href={designMediaHref(resource.id)}>
+                <Wand2 className="h-4 w-4" />
+                用于设计
+              </Link>
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            title={resource.isFavorite ? '取消收藏' : '收藏这个资源'}
+            onClick={() => void handleToggleFavorite()}
+          >
+            <Heart
+              className={cn('h-4 w-4', resource.isFavorite && 'fill-rose-500 text-rose-500')}
+            />
+            {resource.isFavorite ? '已收藏' : '收藏'}
+          </Button>
           <Button variant="outline" size="sm" className="gap-1" onClick={openEdit}>
             <Pencil className="h-4 w-4" />
             编辑
@@ -855,7 +1460,7 @@ export default function ResourceDetailPage() {
               variant="outline"
               size="sm"
               className="gap-1"
-              onClick={() => setDeleteOpen(true)}
+              onClick={() => void handleDelete()}
             >
               <Trash2 className="h-4 w-4 text-destructive" />
               删除
@@ -870,41 +1475,47 @@ export default function ResourceDetailPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* 左侧：预览 + 信息 */}
-        <div className="lg:col-span-2 space-y-6">
-          {/* 预览：有本地文件优先显示本地预览，否则外部链接资源显示远端预览 */}
-          {hasLocalOriginalFile || !isExternalResource ? (
-            <Card>
-              <CardContent>
-                {!previewError ? (
-                  <InlinePreview
-                    resource={resource}
-                    previewUrl={getResourcePreviewUrl(resource.id)}
-                    posterUrl={hasThumbnail ? getResourceThumbnailUrl(resource.id) : null}
-                    onError={() => setPreviewError(true)}
-                  />
-                ) : (
-                  <PreviewIconFallback type={resource.resourceType} />
-                )}
-              </CardContent>
-            </Card>
-          ) : isExternalResource && (previewLocator || primaryLocator) ? (
-            <Card>
-              <CardContent>
-                {!externalPreviewError ? (
-                  <ExternalPreview
-                    url={(previewLocator ?? primaryLocator)!.url}
-                    resource={resource}
-                    onError={() => setExternalPreviewError(true)}
-                  />
-                ) : (
-                  <PreviewIconFallback type={resource.resourceType} />
-                )}
-              </CardContent>
-            </Card>
-          ) : null}
+      {/* 预览：整行铺满，图片/视频/PDF 才有足够的展示空间 */}
+      <div className="mb-6">
+        {/* 有本地文件优先显示本地预览，否则外部链接资源显示远端预览 */}
+        {hasLocalOriginalFile || !isExternalResource ? (
+          <Card>
+            <CardContent className="p-3 pt-3">
+              {!previewError ? (
+                <InlinePreview
+                  resource={resource}
+                  previewUrl={getResourcePreviewUrl(
+                    resource.id,
+                    resource.resourceType === 'image' ? DETAIL_PREVIEW_MAX_EDGE : undefined,
+                  )}
+                  posterUrl={hasThumbnail ? getResourceThumbnailUrl(resource.id) : null}
+                  onError={() => setPreviewError(true)}
+                />
+              ) : (
+                <PreviewIconFallback type={resource.resourceType} />
+              )}
+            </CardContent>
+          </Card>
+        ) : isExternalResource && (previewLocator || primaryLocator) ? (
+          <Card>
+            <CardContent className="p-3 pt-3">
+              {!externalPreviewError ? (
+                <ExternalPreview
+                  url={(previewLocator ?? primaryLocator)!.url}
+                  resource={resource}
+                  onError={() => setExternalPreviewError(true)}
+                />
+              ) : (
+                <PreviewIconFallback type={resource.resourceType} />
+              )}
+            </CardContent>
+          </Card>
+        ) : null}
+      </div>
 
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+        {/* 左侧：文件列表（占 3/5，与右侧元数据 2/5 搭配，信息列更舒展） */}
+        <div className="lg:col-span-3 space-y-6">
           {/* 文件列表 */}
           <Card>
             <CardHeader>
@@ -946,7 +1557,7 @@ export default function ResourceDetailPage() {
         </div>
 
         {/* 右侧：元数据 */}
-        <div className="space-y-6">
+        <div className="lg:col-span-2 space-y-6">
           {/* 基本信息 */}
           <Card>
             <CardHeader>
@@ -1109,7 +1720,7 @@ export default function ResourceDetailPage() {
               </CardHeader>
               <CardContent className="space-y-2">
                 {hasBrokenLinks && (
-                  <div className="rounded-md bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 p-2 text-xs text-amber-800 dark:text-amber-200">
+                  <div className="rounded-md bg-amber-50 border border-amber-200 p-2 text-xs text-amber-800">
                     ⚠ 此资源存在失效链接
                   </div>
                 )}
@@ -1304,16 +1915,6 @@ export default function ResourceDetailPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      <ConfirmDialog
-        open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        title="删除资源"
-        description="确定要将此资源移到回收站吗？你可以从回收站恢复。"
-        variant="destructive"
-        confirmLabel="删除"
-        onConfirm={handleDelete}
-      />
     </div>
   );
 }

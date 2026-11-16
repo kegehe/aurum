@@ -44,7 +44,18 @@ export function buildCssTokens(profile: StyleProfile): string {
   const hierarchyLines = typography.hierarchy
     .map((h, i) => {
       const size = Math.round(h.sizePx);
-      return `  --font-${roleToCssId(h.role, i)}: ${h.weight} ${size}px/${typography.lineHeight} ${h.letterSpacing ? `${h.letterSpacing}` : 'normal'};`;
+      const id = roleToCssId(h.role, i);
+      // 必须补上字体族：`font` 简写里 family 是必填项，缺了整条声明会被浏览器丢弃。
+      // 原来的占位 `normal` 虽然能通过解析，却会把 font-family 字面量设成 "normal"
+      // （Chromium 实测 computed font-family 就是 "normal"），等于把字体重置成浏览器默认、
+      // 而不是继承页面字体 —— 两种写法都达不到"一行 font 简写"的目的。
+      const lines = [
+        `  --font-${id}: ${h.weight} ${size}px/${typography.lineHeight} var(--font-family);`,
+      ];
+      // `font` 简写不含 letter-spacing：塞进去会让整条声明失效
+      // （CSS.supports('font', '800 96px/1.5 -0.02em') 实测 false），所以单独出一个 token。
+      if (h.letterSpacing) lines.push(`  --font-${id}-letter-spacing: ${h.letterSpacing};`);
+      return lines.join('\n');
     })
     .join('\n');
 

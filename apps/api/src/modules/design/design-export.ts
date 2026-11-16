@@ -14,6 +14,7 @@ import {
   toVarName,
   type TokenTable,
 } from './design-css';
+import { buildMediaSkeleton, getMediaDescriptor, type ResolvedMedia } from './design-media';
 import type { DesignKind, JsonRecord } from './design.types';
 
 /** 导出格式的单一事实来源：控制器、服务与前端都引用它，避免白名单各写一份 */
@@ -144,7 +145,11 @@ export interface ComponentExport {
  * 别名替换成 `var(--name)`（aliasMode: 'var'），这样导出物可以随消费方加载的
  * 主题变量换肤；配套的 token 定义由 bundle 一起给出。
  */
-export function buildComponentExport(content: JsonRecord, tokens: TokenTable): ComponentExport {
+export function buildComponentExport(
+  content: JsonRecord,
+  tokens: TokenTable,
+  media?: ResolvedMedia | null,
+): ComponentExport {
   const componentType = String(content.componentType);
   const appliesTo = typeof content.appliesTo === 'string' ? content.appliesTo : 'element';
   const variants = isRecord(content.variants) ? content.variants : {};
@@ -205,13 +210,18 @@ export function buildComponentExport(content: JsonRecord, tokens: TokenTable): C
     }
   }
 
-  const firstVariant = Object.keys(variants)[0];
-  const className = firstVariant
-    ? `aurum-${componentType}-${firstVariant}`
+  // HTML 骨架只能挂一个 variant。优先 default：模型经常把 hover/active 写在
+  // 前面，盲取第一个会让预览只剩一条 transform 声明，看起来像完全没生成。
+  const names = Object.keys(variants);
+  const skeletonVariant = names.includes('default') ? 'default' : names[0];
+  const className = skeletonVariant
+    ? `aurum-${componentType}-${skeletonVariant}`
     : `aurum-${componentType}`;
   return {
     css: `${rules.join('\n\n')}\n`,
-    html: buildElementSkeleton(appliesTo, className),
+    html: getMediaDescriptor(content)
+      ? buildMediaSkeleton(content, className, media)
+      : buildElementSkeleton(appliesTo, className),
     tokensUsed: [...tokensUsed].sort(),
   };
 }
@@ -325,8 +335,9 @@ export function buildBundle(
   kind: DesignKind,
   content: JsonRecord,
   tokens: TokenTable,
+  media?: ResolvedMedia | null,
 ): BundleExport {
-  const bundle = composeBundle(kind, content, tokens);
+  const bundle = composeBundle(kind, content, tokens, media);
   // 派生点只有这一处：任何 kind 的"可粘贴样式"都必然带上 reducedMotion 降级块
   const copyCss = [bundle.css, bundle.reducedMotion].filter(Boolean).join('\n\n');
   return { ...bundle, copyCss };
@@ -336,10 +347,11 @@ function composeBundle(
   kind: DesignKind,
   content: JsonRecord,
   tokens: TokenTable,
+  media?: ResolvedMedia | null,
 ): Omit<BundleExport, 'copyCss'> {
   const common = { json: content };
   if (kind === 'component') {
-    const exported = buildComponentExport(content, tokens);
+    const exported = buildComponentExport(content, tokens, media);
     const tokenCss = buildTokenCss([content, ...fixtureDependencyContents(content)]);
     return {
       ...common,

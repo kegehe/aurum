@@ -70,7 +70,10 @@ describe('SearchService', () => {
   });
 
   it('builds explicit ordering and defaults', () => {
-    expect(service.buildOrderBy()).toEqual({ createdAt: 'desc' });
-    expect(service.buildOrderBy(ResourceSortField.title, SortOrder.asc)).toEqual({ title: 'asc' });
+    expect(service.buildOrderBy()).toEqual([{ createdAt: 'desc' }, { id: 'asc' }]);
+    expect(service.buildOrderBy(ResourceSortField.title, SortOrder.asc)).toEqual([
+      { title: 'asc' },
+      { id: 'asc' },
+    ]);
   });
 });

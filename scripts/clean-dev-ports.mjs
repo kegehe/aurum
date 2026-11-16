@@ -267,8 +267,8 @@ function isAlive(pid) {
   }
 }
 
-const table = getProcessTable();
-const ownAncestors = getOwnAncestors(table);
+let table = null;
+let ownAncestors = null;
 
 for (const port of ports) {
   const listeners = getListeningPids(port);
@@ -276,6 +276,13 @@ for (const port of ports) {
   if (listeners.length === 0) {
     console.log(`[ports] ${port} is free`);
     continue;
+  }
+
+  // 只有确实有端口被占用时才枚举全进程表。WMI 在部分 Windows 机器上
+  // 单次可达数十秒甚至数分钟，空闲启动不该为它买单。
+  if (!table) {
+    table = getProcessTable();
+    ownAncestors = getOwnAncestors(table);
   }
 
   const tree = collectProcessTree(listeners, table).filter(

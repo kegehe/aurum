@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createReadStream, createWriteStream } from 'node:fs';
 import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { IStorageService, StorageObjectInfo } from './interfaces/storage-service.interface';
 import { generateStorageKey } from './storage-key.util';
 
@@ -58,20 +60,53 @@ export class LocalStorageDriver implements IStorageService {
 
   async put(key: string, data: Buffer | NodeJS.ReadableStream): Promise<string> {
     const filePath = this.resolvePath(key);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    // 先写同目录临时文件再 rename：写入中途失败不会留下半截文件，
+    // 也不会因为内容寻址复用同一 key 时把已有的完好文件截断。
+    const tempPath = `${filePath}.tmp-${randomUUID()}`;
 
-    if (Buffer.isBuffer(data)) {
-      await fs.writeFile(filePath, data);
-    } else {
-      // Stream
-      const writable = createWriteStream(filePath);
-      await new Promise<void>((resolve, reject) => {
-        data.pipe(writable);
-        writable.on('finish', resolve);
-        writable.on('error', reject);
-      });
+    try {
+      if (Buffer.isBuffer(data)) {
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(tempPath, data);
+      } else {
+        const source = data as Readable;
+
+        // createReadStream 打开文件是异步的：源文件读不出来（磁盘异常、杀软拦截、
+        // 临时文件被移走）时，'error' 可能在下面 mkdir 的 await 期间就触发。
+        // 必须在这里同步挂上监听——事件无人接收会变成未捕获异常，直接打挂进程。
+        let sourceError: Error | null = null;
+        const captureSourceError = (error: Error) => {
+          sourceError = error;
+        };
+        source.once('error', captureSourceError);
+
+        try {
+          await fs.mkdir(path.dirname(filePath), { recursive: true });
+        } catch (error) {
+          // 这里不能摘掉监听：fs.ReadStream 在 open 尚未完成时 destroy()，
+          // 挂起的打开失败（ENOENT/EACCES）仍会作为 'error' 发出，摘掉就变成未捕获异常。
+          source.destroy();
+          throw error;
+        }
+
+        // 摘掉临时监听后立即交给 pipeline，两者之间没有 await，不会留下空窗。
+        source.off('error', captureSourceError);
+        if (sourceError) {
+          throw sourceError;
+        }
+
+        // 用 pipeline 而非 data.pipe(writable)：pipe 不会把源流的 error 转发给目标流，
+        // 读失败既不会 reject 也无法被调用方感知。pipeline 同时监听两端、出错时销毁
+        // 两个流，保证失败以 reject 的形式传回调用方。
+        await pipeline(source, createWriteStream(tempPath));
+      }
+
+      await fs.rename(tempPath, filePath);
+      return key;
+    } catch (error) {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      throw error;
     }
-    return key;
   }
 
   async get(key: string): Promise<Buffer> {

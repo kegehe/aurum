@@ -20,12 +20,58 @@ import {
 import Anthropic from '@anthropic-ai/sdk';
 import { createHash } from 'node:crypto';
 import { AiSettingsService } from '../ai-settings/ai-settings.service';
-import type { StyleProfile, StyleVariation } from './types';
+import type { ResolvedAiProvider } from '../ai-settings/ai-provider.types';
+import { AiUsageService } from '../ai-usage/ai-usage.service';
+import type { AiFeature } from '../ai-usage/ai-usage.types';
+import type { AiFailureKind, StyleProfile, StyleVariation } from './types';
 import { STYLE_PROFILE_INPUT_SCHEMA, STYLE_VARIATIONS_INPUT_SCHEMA } from './types';
 
 export interface ClaudeImageInput {
   base64: string;
   mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
+
+/**
+ * AI 调用失败，携带失败分类。
+ *
+ * 对外仍是 400（前端展示可读原因），但上层（StyleService）能据此区分
+ * 「网关连不上」（重试无意义，缓存久）与「模型这次没吐出有效结果」
+ * （随机性问题，短暂退避即可），从而给出不同的降级策略。
+ */
+export class AiCallError extends BadRequestException {
+  constructor(
+    message: string,
+    readonly kind: AiFailureKind,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * 把任意异常归类为降级策略可用的失败类型。
+ * 连接/服务端故障 → connectivity；限流 → rate_limit；密钥问题 → auth；
+ * 其余（模型输出无效、JSON 解析失败）→ output。
+ *
+ * `capability` 不由这里推断：它只在守卫确认"模型读不到图"时显式抛出
+ * （见 `assertProfileReadable`），从错误文本反推并不可靠。
+ */
+export function classifyAiFailure(error: unknown): AiFailureKind {
+  if (error instanceof AiCallError) return error.kind;
+  if (error instanceof Anthropic.APIError) {
+    const status = error.status;
+    if (typeof status !== 'number') return 'connectivity';
+    if (status === 429) return 'rate_limit';
+    if (status === 401 || status === 403) return 'auth';
+    if (status >= 500) return 'connectivity';
+    return 'output';
+  }
+  if (
+    error instanceof Error &&
+    /ECONN|ETIMEDOUT|EAI_AGAIN|socket|timeout|network|fetch failed/i.test(error.message)
+  ) {
+    return 'connectivity';
+  }
+  return 'output';
 }
 
 /** 结构化输出工具描述 */
@@ -42,7 +88,10 @@ export class ClaudeVisionClient {
   /** 强制 tool_choice 支持性缓存：key=baseUrl|model，value=false 表示该组合不支持 */
   private readonly forcedToolSupport = new Map<string, boolean>();
 
-  constructor(private readonly aiSettings: AiSettingsService) {}
+  constructor(
+    private readonly aiSettings: AiSettingsService,
+    private readonly usage: AiUsageService,
+  ) {}
 
   get available(): boolean {
     return this.aiSettings.available;
@@ -53,14 +102,22 @@ export class ClaudeVisionClient {
   }
 
   /** 每次调用按当前生效配置构建客户端，保证设置修改后立即生效 */
-  private createClient(): { client: Anthropic; model: string } {
+  private createClient(): {
+    client: Anthropic;
+    model: string;
+    provider: ResolvedAiProvider;
+  } {
     const provider = this.aiSettings.activeProvider;
     if (!provider) {
       throw new ServiceUnavailableException(
         'AI 功能未启用：请到「设置 → AI 配置」中填写 API Key 并设为生效',
       );
     }
-    return { client: this.aiSettings.buildClient(provider), model: provider.model };
+    return {
+      client: this.aiSettings.buildClient(provider),
+      model: provider.model,
+      provider,
+    };
   }
 
   /** 按 baseUrl+model+密钥指纹缓存能力，配置切换后自动区分。
@@ -83,7 +140,7 @@ export class ClaudeVisionClient {
     detectedColors: string[],
     prompt: string,
   ): Promise<StyleProfile> {
-    const { client, model } = this.createClient();
+    const { client, model, provider } = this.createClient();
     const tool: StructuredTool = {
       name: 'output_style_profile',
       description: '输出从图片中提取的结构化样式档案',
@@ -100,6 +157,8 @@ export class ClaudeVisionClient {
       const input = await this.callStructured<StyleProfile>({
         client,
         model,
+        provider,
+        feature: 'style.analyze',
         maxTokens: 4096,
         tool,
         messages: [{ role: 'user', content }],
@@ -119,7 +178,7 @@ export class ClaudeVisionClient {
    * 变体生成：送样式档案 JSON（不重复送图），强制返回 StyleVariation[]
    */
   async generateVariations(profile: StyleProfile, prompt: string): Promise<StyleVariation[]> {
-    const { client, model } = this.createClient();
+    const { client, model, provider } = this.createClient();
     const tool: StructuredTool = {
       name: 'output_style_variations',
       description: '输出基于样式档案生成的多种布局变体',
@@ -129,6 +188,8 @@ export class ClaudeVisionClient {
       const parsed = await this.callStructured<{ variations?: StyleVariation[] }>({
         client,
         model,
+        provider,
+        feature: 'style.variations',
         maxTokens: 8192,
         tool,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
@@ -157,6 +218,8 @@ export class ClaudeVisionClient {
   private async callStructured<T>(params: {
     client: Anthropic;
     model: string;
+    provider: ResolvedAiProvider;
+    feature: AiFeature;
     maxTokens: number;
     tool: StructuredTool;
     messages: Anthropic.MessageParam[];
@@ -164,15 +227,25 @@ export class ClaudeVisionClient {
     parseToolUse: (input: unknown) => T;
     parseText: (text: string) => T;
   }): Promise<T> {
-    const { client, model, maxTokens, tool, messages, jsonInstruction, parseToolUse, parseText } =
-      params;
+    const {
+      client,
+      model,
+      provider,
+      feature,
+      maxTokens,
+      tool,
+      messages,
+      jsonInstruction,
+      parseToolUse,
+      parseText,
+    } = params;
     const key = this.providerKey;
     const base = { model, max_tokens: maxTokens };
 
     // 1) 强制 tool_choice
     if (this.supportsForcedTool(key)) {
       try {
-        const res = await client.messages.create({
+        const res = await this.requestMessage(feature, provider, client, model, {
           ...base,
           tools: [tool],
           tool_choice: { type: 'tool', name: tool.name },
@@ -190,7 +263,7 @@ export class ClaudeVisionClient {
 
     // 2) tools + auto：能出工具调用就用，否则尝试解析文本
     try {
-      const res = await client.messages.create({
+      const res = await this.requestMessage(feature, provider, client, model, {
         ...base,
         tools: [tool],
         tool_choice: { type: 'auto' },
@@ -215,11 +288,47 @@ export class ClaudeVisionClient {
     }
 
     // 3) 纯 JSON 文本兜底（任何模型/网关都接受）
-    const res = await client.messages.create({
+    const res = await this.requestMessage(feature, provider, client, model, {
       ...base,
       messages: this.appendJsonInstruction(messages, jsonInstruction),
     });
     return parseText(this.extractText(res.content));
+  }
+
+  /**
+   * 统一发起上游请求并上报用量。
+   *
+   * 每次真实 HTTP 请求都单独记录（包括三级降级中的失败尝试），因此统计页的
+   * 「请求次数」对应实际上游调用量，而不是用户操作次数。
+   */
+  private async requestMessage(
+    feature: AiFeature,
+    provider: ResolvedAiProvider,
+    client: Anthropic,
+    model: string,
+    params: Anthropic.MessageCreateParamsNonStreaming,
+  ): Promise<Anthropic.Message> {
+    const startedAt = Date.now();
+    try {
+      const response = await client.messages.create(params);
+      this.usage.record({
+        feature,
+        provider,
+        model: response.model || model,
+        usage: response.usage,
+        latencyMs: Date.now() - startedAt,
+      });
+      return response;
+    } catch (error) {
+      this.usage.record({
+        feature,
+        provider,
+        model,
+        latencyMs: Date.now() - startedAt,
+        error,
+      });
+      throw error;
+    }
   }
 
   private supportsForcedTool(key: string): boolean {
@@ -317,16 +426,24 @@ export class ClaudeVisionClient {
   /**
    * 样式档案有效性守卫：模型若根本读不到图片（无视觉能力 / 网关不传图），
    * 会返回空结构（如 colorPalette 为 null）而非真实分析，这里拦截并给出可操作提示。
+   *
+   * 判据必须**只看色板是否整体为空**：primary/background/accent 是 schema 必填项，
+   * 但模型偶发漏掉其中一两个属于"抽风"，`normalizeProfile` 会把缺的那个回退成像素色、
+   * 产出完全可用的档案。若把"缺任一色"也当成读不到图，就会误报成配置问题、
+   * 让用户去换模型，并白等一个 15 分钟退避窗口。
    */
   private assertProfileReadable(input: StyleProfile): void {
+    const palette = input?.colorPalette;
     const empty =
-      input?.colorPalette == null ||
-      input.colorPalette.primary == null ||
-      input.colorPalette.background == null ||
-      input.colorPalette.accent == null;
+      palette == null ||
+      (palette.primary == null && palette.background == null && palette.accent == null);
     if (empty) {
-      throw new BadRequestException(
-        '模型未能读取图片内容（当前模型可能不支持图片输入）。请在「系统设置 → AI 配置」中更换为支持视觉的模型（如 Claude 系列），或确认网关配置正确。',
+      throw new AiCallError(
+        '模型未能读取图片内容（当前模型可能不支持图片输入，也可能是网关本次未转发图片）。请在「系统设置 → AI 配置」中更换为支持视觉的模型（如 Claude 系列），或稍后重试。',
+        // 单独归类：这是**能力/配置**问题，与"模型随机吐出无效 JSON"不是一回事。
+        // 用 output 会让它跟着吃 1 分钟退避，于是配错模型的用户每次分析都白打两次
+        // 完整视觉调用（含图片上传 + 4096 tokens）。
+        'capability',
       );
     }
   }
@@ -336,6 +453,7 @@ export class ClaudeVisionClient {
    * - 记录完整错误
    * - 已是 HttpException（如未配 key、图片读取守卫）原样透传
    * - 其余转为 400，把可读原因带给前端（否则全局过滤器会统一转成 500 Internal server error）
+   * - 同时按错误性质打上 AiFailureKind，供 StyleService 决定降级缓存时长
    *
    * @param visionHint 样式分析等带图场景传入 true：当失败属于模型输出类问题
    *   （非 API 错误）时，追加“模型可能不支持图片输入”的可操作提示。
@@ -343,11 +461,12 @@ export class ClaudeVisionClient {
   private rethrowAsBadRequest(action: string, error: unknown, visionHint = false): never {
     this.logger.error(`${action}失败: ${error instanceof Error ? error.message : String(error)}`);
     if (error instanceof HttpException) throw error;
+    const kind = classifyAiFailure(error);
     const detail = error instanceof Error ? error.message : String(error);
     const hint =
       visionHint && !(error instanceof Anthropic.APIError)
         ? '。若持续失败，当前模型可能不支持图片输入，请在「系统设置 → AI 配置」中更换为支持视觉的模型（如 Claude 系列），或检查网关是否正确转发图片'
         : '';
-    throw new BadRequestException(`${action}失败：${detail}${hint}`);
+    throw new AiCallError(`${action}失败：${detail}${hint}`, kind);
   }
 }

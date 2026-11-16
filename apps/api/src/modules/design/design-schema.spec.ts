@@ -262,3 +262,61 @@ describe('design schema validation', () => {
     ).not.toThrow();
   });
 });
+
+describe('design component media', () => {
+  function mediaComponent(overrides: Record<string, unknown> = {}) {
+    return {
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'media-showcase',
+      appliesTo: 'container',
+      dependencies: [{ documentId: UUID_A, versionId: UUID_B }],
+      media: {
+        resourceId: UUID_C,
+        kind: 'image',
+        alt: '示例图片',
+        width: 800,
+        height: 600,
+      },
+      variants: { default: { declarations: { color: '#ffffff' } } },
+      ...overrides,
+    };
+  }
+
+  it('accepts media on a v2 container component', () => {
+    expect(() => validateDesignContent('component', mediaComponent())).not.toThrow();
+  });
+
+  it('rejects media on v1 components', () => {
+    expect(() =>
+      validateDesignContent(
+        'component',
+        mediaComponent({ schemaVersion: 'aurum.component.v1' }),
+      ),
+    ).toThrow('只支持 aurum.component.v2');
+  });
+
+  it('requires a container skeleton for media components', () => {
+    expect(() =>
+      validateDesignContent('component', mediaComponent({ appliesTo: 'element' })),
+    ).toThrow('appliesTo: container');
+  });
+
+  it('rejects unsafe alt text and unknown media fields', () => {
+    expect(() =>
+      validateDesignContent(
+        'component',
+        mediaComponent({
+          media: { resourceId: UUID_C, kind: 'image', alt: 'a < b' },
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      validateDesignContent(
+        'component',
+        mediaComponent({
+          media: { resourceId: UUID_C, kind: 'image', alt: 'x', url: 'https://x' },
+        }),
+      ),
+    ).toThrow('不支持字段');
+  });
+});

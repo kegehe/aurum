@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import { isNavItemActive } from '@/lib/nav';
 import { cn } from '@/lib/utils';
 
 interface SidebarNavItemProps {
@@ -14,7 +15,7 @@ interface SidebarNavItemProps {
 export function SidebarNavItem({ href, label, icon, collapsed }: SidebarNavItemProps) {
   const pathname = usePathname();
   const router = useRouter();
-  const isActive = pathname === href || (href !== '/dashboard' && pathname.startsWith(href));
+  const isActive = isNavItemActive(pathname, href);
   const prefetch = () => {
     if (!isActive) router.prefetch(href);
   };

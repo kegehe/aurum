@@ -66,6 +66,13 @@ export const envValidationSchema = Joi.object({
   MAX_STYLE_IMAGE_SIZE_MB: Joi.number().integer().min(1).max(100).default(20),
   DESIGN_READ_API_KEY: Joi.string().min(16).allow('').optional(),
   DESIGN_INTERNAL_API_KEY: Joi.string().min(16).allow('').optional(),
+  // 独立预览渲染服务；未配置 URL 时 API 走本地编译/截图回退。
+  // 渲染服务绑定非回环地址时必须配置同一个 KEY，否则 renderer 拒绝启动。
+  DESIGN_RENDERER_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .allow('')
+    .optional(),
+  DESIGN_RENDERER_KEY: Joi.string().allow('').optional(),
   // GitHub API Token（可选）：github 来源同步使用；未配置时匿名访问（限额 60 次/小时）
   GITHUB_TOKEN: Joi.string().allow('').optional(),
 })

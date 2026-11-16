@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { AcquisitionMode } from '@aurum/shared-types';
-import { hasLocalThumbnail, isLinkResource, isRemoteResource } from './resource';
+import { AcquisitionMode, ProcessingStatus, ResourceType } from '@aurum/shared-types';
+import {
+  designMediaHref,
+  designMediaIssue,
+  hasLocalThumbnail,
+  isDesignMediaType,
+  isLinkResource,
+  isRemoteResource,
+} from './resource';
 
 describe('资源获取方式判断', () => {
   it('link_only 判为外链资源', () => {
@@ -40,5 +47,73 @@ describe('hasLocalThumbnail', () => {
   it('缺失 acquisitionMode 时按本地文件处理', () => {
     expect(hasLocalThumbnail({})).toBe(true);
     expect(hasLocalThumbnail({ acquisitionMode: undefined })).toBe(true);
+  });
+});
+
+describe('design media eligibility', () => {
+  it('only images and videos are design media', () => {
+    expect(isDesignMediaType({ resourceType: ResourceType.image })).toBe(true);
+    expect(isDesignMediaType({ resourceType: ResourceType.video })).toBe(true);
+    expect(isDesignMediaType({ resourceType: ResourceType.audio })).toBe(false);
+  });
+
+  it('resources in the trash cannot be used for design', () => {
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.image,
+        acquisitionMode: AcquisitionMode.local_upload,
+        deletedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    ).toContain('回收站');
+  });
+
+  it('remote-only resources must be downloaded first', () => {
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.image,
+        acquisitionMode: AcquisitionMode.metadata_only,
+      }),
+    ).toContain('下载到本地');
+  });
+
+  it('video requires the generated cover in detail data', () => {
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.video,
+        acquisitionMode: AcquisitionMode.local_upload,
+        files: [{ fileRole: 'original' }],
+      }),
+    ).toContain('视频封面');
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.video,
+        acquisitionMode: AcquisitionMode.local_upload,
+        files: [{ fileRole: 'original' }, { fileRole: 'thumbnail' }],
+      }),
+    ).toBeNull();
+  });
+
+  it('video list items use processing status when files are not loaded', () => {
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.video,
+        acquisitionMode: AcquisitionMode.local_upload,
+        processingStatus: ProcessingStatus.pending,
+      }),
+    ).toContain('视频封面');
+  });
+
+  it('image is usable with an original or a thumbnail', () => {
+    expect(
+      designMediaIssue({
+        resourceType: ResourceType.image,
+        acquisitionMode: AcquisitionMode.mirror_file,
+        files: [{ fileRole: 'thumbnail' }],
+      }),
+    ).toBeNull();
+  });
+
+  it('builds an encoded design handoff URL', () => {
+    expect(designMediaHref('res 1')).toBe('/design-library?resource=res%201');
   });
 });

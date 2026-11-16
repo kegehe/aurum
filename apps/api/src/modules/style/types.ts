@@ -114,6 +114,39 @@ export interface StyleExports {
 /** 样式分析来源：AI 视觉分析 or 本地确定性分析（AI 未配置/失败时自动降级） */
 export type StyleSource = 'ai' | 'local';
 
+/**
+ * AI 调用失败分类，决定降级缓存的时长。
+ * 连接/鉴权类问题重试通常无济于事，缓存久一些；
+ * 模型输出质量问题（网关/模型抽风返回空结构）是随机性的，只短暂退避。
+ *
+ * 只列 `classifyAiFailure` 真正会返回的值（`output` 是它的兜底分支）。
+ * 这里不设"未知"档：`Record<AiFailureKind, number>` 会强制新档位补上 TTL，
+ * 留一个永不出现的档位只会让人误以为存在这条路径。
+ */
+export type AiFailureKind = 'connectivity' | 'rate_limit' | 'auth' | 'capability' | 'output';
+
+/** 当前降级详情：为什么在走本地分析、还有多久自动重试 */
+export interface StyleDegradation {
+  kind: AiFailureKind;
+  /** 面向用户的可读原因（原始错误信息） */
+  reason: string;
+  /** 距自动重试的剩余毫秒数 */
+  retryAfterMs: number;
+}
+
+/** AI 可用性（/style/health），前端据此决定顶部模式提示的文案 */
+export interface StyleAvailability {
+  /** 功能可用性：样式实验室始终可用（AI 或本地），恒为 true */
+  available: boolean;
+  /** 当前分析来源：ai / local */
+  source: StyleSource;
+  model: string;
+  /** AI 已配置，但因近期失败被临时降级 —— 与「未配置」是两回事 */
+  degraded: boolean;
+  /** 降级详情；未降级时为 null */
+  degradation: StyleDegradation | null;
+}
+
 export interface StyleImageInfo {
   width: number;
   height: number;
@@ -121,8 +154,13 @@ export interface StyleImageInfo {
 }
 
 export interface StyleAnalyzeResult {
-  /** 结果来源，前端据此展示 "AI 分析 / 本地分析" */
+  /** 样式档案来源，前端据此展示 "AI 分析 / 本地分析" */
   source: StyleSource;
+  /**
+   * 布局变体来源。变体生成失败时不会丢弃已拿到的 AI 档案，
+   * 而是保留 AI 档案 + 本地模板变体，此字段如实反映差异。
+   */
+  variationsSource: StyleSource;
   image: StyleImageInfo;
   /** sharp 像素级检测的主色（确定性 HEX） */
   detectedColors: string[];
@@ -176,7 +214,11 @@ export const STYLE_PROFILE_INPUT_SCHEMA: ToolInputSchema = {
       type: 'object',
       properties: {
         familyTrait: { type: 'string' },
-        suggestedFont: { type: 'string' },
+        suggestedFont: {
+          type: 'string',
+          description:
+            '建议的具体字体名，只写字体名本身（如 Inter / Noto Sans SC），不要附加说明或括号注释',
+        },
         weights: { type: 'array', items: { type: 'number' } },
         hierarchy: {
           type: 'array',
@@ -186,7 +228,10 @@ export const STYLE_PROFILE_INPUT_SCHEMA: ToolInputSchema = {
               role: { type: 'string' },
               sizePx: { type: 'number' },
               weight: { type: 'number' },
-              letterSpacing: { type: 'string' },
+              letterSpacing: {
+                type: 'string',
+                description: 'CSS 字距值，如 "-0.02em"；无特殊字距可省略该字段',
+              },
             },
             required: ['role', 'sizePx', 'weight'],
           },
@@ -221,9 +266,19 @@ export const STYLE_PROFILE_INPUT_SCHEMA: ToolInputSchema = {
     textureMood: {
       type: 'object',
       properties: {
-        radius: { type: 'string' },
-        shadow: { type: 'string' },
-        gradient: { type: ['string', 'null'] },
+        radius: {
+          type: 'string',
+          description: 'CSS 圆角值，如 "8px"、"0"、"12px 12px 0 0"；只写值，不要写说明文字',
+        },
+        shadow: {
+          type: 'string',
+          description:
+            'CSS box-shadow 值，如 "0 2px 8px rgba(0,0,0,.12)"；无阴影写 "none"。只写值，不要写说明文字',
+        },
+        gradient: {
+          type: ['string', 'null'],
+          description: 'CSS 渐变值，如 "linear-gradient(135deg, #111, #333)"；无渐变写 null',
+        },
         density: { type: 'string' },
         keywords: { type: 'array', items: { type: 'string' } },
       },

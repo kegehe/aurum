@@ -10,6 +10,7 @@ import {
   Max,
   MaxLength,
   Min,
+  MinLength,
   ValidateIf,
 } from 'class-validator';
 import { SourceType } from '../../../common/constants/enums';
@@ -105,6 +106,14 @@ export class UpdateSourceDto {
       'downloadDirectory must be a relative subdirectory of letters/digits/_/- separated by / without leading/trailing slash',
   })
   downloadDirectory?: string | null;
+
+  /** 同步下载的资源默认归入的资源库文件夹；传 null 清除 */
+  @IsOptional()
+  @ValidateIf((o) => o.downloadCategoryId !== null)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  downloadCategoryId?: string | null;
 
   @IsOptional()
   @Transform(({ value }) => {

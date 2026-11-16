@@ -8,22 +8,24 @@ import {
   Download,
   Cpu,
   Trash2,
-  Palette,
+  Wand2,
+  Library,
+  BarChart3,
   Settings,
+  Sparkles,
+  ClipboardCheck,
+  Palette,
+  ShieldCheck,
 } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { AurumMark } from '@/components/brand/aurum-mark';
 import { cn } from '@/lib/utils';
 import { NAV_ITEMS } from '@/lib/constants';
+import { isNavItemActive } from '@/lib/nav';
 
 const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   LayoutDashboard,
@@ -33,8 +35,14 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Download,
   Cpu,
   Trash2,
-  Palette,
+  Wand2,
+  Library,
+  BarChart3,
   Settings,
+  Sparkles,
+  ClipboardCheck,
+  Palette,
+  ShieldCheck,
 };
 
 interface MobileSidebarProps {
@@ -69,9 +77,7 @@ export function MobileSidebar({ open, onClose }: MobileSidebarProps) {
               <nav className="flex flex-col gap-0.5">
                 {group.items.map((item) => {
                   const IconComp = ICON_MAP[item.icon];
-                  const isActive =
-                    pathname === item.href ||
-                    (item.href !== '/dashboard' && pathname.startsWith(item.href));
+                  const isActive = isNavItemActive(pathname, item.href);
                   const prefetch = () => {
                     if (!isActive) router.prefetch(item.href);
                   };

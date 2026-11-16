@@ -153,6 +153,20 @@ export function composeDesignGenerate(input: {
   return post<{ taskId: string }>('/design/compose/generate', input);
 }
 
+/**
+ * 一句话生成：不传类别。模型自己判断这是配色、组件还是动效，服务端把三种
+ * 基底一起交给它；`themeDocumentId` 是给发布用的默认配色。
+ */
+export function composeDesignAuto(input: {
+  intent: string;
+  count?: number;
+  reference?: Record<string, unknown>;
+  /** 资源库素材：服务端会把它作为组件的媒体区并锁定 media 字段。 */
+  mediaResourceId?: string;
+}) {
+  return post<{ taskId: string; themeDocumentId: string }>('/design/compose/auto', input);
+}
+
 /** 一键保存并发布。门禁不通过时不写库，直接返回实测比值。 */
 export function composeDesignPublish(input: {
   name: string;
@@ -267,8 +281,8 @@ export function listReadyDrafts() {
     }>
   >('/design/drafts/ready');
 }
-export function listDesignTasks() {
-  return get<DesignTask[]>('/design/tasks');
+export function listDesignTasks(options?: { status?: string; draftId?: string }) {
+  return get<DesignTask[]>('/design/tasks', options);
 }
 export function cancelDesignTask(taskId: string) {
   return post<DesignTask>(`/design/tasks/${taskId}/cancel`);

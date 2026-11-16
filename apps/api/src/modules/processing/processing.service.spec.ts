@@ -194,13 +194,36 @@ describe('ProcessingService', () => {
     expect(resourceRepo.updateProcessingStatus).not.toHaveBeenCalled();
   });
 
-  it('deletes a terminal job record', async () => {
-    const { service, jobRepo } = createService();
-    jobRepo.findById.mockResolvedValue({ id: 'job-1', status: JobStatus.completed });
+  it('deletes a terminal job record without recomputing resource status', async () => {
+    const { service, jobRepo, resourceRepo } = createService();
+    jobRepo.findById.mockResolvedValue({
+      id: 'job-1',
+      resourceId: 'resource-1',
+      status: JobStatus.completed,
+    });
     jobRepo.deleteTerminal.mockResolvedValue(true);
 
     await expect(service.deleteJob('job-1')).resolves.toEqual({ id: 'job-1', deleted: true });
     expect(jobRepo.deleteTerminal).toHaveBeenCalledWith('job-1');
+    // 删除记录不改变资源状态：否则删掉最后一条任务会把健康资源算成 failed
+    expect(resourceRepo.updateProcessingStatus).not.toHaveBeenCalled();
+  });
+
+  it('keeps the cancellation successful even if the status refresh fails', async () => {
+    const { service, jobRepo, resourceRepo } = createService();
+    jobRepo.findById.mockResolvedValue({
+      id: 'job-1',
+      resourceId: 'resource-1',
+      status: JobStatus.processing,
+    });
+    jobRepo.cancelActive.mockResolvedValue(true);
+    jobRepo.findByResourceId.mockResolvedValue([]);
+    resourceRepo.updateProcessingStatus.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(service.cancelJob('job-1')).resolves.toEqual({
+      id: 'job-1',
+      status: JobStatus.canceled,
+    });
   });
 
   it('rejects deleting an active job', async () => {

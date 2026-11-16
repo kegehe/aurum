@@ -60,3 +60,42 @@ describe('buildCssTokens 字体回退', () => {
     expect(css).toContain('sans-serif');
   });
 });
+
+describe('buildCssTokens 字体层级 token', () => {
+  it('--font-* 必须是合法的 font 简写：带字体族，不能留 normal 占位', () => {
+    const css = buildCssTokens(profile('无衬线', 'Inter'));
+    expect(css).toContain('--font-body: 400 16px/1.6 var(--font-family);');
+    // 旧写法 `400 16px/1.6 normal` 能通过解析，但 computed font-family 会变成字面量
+    // "normal"（Chromium 实测），等于把字体重置成浏览器默认，而不是继承页面字体
+    expect(css).not.toMatch(/--font-body: [^;]*\snormal;/);
+  });
+
+  it('letter-spacing 单独出 token，不塞进 font 简写', () => {
+    const p = profile('无衬线');
+    p.typography.hierarchy = [
+      { role: 'display', sizePx: 96, weight: 800, letterSpacing: '-0.02em' },
+      { role: 'body', sizePx: 16, weight: 400 },
+    ];
+
+    const css = buildCssTokens(p);
+
+    expect(css).toContain('--font-display: 800 96px/1.6 var(--font-family);');
+    expect(css).toContain('--font-display-letter-spacing: -0.02em;');
+    // 塞进简写会让整条声明失效（CSS.supports('font', …) 实测 false）
+    expect(css).not.toContain('96px/1.6 -0.02em');
+    // 没有字距的层级不出多余 token
+    expect(css).not.toContain('--font-body-letter-spacing');
+  });
+
+  it('中文 role 仍按 role-N 回退，字距 token 用同一个 id', () => {
+    const p = profile('无衬线');
+    p.typography.hierarchy = [
+      { role: '大标题', sizePx: 56, weight: 700, letterSpacing: '-0.01em' },
+    ];
+
+    const css = buildCssTokens(p);
+
+    expect(css).toContain('--font-level-0: 700 56px/1.6 var(--font-family);');
+    expect(css).toContain('--font-level-0-letter-spacing: -0.01em;');
+  });
+});

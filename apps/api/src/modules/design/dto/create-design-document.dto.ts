@@ -21,4 +21,9 @@ export class CreateDesignDocumentDto {
   @IsString()
   @MaxLength(500)
   summary?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string;
 }

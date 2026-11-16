@@ -1,6 +1,7 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { ZipArchive } from 'archiver';
+import sharp from 'sharp';
 import { PassThrough, Readable } from 'node:stream';
 import { ResourceRepository } from './repositories/resource.repository';
 import { ResourceFileRepository } from '../file/repositories/resource-file.repository';
@@ -8,7 +9,7 @@ import { CategoryRepository } from '../category/repositories/category.repository
 import { IStorageService, STORAGE_SERVICE } from '../storage/interfaces/storage-service.interface';
 import { IJobScheduler, JOB_SCHEDULER } from '../processing/interfaces/job-scheduler.interface';
 import { SearchService } from '../search/search.service';
-import { FileRole } from '../../common/constants/enums';
+import { AcquisitionMode, FileRole, ResourceType } from '../../common/constants/enums';
 import { JobType, ProcessingStatus } from '../../common/constants/enums';
 import { SearchResourceDto, ResourceSortField, SortOrder } from '../search/dto/search-resource.dto';
 import { UpdateResourceDto } from './dto/update-resource.dto';
@@ -144,34 +145,25 @@ const INCOMPRESSIBLE_MIME_TYPES = new Set([
   'application/x-font-woff2',
 ]);
 
-/**
- * 比较两个排序键值（用于相邻资源导航的确定性全序）。
- * NULL 视为最小值（与 SQLite 升序时 NULL 排最前一致）；
- * 支持 Date（createdAt/updatedAt）、bigint（sizeBytes）、string（title）。
- */
-function compareSortKey(
-  a: Date | bigint | string | null,
-  b: Date | bigint | string | null,
-): number {
-  if (a === null && b === null) return 0;
-  if (a === null) return -1;
-  if (b === null) return 1;
-
-  if (typeof a === 'string' && typeof b === 'string') {
-    return a < b ? -1 : a > b ? 1 : 0;
-  }
-  if (typeof a === 'bigint' && typeof b === 'bigint') {
-    return a < b ? -1 : a > b ? 1 : 0;
-  }
-
-  const ta = a instanceof Date ? a.getTime() : Number(a);
-  const tb = b instanceof Date ? b.getTime() : Number(b);
-  if (Number.isNaN(ta) || Number.isNaN(tb)) return 0;
-  return ta === tb ? 0 : ta < tb ? -1 : 1;
+/** 清空回收站的执行进度（流式接口逐条推送，便于前端展示进度条） */
+export interface EmptyTrashProgress {
+  /** 待处理资源总数 / 文件总数（开始清理时即确定） */
+  totalResources: number;
+  totalFiles: number;
+  /** 已处理（成功 + 跳过）的资源数 / 文件记录数 */
+  processedResources: number;
+  processedFiles: number;
+  /** 实际从磁盘删除的文件数：共用文件只计一次，仍被正常资源引用的不计 */
+  deletedResources: number;
+  deletedFiles: number;
+  /** 已被并发请求删除而跳过的资源数 */
+  skippedResources: number;
 }
 
 @Injectable()
 export class ResourceService {
+  private readonly logger = new Logger(ResourceService.name);
+
   constructor(
     private readonly resourceRepo: ResourceRepository,
     private readonly fileRepo: ResourceFileRepository,
@@ -180,6 +172,64 @@ export class ResourceService {
     @Inject(JOB_SCHEDULER) private readonly scheduler: IJobScheduler,
     private readonly searchService: SearchService,
   ) {}
+
+  /**
+   * 详情页大图预览缓存。
+   *
+   * 43MB / 3232×5760 的 PNG 直接内联会先传 43MB、再让浏览器解码 1800 万像素，
+   * 打开详情要 1s 以上。这里按需缩到 2560px 的 WebP（~几百 KB），
+   * 结果缓存在进程内，后续请求只读内存。
+   */
+  private readonly previewCache = new Map<string, { buffer: Buffer; mimeType: string }>();
+  private previewCacheBytes = 0;
+  private static readonly PREVIEW_CACHE_LIMIT_BYTES = 48 * 1024 * 1024;
+  /**
+   * 单次缩放允许读入的原图上限。
+   *
+   * 缩放需要 `storage.get()` 把整份原图读进 Buffer 再交给 Sharp 解码，
+   * 超过这个体积时直接回退原图流，避免一次预览请求把进程内存拉高上百 MB。
+   */
+  private static readonly PREVIEW_MAX_INPUT_BYTES = 64 * 1024 * 1024;
+  /** 可以安全栅格化成静态预览的图片类型（动图缩放会丢帧，SVG 不在白名单） */
+  private static readonly RESIZABLE_IMAGE_TYPES = new Set([
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'image/avif',
+    'image/tiff',
+  ]);
+
+  /** 可以直接内嵌成 data URI 的图片类型（SVG/TIFF 不进设计预览） */
+  private static readonly INLINE_MEDIA_MIME = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/gif',
+    'image/avif',
+  ]);
+
+  /**
+   * 缩放并发闸门：每次缩放都要把整张原图读进内存再交给 Sharp 解码，
+   * 并发请求多时峰值内存成倍增长。超出上限的请求在读取文件前排队。
+   */
+  private static readonly PREVIEW_RESIZE_CONCURRENCY = 2;
+  private previewResizeActive = 0;
+  private previewResizeWaiters: Array<() => void> = [];
+
+  /**
+   * 回收站统计的短 TTL 缓存。
+   *
+   * 统计与列表并行拉取，但翻页、恢复、删除后的刷新都会重复计算一次全量文件；
+   * 回收站很大时每次交互都要扫全表。TTL 内复用结果，所有会改变回收站内容的
+   * 操作显式失效，保证用户自己的操作立刻可见。
+   */
+  private trashStatsCache: {
+    value: { resourceCount: number; fileCount: number; totalSizeBytes: string };
+    expiresAt: number;
+  } | null = null;
+  /** 失效代数：读穿计算期间发生过失效时，丢弃这次结果而不是写回缓存 */
+  private trashStatsEpoch = 0;
+  private static readonly TRASH_STATS_TTL_MS = 5_000;
 
   /**
    * 分页查询资源列表（默认排除已软删除）
@@ -203,12 +253,10 @@ export class ResourceService {
       return {
         ...item,
         sizeBytes: item.sizeBytes.toString(),
-        // External images have no generated local thumbnail. Prefer the source's
-        // preview URL and fall back to its direct download URL for recognition.
-        previewUrl:
-          locators.find((locator) => locator.locatorType === 'preview')?.url ??
-          downloadLocator?.url ??
-          null,
+        // 远端缩略图只认 preview 定位器；没有时前端会退回 downloadUrl。
+        previewUrl: locators.find((locator) => locator.locatorType === 'preview')?.url ?? null,
+        // 远端媒体的真实地址（下载定位器）。视频卡片要用它播放，不能拿预览缩略图当视频源。
+        downloadUrl: downloadLocator?.url ?? null,
         // 远程资源下载失败时列表要能直接看出原因，而不是只显示“远程资源”
         downloadError:
           item.acquisitionMode === 'metadata_only' ? (downloadLocator?.lastError ?? null) : null,
@@ -223,6 +271,19 @@ export class ResourceService {
       pageSize,
       totalPages: Math.ceil(total / pageSize),
     };
+  }
+
+  /**
+   * 当前筛选范围内的全部资源 ID（"全选当前目录"用）。
+   *
+   * 列表接口 pageSize 上限为 100，几千条资源要靠前端逐页翻几十次；
+   * 这里用同一套 where 条件一次取回全部 ID（只查 id 列，不带关联），
+   * 一次往返即可完成全选。返回值不带分页信息，调用方应以本次快照为准。
+   */
+  async findIds(query: SearchResourceDto): Promise<{ ids: string[]; total: number }> {
+    const where = this.searchService.buildWhereClause(query);
+    const rows = await this.resourceRepo.findIds(where);
+    return { ids: rows.map((row) => row.id), total: rows.length };
   }
 
   /**
@@ -248,26 +309,34 @@ export class ResourceService {
     const where = this.searchService.buildWhereClause(query);
     const sortField = query.sortBy ?? ResourceSortField.createdAt;
     const sortOrder = query.sortOrder ?? SortOrder.desc;
+    const order: 'asc' | 'desc' = sortOrder === SortOrder.asc ? 'asc' : 'desc';
 
-    const keys = await this.resourceRepo.findSortKeys({ where, field: sortField });
-
-    const direction = sortOrder === SortOrder.asc ? 1 : -1;
-    keys.sort((a, b) => {
-      const cmp = compareSortKey(a.sortKey, b.sortKey) * direction;
-      if (cmp !== 0) return cmp;
-      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    });
-
-    const index = keys.findIndex((key) => key.id === id);
-    if (index === -1) {
-      return { previousId: null, nextId: null, currentIndex: null, total: keys.length };
+    // 总数与"当前资源是否在筛选范围内"可以并行；后者为 0 时直接返回空箭头。
+    const [total, inScope] = await Promise.all([
+      this.resourceRepo.count(where),
+      this.resourceRepo.count({ AND: [where, { id }] }),
+    ]);
+    if (inScope === 0) {
+      return { previousId: null, nextId: null, currentIndex: null, total };
     }
 
+    // 排序字段在 schema 里都非空，直接取当前行的值做游标，不需要额外查询。
+    const key = existing[sortField];
+    const cursor = { where, field: sortField, key, id, order };
+
+    // 之前：取回筛选范围内全部行 + JS 排序（7411 条约 100–160ms，随数据量线性增长）。
+    // 现在：3 个带索引条件的查询 + LIMIT 1，耗时与结果集大小无关。
+    const [beforeCount, previous, next] = await Promise.all([
+      this.resourceRepo.countBefore(cursor),
+      this.resourceRepo.findNeighbor({ ...cursor, direction: 'previous' }),
+      this.resourceRepo.findNeighbor({ ...cursor, direction: 'next' }),
+    ]);
+
     return {
-      previousId: index > 0 ? keys[index - 1].id : null,
-      nextId: index < keys.length - 1 ? keys[index + 1].id : null,
-      currentIndex: index + 1,
-      total: keys.length,
+      previousId: previous?.id ?? null,
+      nextId: next?.id ?? null,
+      currentIndex: beforeCount + 1,
+      total,
     };
   }
 
@@ -368,6 +437,7 @@ export class ResourceService {
 
   async batchSoftDelete(ids: string[]) {
     const deleted = await this.resourceRepo.batchSoftDelete(ids);
+    this.invalidateTrashStats();
     return {
       resourceIds: ids,
       deleted,
@@ -380,12 +450,33 @@ export class ResourceService {
     filename: string;
     foundResources: number;
     missingResources: number;
+    missingResourceIds: string[];
   }> {
-    const resources = await this.resourceRepo.findActiveOriginalFiles(ids);
+    const requestedIds = [...new Set(ids)];
+    const resources = await this.resourceRepo.findActiveOriginalFiles(requestedIds);
     const downloadableResources = resources.filter((resource) => resource.files.length > 0);
     if (downloadableResources.length === 0) {
-      throw new NotFoundException('No downloadable resources found');
+      throw new NotFoundException(
+        '所选资源都没有本地原文件，无法打包下载。链接资源或仅元数据资源需要先下载到本地。',
+      );
     }
+
+    // 没有本地原文件的资源（链接 / 仅元数据 / 已失联）不会进入压缩包，
+    // 需要把每一笔跳过都记录下来，前端才能如实提示数量并告诉用户少了哪些。
+    const downloadableIds = new Set(downloadableResources.map((resource) => resource.id));
+    const resourcesById = new Map(resources.map((resource) => [resource.id, resource]));
+    const skippedResources = requestedIds
+      .filter((id) => !downloadableIds.has(id))
+      .map((id) => {
+        const resource = resourcesById.get(id);
+        const rawTitle = resource ? resource.title || resource.originalFilename || id : id;
+        return {
+          id,
+          // 标题来自外部来源，压平换行避免清单格式被破坏
+          title: rawTitle.replace(/\s+/g, ' ').trim() || id,
+          reason: resource ? '无本地原文件' : '资源不存在或已删除',
+        };
+      });
 
     // 使用 zlib 默认 DEFLATE 压缩级别（level 6），仅对文本等可压缩内容生效；
     // 视频、图片、压缩包等已压缩格式通过每项 store: true 跳过压缩，避免大文件白白消耗 CPU。
@@ -393,6 +484,11 @@ export class ResourceService {
     const archive = new ZipArchive({ zlib: { level: 6 } });
     const output = new PassThrough();
     const usedNames = new Map<string, number>();
+    // 先占位清单文件名，保证 toast 里提示的 _skipped-resources.txt 不会因资源重名被改名
+    const skippedManifestName =
+      skippedResources.length > 0
+        ? this.uniqueArchiveName('_skipped-resources.txt', usedNames)
+        : null;
     archive.on('error', (error) => output.destroy(error));
     archive.pipe(output);
 
@@ -400,6 +496,12 @@ export class ResourceService {
       void (async () => {
         try {
           for (const resource of downloadableResources) {
+            // 客户端取消/断开时 controller 会 destroy 输出流，这里立刻收手：
+            // 否则还会把剩下的资源逐个读出来打包，白白消耗磁盘 IO
+            if (output.destroyed) {
+              archive.destroy();
+              return;
+            }
             const [originalFile] = resource.files;
             const stream = await this.storage.getStream(originalFile.storagePath);
             const name = this.uniqueArchiveName(
@@ -410,6 +512,16 @@ export class ResourceService {
               name,
               store: this.isAlreadyCompressed(name, originalFile.mimeType, originalFile.extension),
             });
+          }
+          if (skippedManifestName) {
+            archive.append(
+              this.buildSkippedResourcesManifest(
+                skippedResources,
+                requestedIds.length,
+                downloadableResources.length,
+              ),
+              { name: skippedManifestName },
+            );
           }
           await archive.finalize();
         } catch (e) {
@@ -423,7 +535,8 @@ export class ResourceService {
       stream: output,
       filename: `resources-${new Date().toISOString().slice(0, 10)}.zip`,
       foundResources: downloadableResources.length,
-      missingResources: ids.length - downloadableResources.length,
+      missingResources: skippedResources.length,
+      missingResourceIds: skippedResources.map((resource) => resource.id),
     };
   }
 
@@ -489,6 +602,125 @@ export class ResourceService {
   }
 
   /**
+   * 生成缩放后的图片预览（仅静态位图）。
+   *
+   * 返回 null 表示不需要或不能缩放（非图片、动图、原图本来就小、原文件记录缺失、
+   * 解码失败），调用方应回退到原文件/缩略图分支。
+   */
+  async getResizedPreview(
+    id: string,
+    maxEdge: number,
+  ): Promise<{ buffer: Buffer; mimeType: string; originalFilename: string } | null> {
+    const resource = await this.resourceRepo.findById(id);
+    if (!resource) {
+      throw new NotFoundException(`Resource ${id} not found`);
+    }
+    const baseType = resource.mimeType.split(';', 1)[0].trim().toLowerCase();
+    if (!ResourceService.RESIZABLE_IMAGE_TYPES.has(baseType)) {
+      return null;
+    }
+    // DB 里已记录尺寸时直接判断，避免为了一个小图把文件读出来再解码
+    const recordedSide = Math.max(resource.width ?? 0, resource.height ?? 0);
+    if (recordedSide > 0 && recordedSide <= maxEdge) {
+      return null;
+    }
+
+    const cacheKey = `${id}:${maxEdge}`;
+    const cached = this.previewCache.get(cacheKey);
+    if (cached) {
+      return { ...cached, originalFilename: resource.originalFilename };
+    }
+
+    const originalFile = await this.fileRepo.findByResourceAndRole(id, FileRole.original);
+    if (!originalFile) {
+      // 只有缩略图的资源：这里抛 404 会让整个资源预览裂掉，交回调用方降级。
+      return null;
+    }
+    // 超大原图不读进内存：直接返回 null，由调用方回退到原文件流
+    if (originalFile.sizeBytes > BigInt(ResourceService.PREVIEW_MAX_INPUT_BYTES)) {
+      return null;
+    }
+
+    let buffer: Buffer;
+    // 从读文件到编码完成都占用一个槽位：原图 Buffer 和 Sharp 的像素缓冲
+    // 才是内存大头，排队必须排在这之前。
+    const release = await this.acquirePreviewResizeSlot();
+    try {
+      let input: Buffer;
+      try {
+        input = await this.storage.get(originalFile.storagePath);
+      } catch {
+        // 记录还在但原文件丢了：交给调用方回退缩略图/原图分支，
+        // 不要让 /preview 直接 404 掉整个资源。
+        return null;
+      }
+      try {
+        // 只读头部拿尺寸/帧数：小图不必重新编码，动图缩放会丢帧（交给原图分支）
+        const metadata = await sharp(input).metadata();
+        if ((metadata.pages ?? 1) > 1) return null;
+        if ((metadata.width ?? 0) <= maxEdge && (metadata.height ?? 0) <= maxEdge) return null;
+
+        buffer = await sharp(input)
+          .rotate()
+          .resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
+          .webp({ quality: 82 })
+          .toBuffer();
+      } catch {
+        // 损坏或 libvips 不支持的格式：交给原图分支
+        return null;
+      }
+    } finally {
+      release();
+    }
+
+    const mimeType = 'image/webp';
+    this.cachePreview(cacheKey, { buffer, mimeType });
+    return { buffer, mimeType, originalFilename: resource.originalFilename };
+  }
+
+  /**
+   * 取得一个缩放槽位，返回释放函数。
+   *
+   * 释放时若有等待者，直接把槽位移交（不自减再让别人自增），避免「刚释放
+   * 一个、新请求立刻抢占、被唤醒的等待者也同时进入」导致并发超限。
+   */
+  private async acquirePreviewResizeSlot(): Promise<() => void> {
+    if (this.previewResizeActive < ResourceService.PREVIEW_RESIZE_CONCURRENCY) {
+      this.previewResizeActive += 1;
+    } else {
+      await new Promise<void>((resolve) => this.previewResizeWaiters.push(resolve));
+      // 槽位由释放方直接移交，这里不再自增
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.previewResizeWaiters.shift();
+      if (next) next();
+      else this.previewResizeActive -= 1;
+    };
+  }
+
+  /** 按总字节数淘汰的 FIFO 缓存；单张过大则不入缓存，避免挤掉所有条目 */
+  private cachePreview(key: string, value: { buffer: Buffer; mimeType: string }): void {
+    const size = value.buffer.byteLength;
+    if (size > ResourceService.PREVIEW_CACHE_LIMIT_BYTES) return;
+
+    const existing = this.previewCache.get(key);
+    if (existing) this.previewCacheBytes -= existing.buffer.byteLength;
+    this.previewCache.set(key, value);
+    this.previewCacheBytes += size;
+
+    while (this.previewCacheBytes > ResourceService.PREVIEW_CACHE_LIMIT_BYTES) {
+      const oldestKey = this.previewCache.keys().next().value as string | undefined;
+      if (!oldestKey) break;
+      const removed = this.previewCache.get(oldestKey);
+      this.previewCache.delete(oldestKey);
+      this.previewCacheBytes -= removed?.buffer.byteLength ?? 0;
+    }
+  }
+
+  /**
    * 获取派生文件（快照 / 缩略图 / 提取文本 / 转码）的可读流
    *
    * 原文件走 /download，派生文件按角色取，避免为每个角色开一个端点。
@@ -520,26 +752,204 @@ export class ResourceService {
   }
 
   /**
-   * 获取缩略图可读流
-   * 如果缩略图尚未生成，返回 null
+   * 获取缩略图可读流。
+   *
+   * - 成功路径只查一次 resource_files（缩略图命中是常态，不再先查 resource）
+   * - 返回 ETag，命中 If-None-Match 时调用方直接回 304，省掉一次文件读取
+   * - 缩略图尚未生成时返回 null（resource 是否存在由这里判定）
    */
-  async getThumbnailFile(id: string): Promise<{
-    stream: Readable;
-    mimeType: string;
-  } | null> {
-    const resource = await this.resourceRepo.findById(id);
-    if (!resource) {
-      throw new NotFoundException(`Resource ${id} not found`);
-    }
+  async getThumbnailFile(
+    id: string,
+    ifNoneMatch?: string,
+  ): Promise<
+    | { notModified: true; etag: string }
+    | { notModified?: false; stream: Readable; mimeType: string; etag: string }
+    | null
+  > {
     const thumbnailFile = await this.fileRepo.findByResourceAndRole(id, FileRole.thumbnail);
     if (!thumbnailFile) {
+      const resource = await this.resourceRepo.findById(id);
+      if (!resource) {
+        throw new NotFoundException(`Resource ${id} not found`);
+      }
       return null;
     }
+
+    const etag = `"${thumbnailFile.id}-${thumbnailFile.sizeBytes.toString()}"`;
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      return { notModified: true, etag };
+    }
+
     const stream = await this.storage.getStream(thumbnailFile.storagePath);
     return {
       stream,
       mimeType: thumbnailFile.mimeType || 'image/webp',
+      etag,
     };
+  }
+
+  /**
+   * 设计素材可用性检查。
+   *
+   * 只接受有本地文件的图片/视频；视频必须有已生成的封面帧。
+   * 这里不读文件字节，供「一句话生成」在建任务前快速校验。
+   */
+  async assertDesignMedia(id: string): Promise<{
+    kind: 'image' | 'video';
+    title: string;
+    width: number | null;
+    height: number | null;
+    durationSeconds: number | null;
+  }> {
+    const { resource, kind } = await this.loadDesignMedia(id);
+    const duration = resource.durationSeconds === null ? null : Number(resource.durationSeconds);
+    return {
+      kind,
+      title: resource.title || resource.originalFilename,
+      width: resource.width,
+      height: resource.height,
+      durationSeconds:
+        duration !== null && Number.isFinite(duration) && duration > 0 ? duration : null,
+    };
+  }
+
+  /**
+   * 读取设计素材字节。
+   *
+   * 图片优先用按需缩放的 WebP（大图），其次原图（不超过上限），最后缩略图；
+   * 视频只使用封面帧。返回的 cacheKey 供上层缓存 data URI，避免滑块预览反复读盘。
+   */
+  async readDesignMedia(
+    id: string,
+    options: { maxEdge?: number; maxBytes?: number } = {},
+  ): Promise<{
+    buffer: Buffer;
+    mimeType: string;
+    kind: 'image' | 'video';
+    cacheKey: string;
+  }> {
+    const { resource, kind } = await this.loadDesignMedia(id);
+    const maxEdge = Math.min(2048, Math.max(512, Math.round(options.maxEdge ?? 1200)));
+    const maxBytes = Math.min(
+      16 * 1024 * 1024,
+      Math.max(256 * 1024, Math.round(options.maxBytes ?? 4 * 1024 * 1024)),
+    );
+
+    if (kind === 'video') {
+      const thumbnail = await this.getThumbnailFile(id);
+      if (!thumbnail || thumbnail.notModified) {
+        throw new BadRequestException('视频封面还没生成，请等处理完成后再试');
+      }
+      return {
+        buffer: await this.readStreamBuffer(thumbnail.stream, maxBytes),
+        mimeType: normalizeMimeType(thumbnail.mimeType),
+        kind,
+        cacheKey: thumbnail.etag,
+      };
+    }
+
+    // 只有缩略图、没有原文件的图片：getResizedPreview 需要读原文件，可能直接抛
+    // NotFound。这里必须降级到后面的缩略图分支，而不是让整个素材读取失败。
+    const resized = await this.getResizedPreview(id, maxEdge).catch(() => null);
+    if (resized && resized.buffer.length <= maxBytes) {
+      return {
+        buffer: resized.buffer,
+        mimeType: normalizeMimeType(resized.mimeType),
+        kind,
+        cacheKey: `${resource.sha256 ?? resource.id}:${maxEdge}`,
+      };
+    }
+
+    // 小图/动图：原图质量最好，但不能无限大；超过上限再回退缩略图。
+    const originalInfo = await this.getOriginalFileInfo(id).catch(() => null);
+    const originalMime = originalInfo ? normalizeMimeType(originalInfo.mimeType) : '';
+    if (
+      originalInfo &&
+      originalInfo.sizeBytes <= maxBytes &&
+      ResourceService.INLINE_MEDIA_MIME.has(originalMime)
+    ) {
+      const original = await this.getOriginalFile(id);
+      return {
+        buffer: await this.readStreamBuffer(original.stream, maxBytes),
+        mimeType: originalMime,
+        kind,
+        cacheKey: `${resource.sha256 ?? resource.id}:${originalInfo.sizeBytes}`,
+      };
+    }
+
+    const thumbnail = await this.getThumbnailFile(id);
+    if (thumbnail && !thumbnail.notModified) {
+      const mimeType = normalizeMimeType(thumbnail.mimeType);
+      if (ResourceService.INLINE_MEDIA_MIME.has(mimeType)) {
+        return {
+          buffer: await this.readStreamBuffer(thumbnail.stream, maxBytes),
+          mimeType,
+          kind,
+          cacheKey: thumbnail.etag,
+        };
+      }
+      thumbnail.stream.destroy();
+    }
+
+    throw new BadRequestException('该图片格式无法直接内嵌，请重新处理生成缩略图后再试');
+  }
+
+  private async loadDesignMedia(id: string): Promise<{
+    resource: NonNullable<Awaited<ReturnType<ResourceRepository['findById']>>>;
+    kind: 'image' | 'video';
+  }> {
+    const resource = await this.resourceRepo.findById(id);
+    if (!resource || resource.deletedAt) {
+      throw new NotFoundException(`Resource ${id} not found or deleted`);
+    }
+    if (
+      resource.resourceType !== ResourceType.image &&
+      resource.resourceType !== ResourceType.video
+    ) {
+      throw new BadRequestException('只有图片或视频可以作为设计素材');
+    }
+
+    const [originalFile, thumbnailFile] = await Promise.all([
+      this.fileRepo.findByResourceAndRole(id, FileRole.original),
+      this.fileRepo.findByResourceAndRole(id, FileRole.thumbnail),
+    ]);
+    const remoteOnly =
+      resource.acquisitionMode === AcquisitionMode.link_only ||
+      resource.acquisitionMode === AcquisitionMode.metadata_only;
+    if (remoteOnly && !originalFile && !thumbnailFile) {
+      throw new BadRequestException('该资源还没有本地文件，请先在资源详情下载到本地');
+    }
+    if (resource.resourceType === ResourceType.video && !thumbnailFile) {
+      throw new BadRequestException('视频封面还没生成，请等处理完成后再试');
+    }
+    if (resource.resourceType === ResourceType.image && !originalFile && !thumbnailFile) {
+      throw new BadRequestException('该资源还没有本地文件，请先在资源详情下载到本地');
+    }
+    return {
+      resource,
+      kind: resource.resourceType === ResourceType.video ? 'video' : 'image',
+    };
+  }
+
+  private async readStreamBuffer(stream: Readable, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      for await (const chunk of stream) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+        size += buffer.length;
+        if (size > maxBytes) {
+          throw new BadRequestException(
+            `素材文件超过 ${Math.round(maxBytes / 1024 / 1024)}MB 上限`,
+          );
+        }
+        chunks.push(buffer);
+      }
+    } catch (error) {
+      stream.destroy();
+      throw error;
+    }
+    return Buffer.concat(chunks, size);
   }
 
   /** 软删除 */
@@ -549,6 +959,7 @@ export class ResourceService {
       throw new NotFoundException(`Resource ${id} not found`);
     }
     const updated = await this.resourceRepo.softDelete(id);
+    this.invalidateTrashStats();
     return { id: updated.id, deletedAt: updated.deletedAt };
   }
 
@@ -559,12 +970,14 @@ export class ResourceService {
       throw new NotFoundException(`Resource ${id} not found`);
     }
     const updated = await this.resourceRepo.restore(id);
+    this.invalidateTrashStats();
     return { id: updated.id, deletedAt: updated.deletedAt };
   }
 
   /** 批量恢复：一次请求恢复多个回收站资源，并汇总未恢复成功的资源 */
   async batchRestore(ids: string[]) {
     const { restored, failedIds } = await this.resourceRepo.batchRestore(ids);
+    this.invalidateTrashStats();
     return {
       resourceIds: ids,
       restored,
@@ -573,7 +986,17 @@ export class ResourceService {
     };
   }
 
-  /** 彻底删除：清理磁盘文件和数据库记录。只允许删除已在回收站中的资源。 */
+  /**
+   * 彻底删除：清理数据库记录与磁盘文件。只允许删除已在回收站中的资源。
+   *
+   * 先删记录、再删文件：
+   * - `deleteDeleted` 只在记录仍处于回收站时生效，返回 0 说明记录刚被并发恢复
+   *   或被另一个请求删除。此时绝不能再动磁盘文件，否则恢复后的资源会指向
+   *   不存在的文件；
+   * - 记录删除后做引用检查，内容寻址导致的重复资源共用文件只要还有引用就保留。
+   * 代价是磁盘删除失败会留下孤儿文件（一致性检查可发现），但这比产生
+   * 「记录还在、文件没了」的坏资源安全。
+   */
   async permanentDelete(id: string) {
     const resource = await this.resourceRepo.findByIdWithRelations(id);
     if (!resource) {
@@ -583,42 +1006,231 @@ export class ResourceService {
       throw new BadRequestException(`Resource ${id} is not in trash`);
     }
 
-    await Promise.all(resource.files.map((file) => this.storage.delete(file.storagePath)));
     const deletedCount = await this.resourceRepo.deleteDeleted(id);
+    this.invalidateTrashStats();
+    if (deletedCount === 0) {
+      // 并发恢复或已被另一个请求彻底删除：磁盘文件不归本次请求处理
+      return { id, deleted: false, deletedFiles: 0 };
+    }
+
+    // 本资源的 file 行已随记录级联删除，剩下的引用都来自其它资源
+    const deletedFiles = await this.deleteUnreferencedFiles(
+      resource.files.map((file) => file.storagePath),
+    );
+
+    return { id, deleted: true, deletedFiles };
+  }
+
+  /**
+   * 回收站统计：已删除资源数、可回收文件数与可回收字节数。
+   *
+   * 存储 key 按内容哈希生成，同一份磁盘文件可能被多条重复资源引用，因此按
+   * storagePath 去重；仍被回收站之外资源引用的文件在清空时不会删除，也不
+   * 计入可回收大小。BigInt 无法 JSON 序列化，统一转成字符串。
+   */
+  async getTrashStats() {
+    const cached = this.trashStatsCache;
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const epoch = this.trashStatsEpoch;
+    const value = await this.computeTrashStats();
+    // 计算期间回收站发生了变化：这次结果已经过期，不能覆盖失效动作
+    if (epoch === this.trashStatsEpoch) {
+      this.trashStatsCache = {
+        value,
+        expiresAt: Date.now() + ResourceService.TRASH_STATS_TTL_MS,
+      };
+    }
+    return value;
+  }
+
+  /**
+   * 回收站内容变化后立即失效统计缓存。
+   *
+   * 公开给同样会改动 deletedAt 的模块（例如链接导入时复活回收站资源），
+   * 避免它们只能等 TTL 过期。
+   */
+  invalidateTrashStats() {
+    this.trashStatsEpoch += 1;
+    this.trashStatsCache = null;
+  }
+
+  private async computeTrashStats() {
+    const { resourceCount, files } = await this.resourceRepo.getTrashFileUsage();
+
+    // 同一路径理论上大小一致；取最大值只是防御脏数据
+    const sizeByPath = new Map<string, bigint>();
+    for (const file of files) {
+      const current = sizeByPath.get(file.storagePath);
+      if (current === undefined || file.sizeBytes > current) {
+        sizeByPath.set(file.storagePath, file.sizeBytes);
+      }
+    }
+
+    const trashResourceIds = new Set(files.map((file) => file.resourceId));
+    if (sizeByPath.size === 0) {
+      return { resourceCount, fileCount: 0, totalSizeBytes: '0' };
+    }
+
+    const referenced = await this.fileRepo.findStoragePathReferences([...sizeByPath.keys()]);
+    const reclaimablePaths = [...sizeByPath.keys()].filter((storagePath) => {
+      const resourceIds = referenced.get(storagePath);
+      if (!resourceIds) return true;
+      for (const resourceId of resourceIds) {
+        if (!trashResourceIds.has(resourceId)) return false;
+      }
+      return true;
+    });
+
+    const totalSizeBytes = reclaimablePaths.reduce(
+      (sum, storagePath) => sum + (sizeByPath.get(storagePath) ?? 0n),
+      0n,
+    );
 
     return {
-      id,
-      deleted: deletedCount > 0,
-      deletedFiles: resource.files.length,
+      resourceCount,
+      fileCount: reclaimablePaths.length,
+      totalSizeBytes: totalSizeBytes.toString(),
     };
   }
 
-  /** 清空回收站 */
-  async emptyTrash() {
+  /**
+   * 清空回收站
+   *
+   * onProgress：逐条删除时推送进度，供 SSE 接口驱动前端进度条。
+   * 注意：清理过程不可中途取消（客户端断开也会继续删除到底）。
+   *
+   * 分两阶段：先逐条删除数据库记录，再统一清理磁盘文件。
+   * - 只有 `deleteDeleted` 确认删掉的记录才收集文件；并发恢复的资源返回 0，
+   *   其文件不会被误删；
+   * - 文件清理以「记录删除后」的引用状态为准，重复资源共用的文件只删一次，
+   *   仍被正常资源引用的文件保留。
+   */
+  async emptyTrash(options?: { onProgress?: (progress: EmptyTrashProgress) => void }) {
+    // 清空过程可能持续很久，先让统计缓存失效，避免期间一直返回清空前的数字
+    this.invalidateTrashStats();
     const resources = await this.resourceRepo.findDeletedWithFiles();
+    const totalResources = resources.length;
+    const totalFiles = resources.reduce((sum, resource) => sum + resource.files.length, 0);
+
+    let processedResources = 0;
+    let processedFiles = 0;
     let deletedResources = 0;
     let deletedFiles = 0;
     let skippedResources = 0;
-    for (const resource of resources) {
-      const storagePaths = resource.files.map((file) => file.storagePath);
-      // 删除存储文件（忽略已不存在的文件）
-      await Promise.all(storagePaths.map((path) => this.storage.delete(path)));
-      // 删除数据库记录（幂等：并发删除时 count=0 不报错）
-      const count = await this.resourceRepo.deleteDeleted(resource.id);
-      if (count > 0) {
-        deletedResources++;
-        deletedFiles += storagePaths.length;
-      } else {
-        // 记录已被并发请求删除
-        skippedResources++;
+
+    const emitProgress = () =>
+      options?.onProgress?.({
+        totalResources,
+        totalFiles,
+        processedResources,
+        processedFiles,
+        deletedResources,
+        deletedFiles,
+        skippedResources,
+      });
+
+    // 先推一次 0 进度：前端据此立刻拿到总数并渲染进度条，而不是空白等待
+    emitProgress();
+
+    // 第一阶段：删除数据库记录，只收集真正删掉的资源的文件。
+    // 中途抛错也要进入第二阶段：已经删掉的记录如果不清文件，就会留下永久孤儿。
+    const storagePaths: string[] = [];
+    let phaseError: unknown = null;
+    try {
+      for (const resource of resources) {
+        // 幂等：并发删除时 count=0；并发恢复时同样 count=0（deletedAt 已为空）
+        const count = await this.resourceRepo.deleteDeleted(resource.id);
+        if (count > 0) {
+          deletedResources++;
+          storagePaths.push(...resource.files.map((file) => file.storagePath));
+        } else {
+          // 已被并发请求删除，或刚被恢复：不碰它的磁盘文件
+          skippedResources++;
+        }
+        processedResources++;
+        processedFiles += resource.files.length;
+        emitProgress();
       }
+    } catch (error) {
+      phaseError = error;
+    } finally {
+      // 第二阶段：记录已删，按删除后的引用状态回收磁盘文件
+      deletedFiles = await this.deleteUnreferencedFiles(storagePaths, (count) => {
+        deletedFiles = count;
+        emitProgress();
+      });
+      // 期间可能有请求把「清到一半」的结果写进缓存，结束时再失效一次
+      this.invalidateTrashStats();
     }
+    if (phaseError) throw phaseError;
 
     return {
       deletedResources,
       deletedFiles,
       skippedResources,
     };
+  }
+
+  /**
+   * 删除没有任何 ResourceFile 引用的磁盘文件，返回实际删除成功数。
+   *
+   * 必须在删除数据库记录之后调用，这样引用检查反映的是「删除后」的真实状态：
+   * - 并发恢复的资源仍在库中 → 其文件被跳过；
+   * - 内容寻址导致的重复资源共用文件 → 只要还有一条引用就保留；
+   * - 同一路径在一次清理中只处理一次。
+   *
+   * 引用检查或 unlink 失败不抛错：记录已经删掉，失败只会留下孤儿文件
+   * （一致性检查可以找出），不会产生指向缺失文件的坏记录。
+   *
+   * 残余窗口：引用查询返回后到 unlink 之间，另一个进程仍可能提交新的
+   * ResourceFile 行或 put() 同一 key。彻底消除需要内容寻址 blob 的引用计数
+   * 或延迟 GC；这里把窗口压缩到极短，查询前已提交的引用一定不会被误删。
+   */
+  private async deleteUnreferencedFiles(
+    storagePaths: string[],
+    onProgress?: (deletedCount: number) => void,
+  ): Promise<number> {
+    const uniquePaths = [...new Set(storagePaths)];
+    if (uniquePaths.length === 0) return 0;
+
+    let references: Map<string, Set<string>>;
+    try {
+      references = await this.fileRepo.findStoragePathReferences(uniquePaths);
+    } catch (error) {
+      this.logger.warn(`Skip storage cleanup: reference check failed: ${describeError(error)}`);
+      return 0;
+    }
+
+    const unreferencedPaths = uniquePaths.filter((path) => !references.has(path));
+    let deletedCount = 0;
+    const failures: Array<{ path: string; error: unknown }> = [];
+    const chunkSize = 100;
+    for (let offset = 0; offset < unreferencedPaths.length; offset += chunkSize) {
+      const chunk = unreferencedPaths.slice(offset, offset + chunkSize);
+      const results = await Promise.all(
+        chunk.map(async (path) => {
+          try {
+            await this.storage.delete(path);
+            return 1;
+          } catch (error) {
+            failures.push({ path, error });
+            return 0;
+          }
+        }),
+      );
+      deletedCount += results.reduce<number>((sum, count) => sum + count, 0);
+      onProgress?.(deletedCount);
+    }
+
+    // 磁盘批量失败时只汇总一条日志，避免刷屏
+    if (failures.length > 0) {
+      this.logger.warn(
+        `Failed to delete ${failures.length}/${unreferencedPaths.length} unreferenced files; ` +
+          `first error (${failures[0].path}): ${describeError(failures[0].error)}`,
+      );
+    }
+
+    return deletedCount;
   }
 
   /** 重新处理：创建新的元数据检测任务，并标记资源正在处理 */
@@ -631,6 +1243,27 @@ export class ResourceService {
     await this.scheduler.enqueue(JobType.detect_metadata, id);
     await this.resourceRepo.updateProcessingStatus(id, ProcessingStatus.processing);
     return { id, processingStatus: ProcessingStatus.processing };
+  }
+
+  /**
+   * 生成压缩包内的跳过清单：明确列出没有本地原文件、因而未被打包的资源。
+   * 以 UTF-8 BOM 编码，保证 Windows 记事本打开中文不乱码。
+   */
+  private buildSkippedResourcesManifest(
+    skipped: { id: string; title: string; reason: string }[],
+    requestedCount: number,
+    foundCount: number,
+  ): Buffer {
+    const lines = [
+      `共选择 ${requestedCount} 个资源，已打包 ${foundCount} 个，跳过 ${skipped.length} 个。`,
+      '',
+      '以下资源未包含在此压缩包中：',
+      ...skipped.map((item) => `- ${item.title}（${item.reason}，ID: ${item.id}）`),
+      '',
+      '说明：链接资源、仅元数据资源没有本地原文件，需要先下载到本地后才能打包。',
+      '',
+    ];
+    return Buffer.from(`\uFEFF${lines.join('\n')}`, 'utf8');
   }
 
   private safeArchiveName(name: string): string {
@@ -672,4 +1305,13 @@ export class ResourceService {
     if (dotIndex <= 0) return `${name}-${current + 1}`;
     return `${name.slice(0, dotIndex)}-${current + 1}${name.slice(dotIndex)}`;
   }
+}
+
+/** `image/png; charset=binary` → `image/png` */
+function normalizeMimeType(value: string | null | undefined): string {
+  return (value ?? '').split(';', 1)[0].trim().toLowerCase();
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -731,6 +731,7 @@
 - `resources.duration_seconds`
 - `resource_files.resource_id`
 - `resource_files.file_role`
+- `resource_files.storage_path + resource_id + size_bytes`（覆盖索引：按路径反查引用、按路径分组统计存储占用）
 - `collection_resources.collection_id`
 - `processing_jobs.resource_id`
 - `processing_jobs.status`

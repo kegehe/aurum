@@ -9,6 +9,7 @@
  * - 连通性测试成功/失败（不抛异常）
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import { AiSettingsService } from './ai-settings.service';
 import type { AiProviderRepository } from './repositories/ai-provider.repository';
@@ -122,6 +123,64 @@ describe('AiSettingsService', () => {
       await service.refresh();
       expect(service.activeProvider?.apiKey).toBe('env-key');
       expect(service.summary.source).toBe('env');
+    });
+  });
+
+  describe('跨进程配置同步', () => {
+    it('定时轮询后加载其它进程刚保存的配置', async () => {
+      const findActive = vi
+        .fn()
+        .mockResolvedValueOnce(row({ id: '1', model: 'old-model', isActive: true, enabled: true }))
+        .mockResolvedValueOnce(row({ id: '1', model: 'new-model', isActive: true, enabled: true }));
+      const service = new AiSettingsService(createRepoMock({ findActive }), createConfigMock());
+      await service.refresh();
+      expect(service.activeProvider?.model).toBe('old-model');
+
+      await service.pollActiveProvider();
+      expect(service.activeProvider?.model).toBe('new-model');
+    });
+
+    it('较旧的刷新结果晚到时不会覆盖较新的配置', async () => {
+      let resolveOld!: (value: ReturnType<typeof row>) => void;
+      const findActive = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<ReturnType<typeof row>>((resolve) => {
+              resolveOld = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(
+          row({ id: '1', model: 'new-model', isActive: true, enabled: true }),
+        );
+      const service = new AiSettingsService(createRepoMock({ findActive }), createConfigMock());
+
+      const oldRefresh = service.refresh();
+      await service.refresh();
+      expect(service.activeProvider?.model).toBe('new-model');
+
+      resolveOld(row({ id: '1', model: 'old-model', isActive: true, enabled: true }));
+      await oldRefresh;
+      expect(service.activeProvider?.model).toBe('new-model');
+    });
+
+    it('轮询失败时保留当前配置且不抛异常', async () => {
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const findActive = vi
+          .fn()
+          .mockResolvedValueOnce(
+            row({ id: '1', model: 'keep-model', isActive: true, enabled: true }),
+          )
+          .mockRejectedValueOnce(new Error('db unavailable'));
+        const service = new AiSettingsService(createRepoMock({ findActive }), createConfigMock());
+        await service.refresh();
+
+        await expect(service.pollActiveProvider()).resolves.toBeUndefined();
+        expect(service.activeProvider?.model).toBe('keep-model');
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

@@ -12,21 +12,28 @@ import type { JsonRecord } from './design.types';
 function buildService(responses: string[]) {
   const prompts: string[] = [];
   let call = 0;
-  const client = {
-    messages: {
-      create: vi.fn(async ({ messages }: { messages: Array<{ content: string }> }) => {
-        prompts.push(messages[0].content);
-        const text = responses[call] ?? responses[responses.length - 1];
-        call += 1;
-        return { content: [{ type: 'text', text }] };
-      }),
-    },
-  };
-  const service = new DesignAgentService({
-    activeProvider: { model: 'test-model' },
-    buildClient: () => client,
-  } as never);
-  return { service, prompts };
+  const streamMock = vi.fn(({ messages }: { messages: Array<{ content: string }> }) => {
+    prompts.push(messages[0].content);
+    const text = responses[call] ?? responses[responses.length - 1];
+    call += 1;
+    return {
+      on: vi.fn(),
+      finalMessage: vi.fn(async () => ({
+        model: 'test-model',
+        content: [{ type: 'text', text }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })),
+    };
+  });
+  const client = { messages: { stream: streamMock } };
+  const service = new DesignAgentService(
+    {
+      activeProvider: { model: 'test-model' },
+      buildClient: () => client,
+    } as never,
+    { record: vi.fn() } as never,
+  );
+  return { service, prompts, streamMock };
 }
 
 const BASE: JsonRecord = {
@@ -57,6 +64,38 @@ describe('DesignAgentService.generateCandidates', () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0].label).toBe('A');
     expect(candidates[0].content).toEqual(BASE);
+  });
+
+  it('uses streaming so long generations are not cut off as non-streaming requests', async () => {
+    const { service, streamMock } = buildService([candidateBody(BASE)]);
+
+    await service.generateCandidates({
+      kind: 'component',
+      baseContent: BASE,
+      intent: '玻璃拟态卡片',
+      count: 1,
+    });
+
+    expect(streamMock).toHaveBeenCalledTimes(1);
+    expect(streamMock.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ model: 'test-model', max_tokens: 8_192, temperature: 0.35 }),
+    );
+  });
+
+  it('explains how appliesTo and variants map to the preview skeleton', async () => {
+    const { service, prompts } = buildService([candidateBody(BASE)]);
+
+    await service.generateCandidates({
+      kind: 'component',
+      baseContent: BASE,
+      intent: '青柠胶囊按钮',
+      count: 1,
+    });
+
+    expect(prompts[0]).toContain('COMPONENT DOCUMENT STRUCTURE');
+    expect(prompts[0]).toContain('appliesTo must be "element"');
+    expect(prompts[0]).toContain('variants.default.states');
+    expect(prompts[0]).toContain('not the base placeholder custom-component');
   });
 
   it('spells out the three landmines the validator rejects', async () => {
@@ -162,7 +201,12 @@ describe('DesignAgentService.generateCandidates', () => {
   });
 
   it('fails loudly when AI is not configured', async () => {
-    const service = new DesignAgentService({ activeProvider: null } as never);
+    const service = new DesignAgentService(
+      { activeProvider: null } as never,
+      {
+        record: vi.fn(),
+      } as never,
+    );
 
     await expect(
       service.generateCandidates({
@@ -172,6 +216,123 @@ describe('DesignAgentService.generateCandidates', () => {
         count: 1,
       }),
     ).rejects.toThrow('AI 未配置');
+  });
+});
+
+describe('DesignAgentService.generateAutoCandidates', () => {
+  const BASES = {
+    theme: { tokenSchemaVersion: 'aurum.tokens.v1', tokens: {} },
+    component: BASE,
+    animation: { schemaVersion: 'aurum.animation.v1' },
+  };
+
+  function autoBody(kind: string, name = '磨砂按钮'): string {
+    return JSON.stringify({
+      candidates: [{ kind, name, label: '方案 A', rationale: '理由', content: BASE }],
+    });
+  }
+
+  it('carries the kind the model chose and the name it gave', async () => {
+    const { service } = buildService([autoBody('component')]);
+
+    const candidates = await service.generateAutoCandidates({
+      intent: '悬停会发光的磨砂按钮',
+      bases: BASES,
+      count: 3,
+    });
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].kind).toBe('component');
+    expect(candidates[0].name).toBe('磨砂按钮');
+    expect(candidates[0].content).toEqual(BASE);
+  });
+
+  it('rejects a kind that was not offered in the bases', async () => {
+    const { service } = buildService([autoBody('layout')]);
+
+    await expect(
+      service.generateAutoCandidates({
+        intent: '整页布局',
+        bases: BASES,
+        count: 3,
+      }),
+    ).rejects.toThrow('不符合格式要求');
+  });
+
+  it('keeps the usable candidates when a sibling entry is malformed', async () => {
+    const body = JSON.stringify({
+      candidates: [
+        { kind: 'component', label: '方案 A', rationale: '好', content: BASE },
+        // 少写 content：常见的模型手滑，不该连累整批
+        { kind: 'component', name: '坏的', label: '方案 B', rationale: '坏' },
+        { kind: 'layout', label: '方案 C', rationale: '不支持', content: BASE },
+        { kind: 'animation', label: '方案 D', rationale: '好', content: BASE },
+      ],
+    });
+    const { service } = buildService([body]);
+
+    const candidates = await service.generateAutoCandidates({
+      intent: '一组动效和按钮',
+      bases: BASES,
+      count: 3,
+    });
+
+    expect(candidates.map((item) => item.label)).toEqual(['方案 A', '方案 D']);
+  });
+
+  it('cuts the batch down to the requested count instead of failing it', async () => {
+    const body = JSON.stringify({
+      candidates: ['A', 'B', 'C', 'D'].map((label) => ({
+        kind: 'component',
+        label,
+        rationale: '好',
+        content: BASE,
+      })),
+    });
+    const { service } = buildService([body]);
+
+    const candidates = await service.generateAutoCandidates({
+      intent: '四个方案',
+      bases: BASES,
+      count: 3,
+    });
+
+    expect(candidates).toHaveLength(3);
+  });
+
+  it('tells the model the three landmines and the base schemas', async () => {
+    const { service, prompts } = buildService([autoBody('component')]);
+
+    await service.generateAutoCandidates({
+      intent: '悬停会发光的磨砂按钮',
+      bases: BASES,
+      count: 1,
+    });
+
+    expect(prompts[0]).toContain('color-mix()');
+    expect(prompts[0]).toContain('calc()');
+    // 三份基底都要进提示词，否则模型没有可照抄的合法骨架
+    expect(prompts[0]).toContain('### component');
+    expect(prompts[0]).toContain('### animation');
+  });
+
+  it('teaches the component skeleton contract in auto mode', async () => {
+    const { service, prompts } = buildService([autoBody('component')]);
+
+    await service.generateAutoCandidates({
+      intent: '青柠胶囊按钮',
+      bases: BASES,
+      count: 1,
+    });
+
+    expect(prompts[0]).toContain('COMPONENT DOCUMENT STRUCTURE');
+    // 这是本次回归的核心：基底是 container，按钮必须被明确要求改成 element，
+    // 否则预览骨架永远是 "Card content"。
+    expect(prompts[0]).toContain('For a button-like component, appliesTo must be "element"');
+    expect(prompts[0]).toContain('Never emit sibling variants named hover or active');
+    expect(prompts[0]).toContain('never wrap it in another "declarations" key');
+    expect(prompts[0]).toContain('"states": {');
+    expect(prompts[0]).toContain('replace placeholder names and declarations');
   });
 });
 

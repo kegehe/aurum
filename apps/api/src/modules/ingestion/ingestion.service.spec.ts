@@ -4,8 +4,8 @@ import { Prisma } from '@prisma/client';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { SafeUrlService } from '../../common/security/safe-url.service';
 import { DirectDownloadConnector } from './connectors/direct-download.connector';
-import { IngestionJobStatus, IngestionJobType } from '../../common/constants/enums';
-import { IngestionService } from './ingestion.service';
+import { IngestionJobStatus, IngestionJobType, SourceType } from '../../common/constants/enums';
+import { IngestionService, MAX_BATCH_MIRROR_RESOURCES } from './ingestion.service';
 
 // 保留 undici 的 Agent/ProxyAgent 等真实导出（SafeUrlService 依赖），仅 mock fetch，避免下载路径真实联网
 vi.mock('undici', async (importOriginal) => {
@@ -60,6 +60,7 @@ function createService(
     fileRepo?: object;
     scheduler?: object;
     config?: object;
+    resourceService?: object;
   } = {},
 ) {
   const safeUrl = (options.safeUrl ?? new SafeUrlService()) as never;
@@ -82,6 +83,7 @@ function createService(
     (options.fileRepo ?? {}) as never,
     (options.scheduler ?? { enqueue: vi.fn().mockResolvedValue(undefined) }) as never,
     config,
+    (options.resourceService ?? { invalidateTrashStats: vi.fn() }) as never,
   );
   return service;
 }
@@ -94,7 +96,9 @@ function makeSyncPrisma() {
   return {
     resourceLocator: {
       findFirst: vi.fn().mockResolvedValue(null),
+      findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
+      create: vi.fn().mockResolvedValue({}),
       update: vi.fn().mockResolvedValue({}),
     },
     resource: {
@@ -106,6 +110,12 @@ function makeSyncPrisma() {
     },
     resourceFile: {
       findUnique: vi.fn().mockResolvedValue(null), // 无原文件
+    },
+    // 远端条目台账：默认未命中（该条目没下载过）→ 走正常下载流程
+    sourceItemLedger: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn().mockResolvedValue({}),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     ingestionJob: {
       updateMany: vi.fn().mockResolvedValue({ count: 1 }), // touchJob 心跳
@@ -182,6 +192,31 @@ describe('IngestionService source URL policy', () => {
           assertLinkImportAllowed: (sourceId: string, url: string) => Promise<void>;
         }
       ).assertLinkImportAllowed('source-1', 'https://example.com/assets'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('does not treat an RSS feed URL as a path scope', async () => {
+    const sourceRepo = {
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-rss',
+        enabled: true,
+        sourceType: SourceType.rss,
+        allowedModes: 'link_only,metadata_only',
+        baseUrl: 'https://example.com/feed.xml',
+      }),
+    };
+    const service = createService({ sourceRepo });
+    const internalService = service as unknown as {
+      assertLinkImportAllowed: (sourceId: string, url: string) => Promise<void>;
+    };
+
+    // 站内文章页不在 /feed.xml 之下，但对 RSS 来源是合法的导入目标
+    await expect(
+      internalService.assertLinkImportAllowed('source-rss', 'https://example.com/post/1'),
+    ).resolves.toBeUndefined();
+    // Feed 由第三方托管时，条目链接也可能在别的域名
+    await expect(
+      internalService.assertLinkImportAllowed('source-rss', 'https://mirror.example/post/1'),
     ).resolves.toBeUndefined();
   });
 
@@ -341,6 +376,85 @@ describe('IngestionService clearJobs', () => {
   });
 });
 
+describe('IngestionService clearSyncHistory', () => {
+  function makePrisma(count: number) {
+    return {
+      sourceItemLedger: { deleteMany: vi.fn().mockResolvedValue({ count }) },
+    };
+  }
+
+  it('clears the whole ledger when no source is given', async () => {
+    const prisma = makePrisma(12);
+    const sourceRepo = { findById: vi.fn(), update: vi.fn() };
+    const service = createService({ prisma, sourceRepo });
+
+    await expect(service.clearSyncHistory()).resolves.toEqual({
+      deleted: 12,
+      cursorReset: false,
+    });
+    expect(prisma.sourceItemLedger.deleteMany).toHaveBeenCalledWith({ where: {} });
+    // 全量清理不碰任何来源配置
+    expect(sourceRepo.findById).not.toHaveBeenCalled();
+  });
+
+  it('scopes deletion to a single source and resets its cursor', async () => {
+    const prisma = makePrisma(3);
+    const sourceRepo = {
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-9',
+        config: JSON.stringify({ sort: 'Newest', period: 'Day', cursor: 'page-42' }),
+      }),
+      update: vi.fn().mockResolvedValue({}),
+    };
+    const service = createService({ prisma, sourceRepo });
+
+    await expect(service.clearSyncHistory('source-9')).resolves.toEqual({
+      deleted: 3,
+      cursorReset: true,
+    });
+    expect(prisma.sourceItemLedger.deleteMany).toHaveBeenCalledWith({
+      where: { sourceId: 'source-9' },
+    });
+    // 游标被移除、其余筛选条件原样保留：否则清完台账也翻不回已抓过的页
+    expect(sourceRepo.update).toHaveBeenCalledWith('source-9', {
+      config: JSON.stringify({ sort: 'Newest', period: 'Day' }),
+    });
+  });
+
+  it('leaves the config untouched when the source has no cursor', async () => {
+    const prisma = makePrisma(0);
+    const sourceRepo = {
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-9',
+        config: JSON.stringify({ sort: 'Newest' }),
+      }),
+      update: vi.fn(),
+    };
+    const service = createService({ prisma, sourceRepo });
+
+    await expect(service.clearSyncHistory('source-9')).resolves.toEqual({
+      deleted: 0,
+      cursorReset: false,
+    });
+    expect(sourceRepo.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unparsable config instead of overwriting it', async () => {
+    const prisma = makePrisma(1);
+    const sourceRepo = {
+      findById: vi.fn().mockResolvedValue({ id: 'source-9', config: '{not json' }),
+      update: vi.fn(),
+    };
+    const service = createService({ prisma, sourceRepo });
+
+    await expect(service.clearSyncHistory('source-9')).resolves.toEqual({
+      deleted: 1,
+      cursorReset: false,
+    });
+    expect(sourceRepo.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('IngestionService getStats', () => {
   it('delegates status counts to the repository', async () => {
     const stats = {
@@ -411,11 +525,13 @@ describe('IngestionService existing link reuse', () => {
         canonicalUrl: 'https://example.com/resource',
       }),
     };
+    const resourceServiceStub = { invalidateTrashStats: vi.fn() };
     const service = createService({
       prisma,
       jobRepo,
       resourceRepo,
       linkMetadataConnector: connector,
+      resourceService: resourceServiceStub,
     });
 
     await service.runNextJob();
@@ -436,6 +552,8 @@ describe('IngestionService existing link reuse', () => {
       'resource-1',
       JSON.stringify({ canonicalUrl: 'https://example.com/resource' }),
     );
+    // 这条路径直接复活了回收站资源，统计缓存必须同步失效
+    expect(resourceServiceStub.invalidateTrashStats).toHaveBeenCalledOnce();
   });
 });
 
@@ -1012,12 +1130,93 @@ describe('IngestionService sync_source', () => {
     // 需要人工审核的来源：只建元数据，不触发下载/入队处理
     expect(storage.put).not.toHaveBeenCalled();
     expect(scheduler.enqueue).not.toHaveBeenCalled();
+    // 未配置下载文件夹时不写 category
+    const createCall = (prisma.resource.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(createCall.data.category).toBeUndefined();
     expect(jobRepo.complete).toHaveBeenCalledWith(
       'sync-job-review',
       'lease-review',
       null,
       expect.stringContaining('"skippedCount":1'),
     );
+  });
+
+  it('puts synced resources into the configured resource-library folder', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.resourceLocator.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    (prisma.resource.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'new-resource-id',
+      locators: [{ id: 'loc-download', locatorType: 'download' }],
+    });
+
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-job-folder',
+        leaseToken: 'lease-folder',
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-1', cursor: null }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+    };
+
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-1',
+        name: 'Folder Source',
+        enabled: true,
+        sourceType: 'civitai',
+        requiresReview: true,
+        downloadCategoryId: 'folder-1',
+        config: JSON.stringify({}),
+      }),
+    });
+
+    const civitaiConnector = {
+      type: 'civitai' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({
+        items: [
+          {
+            externalId: '1',
+            url: 'https://example.com/1.jpg',
+            canonicalUrl: 'https://example.com/posts/1',
+            resourceType: 'image',
+            mimeType: 'image/jpeg',
+            title: 'Item',
+            description: null,
+            authorName: null,
+            authorUrl: null,
+            publisher: 'Test',
+            width: null,
+            height: null,
+            externalCreatedAt: null,
+            rawMetadata: {},
+            additionalLocators: [],
+          },
+        ],
+        nextCursor: null,
+        totalItems: 1,
+      }),
+    };
+
+    const storage = { generateKey: vi.fn(), put: storagePutSpy() };
+    const scheduler = { enqueue: vi.fn() };
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo,
+      civitaiConnector,
+      storage,
+      scheduler,
+    });
+
+    await service.runNextJob();
+    await settleAsync();
+
+    const createCall = (prisma.resource.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(createCall.data.category).toEqual({ connect: { id: 'folder-1' } });
   });
 
   it('reuses a resource when the same content was synced by another source (identityUrl)', async () => {
@@ -1137,6 +1336,7 @@ describe('IngestionService sync_source', () => {
       },
       resourceFile: { create: vi.fn().mockResolvedValue({}) },
       resourceLocator: { update: vi.fn().mockResolvedValue({}) },
+      sourceItemLedger: { upsert: vi.fn().mockResolvedValue({}) },
     };
     prisma.$transaction = vi
       .fn()
@@ -1208,6 +1408,20 @@ describe('IngestionService sync_source', () => {
     );
     expect(tx.resourceFile.create).toHaveBeenCalledTimes(1);
     expect(tx.resourceLocator.update).toHaveBeenCalledTimes(1);
+    // 台账与文件记录同事务落库：之后即使资源被彻底删除，同步也不会重复下载
+    expect(tx.sourceItemLedger.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          connectorType_externalId: { connectorType: 'civitai', externalId: '88888' },
+        },
+        create: expect.objectContaining({
+          state: 'downloaded',
+          sha256: expect.any(String),
+          resourceId: 'new-resource-id',
+          sourceId: 'source-1',
+        }),
+      }),
+    );
     // 入队元数据检测（链式生成缩略图）
     expect(scheduler.enqueue).toHaveBeenCalledWith('detect_metadata', 'new-resource-id');
     // 同步完成，下载数 = 1、失败数 = 0
@@ -1223,6 +1437,361 @@ describe('IngestionService sync_source', () => {
       null,
       expect.stringContaining('"failedCount":0'),
     );
+  });
+
+  /** 构造一条可同步的远端条目（Civitai 图片） */
+  function ledgerRemote(externalId: string, previewUrl: string | null = null) {
+    return {
+      externalId,
+      url: `https://image.civitai.com/${externalId}.jpeg`,
+      canonicalUrl: `https://civitai.com/images/${externalId}`,
+      resourceType: 'image',
+      mimeType: 'image/jpeg',
+      title: `Civitai Image #${externalId}`,
+      description: null,
+      authorName: null,
+      authorUrl: null,
+      publisher: 'Civitai',
+      previewUrl,
+      width: null,
+      height: null,
+      externalCreatedAt: null,
+      rawMetadata: { id: Number(externalId) },
+      additionalLocators: [],
+    };
+  }
+
+  /** 构造跑完一次 sync_source 所需的最小 jobRepo + connector */
+  function makeLedgerSync(remoteItems: ReturnType<typeof ledgerRemote>[], suffix: string) {
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: `sync-job-${suffix}`,
+        leaseToken: `lease-${suffix}`,
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-1', cursor: null }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+    };
+    const civitaiConnector = {
+      type: 'civitai' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({
+        items: remoteItems,
+        nextCursor: null,
+        totalItems: remoteItems.length,
+      }),
+    };
+    return { jobRepo, civitaiConnector };
+  }
+
+  it('skips a remote item that the ledger already recorded as downloaded', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.sourceItemLedger.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      state: 'downloaded',
+    });
+    const { jobRepo, civitaiConnector } = makeLedgerSync([ledgerRemote('77777')], 'ledger');
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo: makeSourceRepo(),
+      civitaiConnector,
+    });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(prisma.sourceItemLedger.findUnique).toHaveBeenCalledWith({
+      where: { connectorType_externalId: { connectorType: 'civitai', externalId: '77777' } },
+      select: { state: true },
+    });
+    // 台账命中 → 既不重建元数据资源，也不重新下载
+    expect(prisma.resource.create).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'sync-job-ledger',
+      'lease-ledger',
+      null,
+      expect.stringContaining('"skippedCount":1'),
+    );
+  });
+
+  it('still downloads when the ledger only recorded metadata', async () => {
+    const prisma = makeSyncPrisma();
+    // metadata_only 表示上次只存了元数据（如来源开了人工审核），不能拦下载
+    (prisma.sourceItemLedger.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      state: 'metadata_only',
+    });
+    const { jobRepo, civitaiConnector } = makeLedgerSync([ledgerRemote('66666')], 'meta');
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo: makeSourceRepo(),
+      civitaiConnector,
+    });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(prisma.resource.create).toHaveBeenCalledTimes(1);
+    // 下载被发起（本用例网络失败，但不影响「没有被台账拦下」这一断言）
+    expect(mockFetch).toHaveBeenCalled();
+  });
+
+  it('stores the connector preview URL as a preview locator on newly synced resources', async () => {
+    const prisma = makeSyncPrisma();
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-job-preview',
+        leaseToken: 'lease-preview',
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-rss', cursor: null }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+    };
+    const feedConnector = {
+      type: 'rss' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({
+        items: [
+          {
+            externalId: 'https://example.com/episodes/1',
+            url: 'https://cdn.example.com/episodes/1.mp4',
+            canonicalUrl: 'https://example.com/episodes/1',
+            resourceType: 'video',
+            mimeType: 'video/mp4',
+            title: 'Episode 1',
+            description: null,
+            authorName: null,
+            publisher: 'Example',
+            previewUrl: 'https://cdn.example.com/episodes/1-thumb.jpg',
+            rawMetadata: { kind: 'feed_item' },
+            additionalLocators: [{ locatorType: 'page', url: 'https://example.com/episodes/1' }],
+          },
+        ],
+        nextCursor: null,
+        totalItems: 1,
+      }),
+    };
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-rss',
+        name: 'RSS Source',
+        enabled: true,
+        sourceType: 'rss',
+        config: JSON.stringify({}),
+        baseUrl: 'https://example.com/feed.xml',
+      }),
+    });
+
+    const service = createService({ prisma, jobRepo, sourceRepo, feedConnector });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(prisma.resource.create).toHaveBeenCalledTimes(1);
+    const createCall = (prisma.resource.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const locators = createCall.data.locators.create;
+    expect(locators).toHaveLength(3); // download + preview + page
+    expect(locators[1]).toMatchObject({
+      locatorType: 'preview',
+      url: 'https://cdn.example.com/episodes/1-thumb.jpg',
+      isPrimary: false,
+    });
+  });
+
+  it('absolutizes relative preview URLs and drops non-HTTP preview URLs', async () => {
+    const prisma = makeSyncPrisma();
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-job-preview-urls',
+        leaseToken: 'lease-preview-urls',
+        jobType: IngestionJobType.sync_source,
+        request: JSON.stringify({ sourceId: 'source-rss', cursor: null }),
+      }),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+    };
+    const baseItem = {
+      resourceType: 'audio',
+      mimeType: 'audio/mpeg',
+      description: null,
+      authorName: null,
+      publisher: 'Example',
+      rawMetadata: { kind: 'feed_item' },
+      additionalLocators: [],
+    };
+    const feedConnector = {
+      type: 'rss' as const,
+      inspect: vi.fn(),
+      sync: vi.fn().mockResolvedValue({
+        items: [
+          {
+            ...baseItem,
+            externalId: 'relative-1',
+            url: 'https://cdn.example.com/e1.mp3',
+            canonicalUrl: 'https://example.com/episodes/1',
+            title: 'Relative preview',
+            previewUrl: '/thumbs/e1.jpg',
+          },
+          {
+            ...baseItem,
+            externalId: 'data-1',
+            url: 'https://cdn.example.com/e2.mp3',
+            canonicalUrl: 'https://example.com/episodes/2',
+            title: 'Data URI preview',
+            previewUrl: 'data:image/png;base64,AAAA',
+          },
+        ],
+        nextCursor: null,
+        totalItems: 2,
+      }),
+    };
+    const sourceRepo = makeSourceRepo({
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-rss',
+        name: 'RSS Source',
+        enabled: true,
+        sourceType: 'rss',
+        config: JSON.stringify({}),
+        baseUrl: 'https://example.com/feed.xml',
+      }),
+    });
+
+    const service = createService({ prisma, jobRepo, sourceRepo, feedConnector });
+    await service.runNextJob();
+    await settleAsync();
+
+    const createCalls = (prisma.resource.create as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => call[0],
+    );
+    const relative = createCalls.find((call) => call.data.title === 'Relative preview');
+    expect(
+      relative.data.locators.create.find(
+        (locator: { locatorType: string }) => locator.locatorType === 'preview',
+      ),
+    ).toMatchObject({ url: 'https://example.com/thumbs/e1.jpg' });
+
+    const dataUri = createCalls.find((call) => call.data.title === 'Data URI preview');
+    expect(
+      dataUri.data.locators.create.some(
+        (locator: { locatorType: string }) => locator.locatorType === 'preview',
+      ),
+    ).toBe(false);
+  });
+
+  it('backfills the preview locator for an already-downloaded ledger item', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.sourceItemLedger.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      state: 'downloaded',
+    });
+    (prisma.resourceLocator.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      resourceId: 'existing-resource-id',
+      resource: { locators: [] },
+    });
+    const { jobRepo, civitaiConnector } = makeLedgerSync(
+      [ledgerRemote('88888', 'https://image.civitai.com/88888-thumb.jpg')],
+      'preview-backfill',
+    );
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo: makeSourceRepo(),
+      civitaiConnector,
+    });
+    await service.runNextJob();
+    await settleAsync();
+
+    // 台账命中 → 不重建资源、不下载，但仍要补上缩略图
+    expect(prisma.resource.create).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+    // 按来源+externalId 或全局 identityUrl 都能定位到同一资源
+    expect(prisma.resourceLocator.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          OR: [
+            { sourceId: 'source-1', externalId: '88888' },
+            { identityUrl: 'civitai://image/88888' },
+          ],
+        },
+      }),
+    );
+    expect(prisma.resourceLocator.create).toHaveBeenCalledWith({
+      data: {
+        resourceId: 'existing-resource-id',
+        sourceId: 'source-1',
+        locatorType: 'preview',
+        url: 'https://image.civitai.com/88888-thumb.jpg',
+        isPrimary: false,
+      },
+    });
+  });
+
+  it('batches the preview lookup and skips items that already have one', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.sourceItemLedger.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      state: 'downloaded',
+    });
+    (prisma.resourceLocator.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        externalId: '99999',
+        identityUrl: 'civitai://image/99999',
+        resource: { locators: [{ id: 'preview-1' }] },
+      },
+    ]);
+    const { jobRepo, civitaiConnector } = makeLedgerSync(
+      [ledgerRemote('99999', 'https://image.civitai.com/99999-thumb.jpg')],
+      'preview-ready',
+    );
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo: makeSourceRepo(),
+      civitaiConnector,
+    });
+    await service.runNextJob();
+    await settleAsync();
+
+    // 整页一次 IN 查询，而不是逐条 findFirst
+    expect(prisma.resourceLocator.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: expect.arrayContaining([
+            { sourceId: 'source-1', externalId: { in: ['99999'] } },
+            { identityUrl: { in: ['civitai://image/99999'] } },
+          ]),
+        }),
+      }),
+    );
+    // 预取已确认有预览 → 不再逐条回填，也不重复插入
+    expect(prisma.resourceLocator.findFirst).not.toHaveBeenCalled();
+    expect(prisma.resourceLocator.create).not.toHaveBeenCalled();
+  });
+
+  it('does not duplicate a preview locator when the preview URL equals the download URL', async () => {
+    const prisma = makeSyncPrisma();
+    (prisma.sourceItemLedger.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      state: 'downloaded',
+    });
+    const remote = ledgerRemote('99999');
+    const { jobRepo, civitaiConnector } = makeLedgerSync(
+      [{ ...remote, previewUrl: remote.url }],
+      'preview-same-url',
+    );
+
+    const service = createService({
+      prisma,
+      jobRepo,
+      sourceRepo: makeSourceRepo(),
+      civitaiConnector,
+    });
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(prisma.resourceLocator.findFirst).not.toHaveBeenCalled();
+    expect(prisma.resourceLocator.create).not.toHaveBeenCalled();
   });
 
   it('syncs multiple pages when config.maxPages is set, advancing cursor and aggregating counts', async () => {
@@ -1695,7 +2264,10 @@ function makeSnapshotMocks(
       body: html,
     }),
   };
-  return { prisma, storage, safeUrl, sha256, html };
+  const fileRepo = {
+    findStoragePathReferences: vi.fn().mockResolvedValue(new Map()),
+  };
+  return { prisma, storage, safeUrl, fileRepo, sha256, html };
 }
 
 function createSnapshotJobService(
@@ -1717,6 +2289,7 @@ function createSnapshotJobService(
     prisma: mocks.prisma,
     storage: mocks.storage,
     safeUrl: mocks.safeUrl,
+    fileRepo: mocks.fileRepo,
     jobRepo,
   });
   return { service, jobRepo };
@@ -1893,6 +2466,51 @@ describe('IngestionService page snapshots', () => {
     );
   });
 
+  it('keeps the previous snapshot object when another resource still references it', async () => {
+    const mocks = makeSnapshotMocks({
+      existingSnapshot: { id: 'f-old', storagePath: 'snapshots/ab/cd/shared.html' },
+    });
+    // 内容相同的快照被另一条资源共用 → 旧对象不能删
+    mocks.fileRepo.findStoragePathReferences.mockResolvedValue(
+      new Map([['snapshots/ab/cd/shared.html', new Set(['res-2'])]]),
+    );
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-4b');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    expect(mocks.fileRepo.findStoragePathReferences).toHaveBeenCalledWith([
+      'snapshots/ab/cd/shared.html',
+    ]);
+    expect(mocks.storage.delete).not.toHaveBeenCalled();
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'snap-job-4b',
+      'lease-snap-job-4b',
+      'res-1',
+      expect.stringContaining('"status":"updated"'),
+    );
+  });
+
+  it('keeps the previous snapshot object when the reference check fails', async () => {
+    const mocks = makeSnapshotMocks({
+      existingSnapshot: { id: 'f-old', storagePath: 'snapshots/ab/cd/stale.html' },
+    });
+    mocks.fileRepo.findStoragePathReferences.mockRejectedValue(new Error('db unavailable'));
+    const { service, jobRepo } = createSnapshotJobService(mocks, 'snap-job-4c');
+
+    await service.runNextJob();
+    await settleAsync();
+
+    // 无法确认是否共用时保守保留，避免误删其它资源的快照
+    expect(mocks.storage.delete).not.toHaveBeenCalled();
+    expect(jobRepo.complete).toHaveBeenCalledWith(
+      'snap-job-4c',
+      'lease-snap-job-4c',
+      'res-1',
+      expect.stringContaining('"status":"updated"'),
+    );
+  });
+
   it('reports the offending URL when the page cannot be fetched', async () => {
     const mocks = makeSnapshotMocks();
     mocks.safeUrl.fetchHtml.mockRejectedValue(new Error('Remote HTML exceeds 2097152 byte limit'));
@@ -1935,6 +2553,7 @@ describe('IngestionService download retries', () => {
       },
       resourceFile: { create: vi.fn().mockResolvedValue({}) },
       resourceLocator: { update: vi.fn().mockResolvedValue({}) },
+      sourceItemLedger: { upsert: vi.fn().mockResolvedValue({}) },
     };
     const prisma = {
       $transaction: vi.fn(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
@@ -1992,7 +2611,7 @@ describe('IngestionService download retries', () => {
     const prisma = {
       resourceLocator: {
         findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
-        update: vi.fn().mockResolvedValue({}),
+        update: vi.fn().mockResolvedValueOnce({ downloadAttempts: 1 }).mockResolvedValue({}),
       },
     };
     const download = vi.fn().mockRejectedValue(new Error('socket hang up'));
@@ -2021,21 +2640,26 @@ describe('IngestionService download retries', () => {
     }
 
     expect(download).toHaveBeenCalledTimes(3);
-    expect(prisma.resourceLocator.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          downloadAttempts: 1,
-          nextDownloadAttemptAt: expect.any(Date),
-        }),
+    // 计数由数据库原子自增；退避时间基于自增后的次数单独写回
+    expect(prisma.resourceLocator.update).toHaveBeenNthCalledWith(1, {
+      where: { id: 'locator-1' },
+      data: expect.objectContaining({
+        downloadAttempts: { increment: 1 },
+        lastError: 'socket hang up',
       }),
-    );
+      select: { downloadAttempts: true },
+    });
+    expect(prisma.resourceLocator.update).toHaveBeenNthCalledWith(2, {
+      where: { id: 'locator-1' },
+      data: { nextDownloadAttemptAt: expect.any(Date) },
+    });
   });
 
   it('does not retry a non-transient failure', async () => {
     const prisma = {
       resourceLocator: {
         findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 0 }),
-        update: vi.fn().mockResolvedValue({}),
+        update: vi.fn().mockResolvedValueOnce({ downloadAttempts: 1 }).mockResolvedValue({}),
       },
     };
     const download = vi.fn().mockRejectedValue(new Error('HTTP 403'));
@@ -2059,14 +2683,14 @@ describe('IngestionService download retries', () => {
     ).resolves.toBe('failed');
 
     expect(download).toHaveBeenCalledOnce();
-    expect(prisma.resourceLocator.update).toHaveBeenCalledOnce();
+    expect(prisma.resourceLocator.update).toHaveBeenCalledTimes(2);
   });
 
   it('stops scheduling automatic retries once the attempt cap is reached', async () => {
     const prisma = {
       resourceLocator: {
         findUnique: vi.fn().mockResolvedValue({ downloadAttempts: 4 }),
-        update: vi.fn().mockResolvedValue({}),
+        update: vi.fn().mockResolvedValueOnce({ downloadAttempts: 5 }).mockResolvedValue({}),
       },
     };
     const service = createService({ prisma });
@@ -2075,9 +2699,17 @@ describe('IngestionService download retries', () => {
       service as unknown as { markLocatorError: (id: string, msg: string) => Promise<void> }
     ).markLocatorError('locator-1', 'still failing');
 
-    expect(prisma.resourceLocator.update).toHaveBeenCalledWith({
+    expect(prisma.resourceLocator.update).toHaveBeenNthCalledWith(1, {
       where: { id: 'locator-1' },
-      data: expect.objectContaining({ downloadAttempts: 5, nextDownloadAttemptAt: null }),
+      data: expect.objectContaining({
+        downloadAttempts: { increment: 1 },
+        lastError: 'still failing',
+      }),
+      select: { downloadAttempts: true },
+    });
+    expect(prisma.resourceLocator.update).toHaveBeenNthCalledWith(2, {
+      where: { id: 'locator-1' },
+      data: { nextDownloadAttemptAt: null },
     });
   });
 
@@ -2107,14 +2739,48 @@ describe('IngestionService download retries', () => {
     expect(jobRepo.create).toHaveBeenCalledTimes(2);
   });
 
+  it('only queues failed downloads from sources whose policy allows mirror_file', async () => {
+    const prisma = {
+      resource: { findMany: vi.fn().mockResolvedValue([]) },
+    };
+    const service = createService({ prisma });
+
+    await (
+      service as unknown as { scheduleFailedDownloadRetries: (n: number) => Promise<number> }
+    ).scheduleFailedDownloadRetries(20);
+
+    expect(prisma.resource.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          sourceRecord: expect.objectContaining({
+            enabled: true,
+            requiresReview: false,
+            // 策略不允许 mirror_file 的来源不能在补漏里建出注定失败的任务：
+            // 执行期 assertDownloadAllowed 拒绝不会累加失败次数
+            allowedModes: { contains: 'mirror_file' },
+          }),
+        }),
+      }),
+    );
+  });
+
   it('skips sources that do not permit mirror downloads during a bulk retry', async () => {
+    // 查询时两条都还“有资格”（模拟查询与逐条校验之间来源被禁用），
+    // 逐条门禁仍需拒绝第二条。
     const prisma = {
       resource: {
+        count: vi
+          .fn()
+          .mockImplementation(
+            async ({ where }: { where: { ingestionJobs?: { some?: unknown } } }) =>
+              where.ingestionJobs?.some ? 0 : 2,
+          ),
         findMany: vi.fn().mockResolvedValue([
           { id: 'resource-1', sourceId: 'enabled-source' },
           { id: 'resource-2', sourceId: 'disabled-source' },
         ]),
       },
+      resourceLocator: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     };
     const sourceRepo = {
       findById: vi.fn().mockImplementation(async (id: string) =>
@@ -2147,5 +2813,739 @@ describe('IngestionService download retries', () => {
       ).retryFailedDownloads({ limit: 10 }),
     ).resolves.toEqual({ queued: 1, skipped: 1 });
     expect(jobRepo.create).toHaveBeenCalledOnce();
+  });
+
+  it('reports policy-ineligible resources as skipped without letting them occupy the batch', async () => {
+    const prisma = {
+      resource: {
+        // total=3，其中 1 条策略允许；被拒绝的 2 条不进候选集，只计入 skipped
+        count: vi
+          .fn()
+          .mockImplementation(
+            async ({
+              where,
+            }: {
+              where: { sourceRecord?: unknown; ingestionJobs?: { some?: unknown } };
+            }) => {
+              if (where.ingestionJobs?.some) return 0;
+              if (where.sourceRecord) return 1;
+              return 3;
+            },
+          ),
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+    const service = createService({ prisma });
+
+    await expect(
+      (
+        service as unknown as {
+          retryFailedDownloads: (params: object) => Promise<{ queued: number; skipped: number }>;
+        }
+      ).retryFailedDownloads({ limit: 2 }),
+    ).resolves.toEqual({ queued: 0, skipped: 2 });
+    // 候选查询必须带策略过滤，否则每次都会取到同一批头部资源
+    expect(prisma.resource.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        take: 2,
+        where: expect.objectContaining({
+          sourceId: { not: null },
+          sourceRecord: {
+            enabled: true,
+            OR: [
+              { allowedModes: { contains: 'mirror_file' } },
+              { requiresReview: true, allowedModes: { contains: 'metadata_only' } },
+            ],
+          },
+        }),
+      }),
+    );
+  });
+
+  it('counts already-queued resources as queued and keeps them out of the batch', async () => {
+    const prisma = {
+      resource: {
+        count: vi
+          .fn()
+          .mockImplementation(
+            async ({
+              where,
+            }: {
+              where: { sourceRecord?: unknown; ingestionJobs?: { some?: unknown } };
+            }) => {
+              if (where.ingestionJobs?.some) return 1; // 已在队列里的
+              if (where.sourceRecord) return 2; // 策略允许的
+              return 2;
+            },
+          ),
+        findMany: vi.fn().mockResolvedValue([{ id: 'resource-2', sourceId: 'source-1' }]),
+      },
+      resourceLocator: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    };
+    const sourceRepo = {
+      findById: vi.fn().mockResolvedValue({
+        id: 'source-1',
+        enabled: true,
+        allowedModes: 'metadata_only,mirror_file',
+        requiresReview: false,
+      }),
+    };
+    const jobRepo = {
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: 'retry-job' }),
+    };
+    const service = createService({ prisma, sourceRepo, jobRepo });
+
+    await expect(
+      (
+        service as unknown as {
+          retryFailedDownloads: (params: object) => Promise<{ queued: number; skipped: number }>;
+        }
+      ).retryFailedDownloads({ limit: 2 }),
+    ).resolves.toEqual({ queued: 2, skipped: 0 });
+    // 候选集必须排除已有在途任务的资源，避免它们反复占满 limit
+    expect(prisma.resource.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          ingestionJobs: {
+            none: {
+              jobType: 'download_file',
+              status: { in: ['pending', 'processing'] },
+            },
+          },
+        }),
+      }),
+    );
+    // 手动重试会清零自动补漏预算，失败后还能重新走完整退避
+    expect(prisma.resourceLocator.updateMany).toHaveBeenCalledWith({
+      where: { resourceId: 'resource-2', locatorType: 'download' },
+      data: { downloadAttempts: 0, nextDownloadAttemptAt: null },
+    });
+  });
+
+  it('scopes the bulk retry to the requested source', async () => {
+    const prisma = {
+      resource: {
+        count: vi.fn().mockResolvedValue(0),
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+    const service = createService({ prisma });
+
+    await (
+      service as unknown as {
+        retryFailedDownloads: (params: object) => Promise<{ queued: number; skipped: number }>;
+      }
+    ).retryFailedDownloads({ sourceId: 'source-1', limit: 5 });
+
+    expect(prisma.resource.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        take: 5,
+        where: expect.objectContaining({ sourceId: 'source-1' }),
+      }),
+    );
+    for (const [args] of prisma.resource.count.mock.calls) {
+      expect((args as { where: { sourceId: unknown } }).where.sourceId).toBe('source-1');
+    }
+  });
+});
+
+describe('IngestionService download storage cleanup', () => {
+  const remote = {
+    externalId: 'remote-1',
+    url: 'https://example.com/a.jpg',
+    resourceType: 'image',
+    mimeType: 'image/jpeg',
+  };
+  const downloaded = (storageKey: string) => ({
+    sha256: 'a'.repeat(64),
+    mimeType: 'image/jpeg',
+    extension: 'jpg',
+    resourceType: 'image',
+    sizeBytes: 10,
+    storageKey,
+  });
+
+  function invokeDownload(service: IngestionService, jobControl?: object) {
+    return (
+      service as unknown as {
+        downloadRemoteFile: (
+          resourceId: string,
+          locatorId: string,
+          remote: object,
+          jobControl?: object,
+        ) => Promise<'downloaded' | 'failed'>;
+      }
+    ).downloadRemoteFile('resource-1', 'locator-1', remote, jobControl);
+  }
+
+  function makeCommitTx(overrides: Record<string, unknown> = {}) {
+    return {
+      resource: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      resourceFile: { create: vi.fn().mockResolvedValue({}) },
+      resourceLocator: { update: vi.fn().mockResolvedValue({}) },
+      sourceItemLedger: { upsert: vi.fn().mockResolvedValue({}) },
+      ingestionJob: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+      ...overrides,
+    };
+  }
+
+  it('removes the stored object when the commit transaction fails', async () => {
+    const tx = makeCommitTx();
+    const prisma = {
+      $transaction: vi.fn(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
+      resourceLocator: { update: vi.fn().mockResolvedValue({ downloadAttempts: 1 }) },
+    };
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = { findStoragePathReferences: vi.fn().mockResolvedValue(new Map()) };
+    // 事务里的 resource.update 失败（模拟 SQLITE_BUSY 等）
+    tx.resource.update.mockRejectedValue(new Error('database is locked'));
+    const service = createService({
+      prisma,
+      directDownload: { download: vi.fn().mockResolvedValue(downloaded('originals/ab/cd/a.jpg')) },
+      storage,
+      fileRepo,
+    });
+
+    await expect(invokeDownload(service)).resolves.toBe('failed');
+
+    expect(fileRepo.findStoragePathReferences).toHaveBeenCalledWith(['originals/ab/cd/a.jpg']);
+    expect(storage.delete).toHaveBeenCalledWith('originals/ab/cd/a.jpg');
+  });
+
+  it('keeps the stored object when another resource already references it', async () => {
+    const prisma = {
+      $transaction: vi.fn().mockRejectedValue(new Error('database is locked')),
+      resourceLocator: { update: vi.fn().mockResolvedValue({ downloadAttempts: 1 }) },
+    };
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = {
+      findStoragePathReferences: vi
+        .fn()
+        .mockResolvedValue(new Map([['originals/ab/cd/a.jpg', new Set(['another-resource'])]])),
+    };
+    const service = createService({
+      prisma,
+      directDownload: { download: vi.fn().mockResolvedValue(downloaded('originals/ab/cd/a.jpg')) },
+      storage,
+      fileRepo,
+    });
+
+    await expect(invokeDownload(service)).resolves.toBe('failed');
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('removes the stored object when the job was canceled before commit', async () => {
+    // 下载完成、事务提交时发现租约已失效 → 事务回滚并抛取消错误
+    const tx = makeCommitTx({
+      ingestionJob: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    });
+    const prisma = {
+      $transaction: vi.fn(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
+    };
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = { findStoragePathReferences: vi.fn().mockResolvedValue(new Map()) };
+    const service = createService({
+      prisma,
+      directDownload: { download: vi.fn().mockResolvedValue(downloaded('originals/ab/cd/a.jpg')) },
+      storage,
+      fileRepo,
+      jobRepo: { isProcessing: vi.fn().mockResolvedValue(true) },
+    });
+
+    await expect(
+      invokeDownload(service, { id: 'job-1', leaseToken: 'lease-1', completeOnCommit: true }),
+    ).rejects.toThrow();
+
+    expect(storage.delete).toHaveBeenCalledWith('originals/ab/cd/a.jpg');
+  });
+
+  it('removes the stored object when the job was canceled while the file was being stored', async () => {
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = { findStoragePathReferences: vi.fn().mockResolvedValue(new Map()) };
+    // 下载期间任务被取消：download() 正常返回（对象已落盘），返回后的检查点必须发现并回收
+    const service = createService({
+      prisma: {},
+      directDownload: { download: vi.fn().mockResolvedValue(downloaded('originals/ab/cd/a.jpg')) },
+      storage,
+      fileRepo,
+      jobRepo: { isProcessing: vi.fn().mockResolvedValue(false) },
+    });
+
+    await expect(invokeDownload(service, { id: 'job-1', leaseToken: 'lease-1' })).rejects.toThrow();
+
+    expect(storage.delete).toHaveBeenCalledWith('originals/ab/cd/a.jpg');
+  });
+
+  it('removes the previous attempt object before retrying a transient commit failure', async () => {
+    const tx = makeCommitTx();
+    const prisma = {
+      $transaction: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('timeout'))
+        .mockImplementation(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
+      resourceLocator: { update: vi.fn().mockResolvedValue({ downloadAttempts: 1 }) },
+    };
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = { findStoragePathReferences: vi.fn().mockResolvedValue(new Map()) };
+    const download = vi
+      .fn()
+      .mockResolvedValueOnce(downloaded('originals/ab/cd/first.jpg'))
+      .mockResolvedValueOnce(downloaded('originals/ab/cd/second.jpg'));
+    const service = createService({
+      prisma,
+      directDownload: { download },
+      storage,
+      fileRepo,
+      scheduler: { enqueue: vi.fn().mockResolvedValue(undefined) },
+    });
+
+    vi.useFakeTimers();
+    try {
+      const promise = invokeDownload(service);
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('downloaded');
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(storage.delete).toHaveBeenCalledWith('originals/ab/cd/first.jpg');
+    // 成功提交的那次对象归数据库记录所有，不能删
+    expect(storage.delete).not.toHaveBeenCalledWith('originals/ab/cd/second.jpg');
+  });
+
+  it('removes the stored object when a concurrent sync already owns the file record', async () => {
+    // 并发同步先建了 resourceFile（P2002 被忽略），本次写入的 key 可能没有被引用
+    const tx = makeCommitTx({
+      resourceFile: {
+        create: vi.fn().mockRejectedValue(
+          new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+            code: 'P2002',
+            clientVersion: 'test',
+          }),
+        ),
+      },
+    });
+    const prisma = {
+      $transaction: vi.fn(async (callback: (t: object) => Promise<unknown>) => callback(tx)),
+      resourceLocator: { update: vi.fn().mockResolvedValue({ downloadAttempts: 1 }) },
+    };
+    const storage = { delete: vi.fn().mockResolvedValue(undefined) };
+    const fileRepo = { findStoragePathReferences: vi.fn().mockResolvedValue(new Map()) };
+    const service = createService({
+      prisma,
+      directDownload: { download: vi.fn().mockResolvedValue(downloaded('originals/ab/cd/a.jpg')) },
+      storage,
+      fileRepo,
+      scheduler: { enqueue: vi.fn().mockResolvedValue(undefined) },
+    });
+
+    await expect(invokeDownload(service)).resolves.toBe('downloaded');
+    expect(fileRepo.findStoragePathReferences).toHaveBeenCalledWith(['originals/ab/cd/a.jpg']);
+    expect(storage.delete).toHaveBeenCalledWith('originals/ab/cd/a.jpg');
+  });
+});
+
+describe('IngestionService batch mirror', () => {
+  const eligibleResource = {
+    id: 'res-ok',
+    sourceId: 'source-1',
+    deletedAt: null,
+    files: [],
+    locators: [{ locatorType: 'download' }],
+  };
+
+  function createBatchService(resources: Record<string, object | null>) {
+    const prisma = {
+      resource: {
+        findUnique: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) => {
+          return resources[where.id] ?? null;
+        }),
+      },
+      resourceLocator: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    };
+    const jobRepo = {
+      findActiveByIdempotencyKey: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockImplementation(async (data: { resourceId: string }) => ({
+        id: `job-${data.resourceId}`,
+      })),
+    };
+    const sourceRepo = {
+      findById: vi.fn().mockImplementation(async (sourceId: string) => {
+        if (sourceId === 'source-disabled') {
+          return {
+            id: sourceId,
+            enabled: false,
+            allowedModes: 'mirror_file',
+            requiresReview: false,
+          };
+        }
+        if (sourceId === 'source-link-only') {
+          return { id: sourceId, enabled: true, allowedModes: 'link_only', requiresReview: false };
+        }
+        return {
+          id: sourceId,
+          enabled: true,
+          allowedModes: 'mirror_file,metadata_only',
+          requiresReview: false,
+        };
+      }),
+    };
+    return { service: createService({ prisma, jobRepo, sourceRepo }), prisma, jobRepo, sourceRepo };
+  }
+
+  it('queues eligible resources and reports why each other resource was skipped', async () => {
+    const { service, jobRepo } = createBatchService({
+      'res-ok': eligibleResource,
+      'res-local': { ...eligibleResource, id: 'res-local', files: [{ id: 'file-1' }] },
+      'res-no-url': { ...eligibleResource, id: 'res-no-url', locators: [] },
+      'res-deleted': { ...eligibleResource, id: 'res-deleted', deletedAt: new Date() },
+      'res-disabled': { ...eligibleResource, id: 'res-disabled', sourceId: 'source-disabled' },
+      'res-link-only': { ...eligibleResource, id: 'res-link-only', sourceId: 'source-link-only' },
+      'res-no-source': { ...eligibleResource, id: 'res-no-source', sourceId: null },
+    });
+
+    const result = await service.mirrorRemoteResources([
+      'res-ok',
+      'res-local',
+      'res-no-url',
+      'res-deleted',
+      'res-disabled',
+      'res-link-only',
+      'res-no-source',
+      'res-missing',
+    ]);
+
+    expect(result.queued).toBe(1);
+    expect(result.skipped).toBe(7);
+    expect(
+      Object.fromEntries(result.skippedResources.map((item) => [item.id, item.reason])),
+    ).toEqual({
+      'res-local': 'already_local',
+      'res-no-url': 'no_source_url',
+      'res-deleted': 'deleted',
+      'res-disabled': 'policy',
+      'res-link-only': 'policy',
+      'res-no-source': 'no_source',
+      'res-missing': 'not_found',
+    });
+    // 只有可下载的资源真正入队
+    expect(jobRepo.create).toHaveBeenCalledTimes(1);
+    expect(jobRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ resourceId: 'res-ok', jobType: 'download_file' }),
+    );
+  });
+
+  it('deduplicates resource ids so a repeated selection enqueues only once', async () => {
+    const { service, prisma, jobRepo } = createBatchService({ 'res-ok': eligibleResource });
+
+    const result = await service.mirrorRemoteResources(['res-ok', 'res-ok', 'res-ok']);
+
+    expect(result).toMatchObject({ resourceIds: ['res-ok'], queued: 1, skipped: 0 });
+    expect(prisma.resource.findUnique).toHaveBeenCalledTimes(1);
+    expect(jobRepo.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects batches larger than the server limit before touching resources', async () => {
+    const prisma = { resource: { findUnique: vi.fn() } };
+    const service = createService({ prisma });
+    const ids = Array.from(
+      { length: MAX_BATCH_MIRROR_RESOURCES + 1 },
+      (_, index) => `resource-${index}`,
+    );
+
+    await expect(service.mirrorRemoteResources(ids)).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.resource.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('IngestionService manual download rate limit', () => {
+  const source = {
+    id: 'source-1',
+    enabled: true,
+    allowedModes: 'mirror_file',
+    requiresReview: false,
+    rateLimitPerMinute: 1,
+    downloadIntervalMs: 0,
+    downloadDirectory: null,
+    sourceType: 'civitai',
+  };
+  const resource = {
+    id: 'res-1',
+    sourceId: 'source-1',
+    deletedAt: null,
+    files: [],
+    locators: [{ id: 'loc-1', locatorType: 'download', url: 'https://example.com/a.jpg' }],
+  };
+
+  it('paces downloads per source and applies a new rate config without resetting the wait', () => {
+    vi.useFakeTimers();
+    try {
+      const service = createService({});
+      const reserve = (
+        service as unknown as { reserveSourceDownloadSlot: (input: object) => number }
+      ).reserveSourceDownloadSlot.bind(service);
+      const perMinute60 = { id: 'source-1', rateLimitPerMinute: 60, downloadIntervalMs: 0 };
+
+      expect(reserve(perMinute60)).toBe(0);
+      expect(reserve(perMinute60)).toBeGreaterThan(0);
+      // 其它来源互不影响
+      expect(reserve({ ...perMinute60, id: 'source-2' })).toBe(0);
+      // 配置变化不重置已有等待窗口：同步持有旧快照、手动读取新配置时，
+      // 若每次都重置并放行，会交替产生突发下载。
+      expect(reserve({ ...perMinute60, rateLimitPerMinute: 1 })).toBeGreaterThan(0);
+
+      vi.advanceTimersByTime(1_000);
+      // 旧窗口到期后按新配置重新计时
+      expect(reserve({ ...perMinute60, rateLimitPerMinute: 1 })).toBe(0);
+      expect(reserve({ ...perMinute60, rateLimitPerMinute: 1 })).toBeGreaterThan(50_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers the job instead of blocking the ingestion queue when the slot is exhausted', async () => {
+    const prisma = { resource: { findUnique: vi.fn().mockResolvedValue(resource) } };
+    const sourceRepo = { findById: vi.fn().mockResolvedValue(source) };
+    const jobRepo = { release: vi.fn().mockResolvedValue(true) };
+    const directDownload = { download: vi.fn() };
+    const service = createService({ prisma, sourceRepo, jobRepo, directDownload });
+    const internals = service as unknown as {
+      reserveSourceDownloadSlot: (input: object) => number;
+      manualDownloadPriorityUntil: Map<string, number>;
+      runDownloadResourceJob: (job: object, leaseToken: string) => Promise<void>;
+    };
+    // 占掉当前速率槽：队列里的下一个同来源任务必须等待
+    expect(internals.reserveSourceDownloadSlot(source)).toBe(0);
+
+    await internals.runDownloadResourceJob(
+      { id: 'job-1', request: JSON.stringify({ resourceId: 'res-1' }) },
+      'lease-1',
+    );
+
+    // 不阻塞摄入队列：任务被释放并按剩余间隔延迟重排，下载没有开始
+    expect(jobRepo.release).toHaveBeenCalledWith('job-1', 'lease-1', expect.any(Number));
+    expect(directDownload.download).not.toHaveBeenCalled();
+    // 同时给该来源留下优先窗口，避免同步等待者把手动任务一直挤在后面
+    expect(internals.manualDownloadPriorityUntil.get(source.id)).toBeGreaterThan(Date.now());
+  });
+
+  it('leaves the job for stale recovery instead of failing it when release throws', async () => {
+    const prisma = { resource: { findUnique: vi.fn().mockResolvedValue(resource) } };
+    const sourceRepo = { findById: vi.fn().mockResolvedValue(source) };
+    const jobRepo = { release: vi.fn().mockRejectedValue(new Error('SQLITE_BUSY')) };
+    const directDownload = { download: vi.fn() };
+    const service = createService({ prisma, sourceRepo, jobRepo, directDownload });
+    const internals = service as unknown as {
+      reserveSourceDownloadSlot: (input: object) => number;
+      runDownloadResourceJob: (job: object, leaseToken: string) => Promise<void>;
+    };
+    internals.reserveSourceDownloadSlot(source);
+
+    // release 抛错时不能让 runNextJob 把任务标记为终态失败：
+    // 保持 processing，等 stale 恢复重新排队即可自动重试。
+    await expect(
+      internals.runDownloadResourceJob(
+        { id: 'job-1', request: JSON.stringify({ resourceId: 'res-1' }) },
+        'lease-1',
+      ),
+    ).resolves.toBeUndefined();
+    expect(directDownload.download).not.toHaveBeenCalled();
+  });
+
+  it('shares the source budget between blocking sync waits and manual downloads', async () => {
+    vi.useFakeTimers();
+    try {
+      const service = createService({});
+      const internals = service as unknown as {
+        reserveSourceDownloadSlot: (input: object) => number;
+        waitForSourceDownloadSlot: (input: object) => Promise<void>;
+      };
+      const perMinute60 = { id: 'source-shared', rateLimitPerMinute: 60, downloadIntervalMs: 0 };
+      expect(internals.reserveSourceDownloadSlot(perMinute60)).toBe(0);
+
+      let resolved = false;
+      const waiting = internals.waitForSourceDownloadSlot(perMinute60).then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(resolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await waiting;
+      expect(resolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a deferred manual download take the next slot before sync waiters', async () => {
+    vi.useFakeTimers();
+    try {
+      const service = createService({});
+      const internals = service as unknown as {
+        manualDownloadPriorityUntil: Map<string, number>;
+        waitForSourceDownloadSlot: (input: object) => Promise<void>;
+      };
+      const source = { id: 'source-priority', rateLimitPerMinute: 60, downloadIntervalMs: 0 };
+      internals.manualDownloadPriorityUntil.set(source.id, Date.now() + 1_000);
+
+      let resolved = false;
+      const waiting = internals.waitForSourceDownloadSlot(source).then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(resolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await waiting;
+      expect(resolved).toBe(true);
+      // 优先窗口用完后必须清理，不能永久卡住同步下载
+      expect(internals.manualDownloadPriorityUntil.has(source.id)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops waiting when the sync job is canceled', async () => {
+    vi.useFakeTimers();
+    try {
+      const service = createService({});
+      const internals = service as unknown as {
+        reserveSourceDownloadSlot: (input: object) => number;
+        waitForSourceDownloadSlot: (
+          input: object,
+          assertActive?: () => Promise<void>,
+        ) => Promise<void>;
+      };
+      const source = { id: 'source-cancel', rateLimitPerMinute: 60, downloadIntervalMs: 0 };
+      // 先占掉槽位，强制等待循环至少走一轮
+      expect(internals.reserveSourceDownloadSlot(source)).toBe(0);
+
+      const assertActive = vi
+        .fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('canceled'));
+      const waiting = internals.waitForSourceDownloadSlot(source, assertActive);
+      const assertion = expect(waiting).rejects.toThrow('canceled');
+      await vi.advanceTimersByTimeAsync(300);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('IngestionService sync job deferral', () => {
+  it('does not fail the sync job when release throws while another sync is running', async () => {
+    const jobRepo = {
+      claimNext: vi.fn().mockResolvedValue({
+        id: 'sync-job',
+        jobType: 'sync_source',
+        leaseToken: 'lease-1',
+        request: JSON.stringify({ sourceId: 'source-1' }),
+      }),
+      release: vi.fn().mockRejectedValue(new Error('SQLITE_BUSY')),
+      fail: vi.fn(),
+    };
+    const service = createService({
+      jobRepo,
+      config: { get: vi.fn().mockReturnValue(3000) },
+    });
+    (service as unknown as { syncJobRunning: boolean }).syncJobRunning = true;
+
+    await expect(service.runNextJob()).resolves.toBe(true);
+    // release 失败只记录 warning，不能把任务标记为终态失败
+    expect(jobRepo.fail).not.toHaveBeenCalled();
+  });
+});
+
+describe('IngestionService download heartbeat', () => {
+  it('refreshes startedAt during a download longer than the stale timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const prisma = {
+        ingestionJob: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+        resourceLocator: { update: vi.fn().mockResolvedValue({ downloadAttempts: 1 }) },
+      };
+      let rejectDownload!: (error: Error) => void;
+      const download = vi.fn().mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectDownload = reject;
+          }),
+      );
+      const service = createService({
+        prisma,
+        directDownload: { download },
+        config: {
+          get: vi.fn((key: string) => (key === 'ingestion.staleJobTimeoutMs' ? 60_000 : undefined)),
+        },
+      });
+      const promise = (
+        service as unknown as {
+          downloadRemoteFile: (
+            resourceId: string,
+            locatorId: string,
+            remote: object,
+            jobControl: object,
+          ) => Promise<string>;
+        }
+      ).downloadRemoteFile(
+        'resource-1',
+        'locator-1',
+        {
+          externalId: 'remote-1',
+          url: 'https://example.com/a.jpg',
+          resourceType: 'image',
+          mimeType: 'image/jpeg',
+        },
+        { id: 'job-1', leaseToken: 'lease-1' },
+      );
+
+      // stale 60s → 心跳间隔 5s：4s 时不应写心跳，超过 5s 后必须刷新
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(prisma.ingestionJob.updateMany).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(prisma.ingestionJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'job-1', status: 'processing', leaseToken: 'lease-1' },
+          data: { startedAt: expect.any(Date) },
+        }),
+      );
+
+      rejectDownload(new Error('HTTP 403'));
+      await expect(promise).resolves.toBe('failed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('derives the heartbeat interval from the configured stale timeout', () => {
+    const makeService = (staleTimeoutMs: number | undefined) =>
+      createService({
+        config: {
+          get: vi.fn((key: string) =>
+            key === 'ingestion.staleJobTimeoutMs' ? staleTimeoutMs : undefined,
+          ),
+        },
+      });
+    const resolveInterval = (service: object) =>
+      (
+        service as unknown as { resolveJobHeartbeatIntervalMs: () => number }
+      ).resolveJobHeartbeatIntervalMs.bind(service);
+
+    expect(resolveInterval(makeService(60_000))()).toBe(5_000);
+    // stale 被调小时心跳同比收缩
+    expect(resolveInterval(makeService(6_000))()).toBe(2_000);
+    // 缺失 / 0 / NaN 回退默认 60s，不能算出 NaN 让心跳失效
+    expect(resolveInterval(makeService(undefined))()).toBe(5_000);
+    expect(resolveInterval(makeService(0))()).toBe(5_000);
+    expect(resolveInterval(makeService(Number.NaN))()).toBe(5_000);
   });
 });

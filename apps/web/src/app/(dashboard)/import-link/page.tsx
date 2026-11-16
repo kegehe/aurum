@@ -9,7 +9,13 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { createLinkImport, getIngestionJob, retryIngestionJob } from '@/lib/api/ingestion';
 import { listCategories } from '@/lib/api/categories';
 import { listSources } from '@/lib/api/sources';
@@ -36,13 +42,20 @@ export default function ImportLinkPage() {
   const [job, setJob] = useState<IngestionJobItem | null>(null);
   const flatCategories = useMemo(() => flattenCategories(categories), [categories]);
 
-  useEffect(() => () => {
-    if (pollTimer.current) clearInterval(pollTimer.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (pollTimer.current) clearInterval(pollTimer.current);
+    },
+    [],
+  );
 
   useEffect(() => {
-    void listCategories().then((result) => setCategories(result.items)).catch(() => undefined);
-    void listSources({ enabled: true, pageSize: 100 }).then((result) => setSources(result.items)).catch(() => undefined);
+    void listCategories()
+      .then((result) => setCategories(result.items))
+      .catch(() => undefined);
+    void listSources({ enabled: true, pageSize: 100 })
+      .then((result) => setSources(result.items))
+      .catch(() => undefined);
   }, []);
 
   const stopPolling = () => {
@@ -134,12 +147,19 @@ export default function ImportLinkPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                {sourceId && sourceId !== '__none__' && (() => {
-                  const selected = sources.find((s) => s.id === sourceId);
-                  return selected?.baseUrl ? (
-                    <p className="text-xs text-muted-foreground">Base URL: {selected.baseUrl}</p>
-                  ) : null;
-                })()}
+                {sourceId &&
+                  sourceId !== '__none__' &&
+                  (() => {
+                    const selected = sources.find((s) => s.id === sourceId);
+                    if (!selected?.baseUrl) return null;
+                    // RSS 来源的 baseUrl 是 Feed 地址，不是站内路径范围：
+                    // 后端不会按它限制导入链接，这里也用 Feed 措辞避免误解。
+                    return selected.sourceType === 'rss' ? (
+                      <p className="text-xs text-muted-foreground">Feed 地址: {selected.baseUrl}</p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Base URL: {selected.baseUrl}</p>
+                    );
+                  })()}
               </div>
             )}
             <div className="space-y-1.5">
@@ -182,7 +202,11 @@ export default function ImportLinkPage() {
               </Select>
             </div>
             <Button type="submit" disabled={submitting || isRunning} className="gap-2">
-              {submitting || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <LinkIcon className="h-4 w-4" />}
+              {submitting || isRunning ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <LinkIcon className="h-4 w-4" />
+              )}
               添加链接
             </Button>
           </form>
@@ -200,12 +224,26 @@ export default function ImportLinkPage() {
               )}
               <div>
                 <p className="font-medium">
-                  {job.status === 'failed' ? '导入失败' : job.status === 'completed' ? '导入完成' : job.status === 'canceled' ? '导入已取消' : '正在导入'}
+                  {job.status === 'failed'
+                    ? '导入失败'
+                    : job.status === 'completed'
+                      ? '导入完成'
+                      : job.status === 'canceled'
+                        ? '导入已取消'
+                        : '正在导入'}
                 </p>
                 {job.errorMessage && <p className="mt-1 text-destructive">{job.errorMessage}</p>}
-                {pollError && !job.errorMessage && <p className="mt-1 text-destructive">网络错误：{pollError}</p>}
+                {pollError && !job.errorMessage && (
+                  <p className="mt-1 text-destructive">网络错误：{pollError}</p>
+                )}
                 {(job.status === 'failed' || job.status === 'canceled') && (
-                  <Button variant="outline" size="sm" className="mt-2" onClick={retry} disabled={retrying}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-2"
+                    onClick={retry}
+                    disabled={retrying}
+                  >
                     重试
                   </Button>
                 )}

@@ -82,7 +82,7 @@ function getDetail(job: IngestionJobItem) {
   }
 }
 
-export default function IngestionTasks() {
+export default function IngestionTasks({ active = true }: { active?: boolean }) {
   const searchParams = useSearchParams();
   const statusFromUrl = useMemo(() => {
     const value = searchParams.get('status');
@@ -113,6 +113,7 @@ export default function IngestionTasks() {
       if (quiet && fetching.current) return;
       fetching.current = true;
       if (!quiet) setLoading(true);
+      let refetching = false;
       try {
         const [result, nextStats] = await Promise.all([
           listIngestionJobs({
@@ -123,15 +124,22 @@ export default function IngestionTasks() {
           }),
           getIngestionJobStats(),
         ]);
-        setJobs(result.items);
+        // 与处理任务一致：清空/删除后当前页可能越界，先收敛回最后一个有效页再重新拉取
         setTotal(result.total);
         setStats(nextStats);
         setError(undefined);
+        const lastPage = Math.max(1, Math.ceil(result.total / pageSize));
+        if (page > lastPage) {
+          refetching = true;
+          setPage(lastPage);
+          return;
+        }
+        setJobs(result.items);
       } catch (reason) {
         if (!quiet) setError(reason instanceof Error ? reason.message : '加载失败');
       } finally {
         fetching.current = false;
-        if (!quiet) setLoading(false);
+        if (!quiet && !refetching) setLoading(false);
       }
     },
     [jobType, page, status],
@@ -140,35 +148,54 @@ export default function IngestionTasks() {
   useEffect(() => {
     void fetchData();
   }, [fetchData]);
-  const active = (stats?.pending ?? 0) + (stats?.processing ?? 0) > 0;
+  const hasActiveJobs = (stats?.pending ?? 0) + (stats?.processing ?? 0) > 0;
   useEffect(() => {
+    // 隐藏的 tab 不轮询：两个面板都常驻挂载后，后台白跑请求会变成持续抖动
+    if (!active) return;
     const timer = window.setInterval(
       () => {
         if (!document.hidden) void fetchData(true);
       },
-      active ? 3000 : 15000,
+      hasActiveJobs ? 3000 : 15000,
     );
     return () => window.clearInterval(timer);
+  }, [active, hasActiveJobs, fetchData]);
+
+  // 从另一个 tab 切回来时补一次静默刷新，不闪骨架
+  const prevActiveRef = useRef(active);
+  useEffect(() => {
+    const wasActive = prevActiveRef.current;
+    prevActiveRef.current = active;
+    if (active && !wasActive) void fetchData(true);
   }, [active, fetchData]);
 
-  const retry = async (job: IngestionJobItem) => {
-    try {
-      await retryIngestionJob(job.id);
-      toast.success('任务已重新排队');
-      await fetchData();
-    } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : '重试失败');
-    }
-  };
-  const cancel = async (job: IngestionJobItem) => {
-    try {
-      await cancelIngestionJob(job.id);
-      toast.success('任务已停止');
-      await fetchData();
-    } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : '停止任务失败');
-    }
-  };
+  const retry = useCallback(
+    async (job: IngestionJobItem) => {
+      try {
+        await retryIngestionJob(job.id);
+        toast.success('任务已重新排队');
+        await fetchData();
+      } catch (reason) {
+        toast.error(reason instanceof Error ? reason.message : '重试失败');
+      }
+    },
+    [fetchData],
+  );
+  const cancel = useCallback(
+    async (job: IngestionJobItem) => {
+      const queued = job.status === 'pending';
+      try {
+        await cancelIngestionJob(job.id);
+        toast.success(queued ? '已取消排队' : '任务已停止');
+        await fetchData();
+      } catch (reason) {
+        toast.error(
+          reason instanceof Error ? reason.message : queued ? '取消任务失败' : '停止任务失败',
+        );
+      }
+    },
+    [fetchData],
+  );
   const remove = async (job: IngestionJobItem) => {
     try {
       await deleteIngestionJob(job.id);
@@ -189,78 +216,87 @@ export default function IngestionTasks() {
       toast.error(reason instanceof Error ? reason.message : '清空任务记录失败');
     }
   };
-  const columns: Column<IngestionJobItem>[] = [
-    {
-      key: 'jobType',
-      header: '任务类型',
-      render: (job) => <span className="font-medium">{TYPE_LABELS[job.jobType]}</span>,
-    },
-    {
-      key: 'status',
-      header: '状态',
-      className: 'w-28',
-      render: (job) => (
-        <Badge variant={statusVariant(job.status)}>{STATUS_LABELS[job.status]}</Badge>
-      ),
-    },
-    {
-      key: 'source',
-      header: '来源',
-      className: 'w-36',
-      render: (job) =>
-        job.source ? (
-          <Link className="text-primary hover:underline" href="/sources">
-            {job.source.name}
-          </Link>
-        ) : (
-          '-'
+  // columns 必须稳定：否则 tab 切换/轮询时 DataTable 的行级 memo 全部失效
+  const columns: Column<IngestionJobItem>[] = useMemo(
+    () => [
+      {
+        key: 'jobType',
+        header: '任务类型',
+        render: (job) => <span className="font-medium">{TYPE_LABELS[job.jobType]}</span>,
+      },
+      {
+        key: 'status',
+        header: '状态',
+        className: 'w-28',
+        render: (job) => (
+          <Badge variant={statusVariant(job.status)}>{STATUS_LABELS[job.status]}</Badge>
         ),
-    },
-    { key: 'detail', header: '详情', render: getDetail },
-    {
-      key: 'error',
-      header: '失败原因',
-      render: (job) => (
-        <span className="line-clamp-1 text-destructive">{job.errorMessage || '-'}</span>
-      ),
-    },
-    {
-      key: 'createdAt',
-      header: '创建时间',
-      className: 'w-40',
-      render: (job) => (
-        <span className="text-muted-foreground">{formatDateTime(job.createdAt)}</span>
-      ),
-    },
-    {
-      key: 'actions',
-      header: '操作',
-      className: 'w-40 text-right',
-      render: (job) => (
-        <div className="flex justify-end gap-1">
-          {job.status === 'processing' ? (
-            <Button variant="ghost" size="sm" title="停止任务" onClick={() => cancel(job)}>
-              <Square className="h-4 w-4" />
-            </Button>
-          ) : job.status === 'failed' || job.status === 'canceled' ? (
-            <Button variant="ghost" size="sm" title="重新排队" onClick={() => retry(job)}>
-              <RotateCcw className="h-4 w-4" />
-            </Button>
-          ) : null}
-          {job.status === 'completed' || job.status === 'failed' || job.status === 'canceled' ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              title="删除记录"
-              onClick={() => setDeleteTarget(job)}
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          ) : null}
-        </div>
-      ),
-    },
-  ];
+      },
+      {
+        key: 'source',
+        header: '来源',
+        className: 'w-36',
+        render: (job) =>
+          job.source ? (
+            <Link className="text-primary hover:underline" href="/sources">
+              {job.source.name}
+            </Link>
+          ) : (
+            '-'
+          ),
+      },
+      { key: 'detail', header: '详情', render: getDetail },
+      {
+        key: 'error',
+        header: '失败原因',
+        render: (job) => (
+          <span className="line-clamp-1 text-destructive">{job.errorMessage || '-'}</span>
+        ),
+      },
+      {
+        key: 'createdAt',
+        header: '创建时间',
+        className: 'w-40',
+        render: (job) => (
+          <span className="text-muted-foreground">{formatDateTime(job.createdAt)}</span>
+        ),
+      },
+      {
+        key: 'actions',
+        header: '操作',
+        className: 'w-40 text-right',
+        render: (job) => (
+          <div className="flex justify-end gap-1">
+            {job.status === 'processing' || job.status === 'pending' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                title={job.status === 'pending' ? '取消排队' : '停止任务'}
+                onClick={() => cancel(job)}
+              >
+                <Square className="h-4 w-4" />
+              </Button>
+            ) : job.status === 'failed' || job.status === 'canceled' ? (
+              <Button variant="ghost" size="sm" title="重新排队" onClick={() => retry(job)}>
+                <RotateCcw className="h-4 w-4" />
+              </Button>
+            ) : null}
+            {job.status === 'completed' || job.status === 'failed' || job.status === 'canceled' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                title="删除记录"
+                onClick={() => setDeleteTarget(job)}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            ) : null}
+          </div>
+        ),
+      },
+    ],
+    [cancel, retry],
+  );
   const cards = useMemo(
     () =>
       [
@@ -275,16 +311,16 @@ export default function IngestionTasks() {
   return (
     <>
       <div className="mb-6 flex justify-end">
-        <Button variant="outline" size="sm" className="gap-1" onClick={() => setClearConfirmOpen(true)}>
-          <Trash2 className="h-4 w-4" />
-          清空已结束任务
-        </Button>
         <Button
           variant="outline"
           size="sm"
-          className="ml-2 gap-1"
-          onClick={() => fetchData()}
+          className="gap-1"
+          onClick={() => setClearConfirmOpen(true)}
         >
+          <Trash2 className="h-4 w-4" />
+          清空已结束任务
+        </Button>
+        <Button variant="outline" size="sm" className="ml-2 gap-1" onClick={() => fetchData()}>
           <RefreshCw className="h-4 w-4" />
           刷新
         </Button>
@@ -349,7 +385,7 @@ export default function IngestionTasks() {
         data={jobs}
         loading={loading}
         error={error}
-        onRetry={fetchData}
+        onRetry={() => void fetchData()}
         emptyTitle="暂无导入任务"
         emptyDescription="添加链接或同步来源后，后台任务将在这里显示"
         keyExtractor={(job) => job.id}

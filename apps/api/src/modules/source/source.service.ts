@@ -96,6 +96,10 @@ export class SourceService {
       this.validateAllowedModes(dto.allowedModes);
     }
 
+    if (dto.downloadCategoryId) {
+      await this.assertCategoryExists(dto.downloadCategoryId);
+    }
+
     const requiresReview = dto.requiresReview ?? false;
     const allowedModes =
       dto.allowedModes ??
@@ -118,6 +122,7 @@ export class SourceService {
         config: dto.config,
         autoSyncIntervalHours: dto.autoSyncIntervalHours,
         downloadDirectory: dto.downloadDirectory ?? null,
+        downloadCategoryId: dto.downloadCategoryId ?? null,
       });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -145,6 +150,10 @@ export class SourceService {
       this.validateAllowedModes(dto.allowedModes);
     }
 
+    if (dto.downloadCategoryId) {
+      await this.assertCategoryExists(dto.downloadCategoryId);
+    }
+
     try {
       return await this.sourceRepo.update(id, {
         name: dto.name,
@@ -165,6 +174,10 @@ export class SourceService {
           dto.autoSyncIntervalHours === undefined ? undefined : dto.autoSyncIntervalHours,
         downloadDirectory:
           dto.downloadDirectory === undefined ? undefined : (dto.downloadDirectory as string | null),
+        downloadCategoryId:
+          dto.downloadCategoryId === undefined
+            ? undefined
+            : (dto.downloadCategoryId as string | null),
       });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -183,6 +196,12 @@ export class SourceService {
       }
     }
     return { id, deleted: true };
+  }
+
+  /** 校验来源下载文件夹存在，避免把无效 id 写到外键上 */
+  private async assertCategoryExists(categoryId: string): Promise<void> {
+    const category = await this.sourceRepo.findCategoryById(categoryId);
+    if (!category) throw new BadRequestException(`Category ${categoryId} not found`);
   }
 
   /** 校验 allowedModes 逗号分隔值都是合法的 AcquisitionMode */

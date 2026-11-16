@@ -1,0 +1,43 @@
+diff --git a/docs/ai-native-design-operations-plan.md b/docs/ai-native-design-operations-plan.md
+index 240ff66..32cb7a8 100644
+--- a/docs/ai-native-design-operations-plan.md
++++ b/docs/ai-native-design-operations-plan.md
+@@ -69,7 +69,7 @@ AI 生成多个方案、并排比较、确认后替换、支持历史回退，
+ 
+ `DesignDocument`
+ 
+-- `id`、`slug`、`name`、`kind`：`foundation | theme | component | layout | style_pack`。
++- `id`、`slug`、`name`、`kind`：`foundation | theme | component | layout | style_pack | animation`。
+ - `status`：`draft | published | deprecated | archived`。
+ - `currentPublishedVersionId`、`visibility`（第一版为 `internal`）。
+ 
+@@ -407,6 +407,29 @@ Robots Exclusion Protocol：https://www.rfc-editor.org/rfc/rfc9309.html。它不
+ - 搜索先返回 `id`、`slug`、版本、摘要、适用场景、标签和校验状态。
+ - 详情返回固定的 `schemaVersion`、依赖版本、Token、组件/布局规则和导出链接。
+ - 默认不返回原始参考图片、网页 HTML 或未发布草稿。
++
++### 15.10 面向非专业用户的创建入口（2026-09 补充）
++
++§7 的"对话 + 画布 + 检查器"是**审查**界面，假定使用者看得懂结构化 Diff 与校验状态。
++实际使用者的多数是运营而非设计工程师，让他们写 `aurum.component.v2` 的 JSON 不成立。
++因此新增一个创建向导（`/design-library`），专业流程整体移到 `/design-library/review`。
++
++它与本方案其余部分的关系：
++
++- **事实来源不变**：向导产出的仍是同一套结构化 content，只是不再由人手写。
++- **治理链不变**：一键发布走的是 §6.1 的状态机（草稿 → 候选 → 渲染校验 → 选择 → 发布），
++  由服务端串起来，不是绕过。
++- **§15.3 仍成立**：对比度门禁是纯函数，可以在写库前同步跑完且不占请求线程；
++  渲染与 AI 调用留在任务队列里。
++- **§15.4 仍成立**：向导里的实时预览是 iframe 注入**服务端从结构化内容派生**的
++  CSS 与 HTML 骨架，不把模型返回的 HTML 当事实来源；权威预览仍是受控渲染器产物。
++  iframe 只用于隔离预览与运营台自身的 DOM，不是发布安全边界。
++- **§15.8 仍成立**：参考档案只进提示词产出候选，由操作员点选后才成为正式版本；
++  `variations[].html` 被显式剔除，不会变成组件。
++
++一个需要记录的取舍：手工挑选的效果配方（`design-recipes.ts`）是**预先验证过**的
++内容，所以"选现成效果"这条路完全不花 AI 调用；而"描述生成"仍需模型，也就仍受
++§15.7 关于通用设计代理尚未建成的限制。
+ - 使用服务 API Key、限流、分页、最大响应大小和调用审计。
+ - 外部 AI 请求必须显式指定 `published` 版本或允许的版本范围，不能默认读取“当前草稿”。
+ 

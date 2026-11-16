@@ -175,6 +175,57 @@ describe('ControlledRendererService', () => {
     expect(result.outputs.every((item) => item.changedPixels > 0)).toBe(true);
   }, 60_000);
 
+  it('renders embedded media data URIs even with all network requests aborted', async () => {
+    const writes = new Map<string, Buffer>();
+    const renderer = new ControlledRendererService(createStorage(writes));
+    const redPng = await sharp({
+      create: { width: 64, height: 48, channels: 3, background: { r: 220, g: 20, b: 20 } },
+    })
+      .png()
+      .toBuffer();
+    const mediaContent = {
+      ...componentContent({ 'aspect-ratio': 1.333, 'max-width': '400px' }),
+      media: {
+        resourceId: '2e0c21c4-44f1-4e53-8daa-ff796d722049',
+        kind: 'image',
+        alt: '红色素材',
+        width: 64,
+        height: 48,
+      },
+    };
+
+    await renderer.render(
+      {
+        kind: 'component',
+        content: mediaContent,
+        baseContent: mediaContent,
+        media: {
+          dataUri: `data:image/png;base64,${redPng.toString('base64')}`,
+          mimeType: 'image/png',
+          kind: 'image',
+        },
+        baseMedia: null,
+      },
+      'media-render-test',
+    );
+
+    const preview = [...writes.entries()].find(
+      ([key]) => key.startsWith('design-previews/') && key.endsWith('-desktop.png'),
+    );
+    expect(preview).toBeDefined();
+    const { data, info } = await sharp(preview![1])
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    let sawRed = false;
+    for (let index = 0; index + 2 < data.length; index += info.channels) {
+      if (data[index] > 160 && data[index + 1] < 90 && data[index + 2] < 90) {
+        sawRed = true;
+        break;
+      }
+    }
+    expect(sawRed).toBe(true);
+  }, 60_000);
+
   it('renders an animation as a single side-by-side frame strip', async () => {
     const renderer = new ControlledRendererService(createStorage());
     const result = await renderer.render(

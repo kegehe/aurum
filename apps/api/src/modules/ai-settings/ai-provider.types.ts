@@ -4,6 +4,8 @@
 
 /** 当前运行时可用的供应商解析结果（来自数据库生效配置或环境变量回退） */
 export interface ResolvedAiProvider {
+  /** 数据库配置 ID；环境变量回退时为 null（用量统计用于区分来源） */
+  id?: string | null;
   provider: string;
   apiKey: string;
   baseUrl?: string;

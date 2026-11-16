@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   Check,
@@ -61,6 +61,33 @@ const KINDS: Array<{ value: DesignKind; label: string }> = [
   { value: 'style_pack', label: '样式包' },
   { value: 'animation', label: '动画' },
 ];
+
+const ACTIVE_TASK_STATUSES = ['pending', 'running'];
+
+/**
+ * 还有任务在跑吗？
+ *
+ * 审核台的轮询只应该在有活跃任务时进行：任务都结束（或一开始就没有任务）时，
+ * 每 3 秒重复拉取候选、预览和任务列表没有任何新信息。
+ */
+function hasActiveWork(candidates: Candidate[], tasks: DesignTask[]) {
+  return (
+    tasks.some((task) => ACTIVE_TASK_STATUSES.includes(task.status)) ||
+    candidates.some((candidate) =>
+      candidate.validationRuns?.some((run) => ACTIVE_TASK_STATUSES.includes(run.status)),
+    )
+  );
+}
+
+/**
+ * 候选预览的失效签名。
+ *
+ * 预览图与 validationRun 在渲染任务成功时同一个事务里写入，所以「最新一次
+ * 校验的 id + 候选状态」不变就说明预览不会变，不需要重新请求。
+ */
+function previewSignature(candidate: Candidate) {
+  return `${candidate.status}:${candidate.validationRuns?.[0]?.id ?? ''}`;
+}
 
 /**
  * 新建资产的初始内容。
@@ -149,6 +176,8 @@ export default function DesignLibraryPage() {
     {},
   );
   const [tasks, setTasks] = useState<DesignTask[]>([]);
+  // 只有存在 pending/running 任务时才轮询；由 refreshDraftState 按最新状态更新
+  const [polling, setPolling] = useState(false);
   const [working, setWorking] = useState(false);
   const [readyDrafts, setReadyDrafts] = useState<
     Array<{
@@ -163,27 +192,42 @@ export default function DesignLibraryPage() {
   const [newSlug, setNewSlug] = useState('');
   const [newThemeId, setNewThemeId] = useState('');
   const [newContent, setNewContent] = useState('');
+  // 新建表单自己的类型：打开时从当前筛选类型带过来，之后不再随左栏切换而变
+  const [newKind, setNewKind] = useState<DesignKind>('theme');
 
-  const refresh = async (preserveId?: string) => {
-    setLoading(true);
-    try {
-      const next = await listDesignDocuments();
-      setDocuments(next);
-      const id = preserveId ?? selected?.id;
-      const item = id ? next.find((entry) => entry.id === id) : next[0];
-      if (item) await choose(item.id);
-      else setSelected(null);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : '读取设计目录失败');
-    } finally {
-      setLoading(false);
-    }
+  // 右侧（版本历史与所有按钮）只认与当前筛选类型一致的文档：
+  // 切换类型后首个资产加载完成之前、以及过期响应到达时，旧类型的资产不会残留可操作。
+  const activeDocument = selected && selected.kind === kind ? selected : null;
+  const activeVersionNumber = activeDocument?.currentPublishedVersion?.versionNumber;
+
+  // 最后一次发起的选中请求 id：快速连点或切换类型时，先发后到的响应必须丢弃
+  const pendingIdRef = useRef<string | null>(null);
+  // 草稿数据只属于当前 draftId：切走后到达的旧请求不能把上一个草稿的候选写回来
+  const draftIdRef = useRef<string | null>(null);
+  // 已经取过预览的候选签名：签名不变就不再请求，见 previewSignature
+  const previewSignaturesRef = useRef<Record<string, string>>({});
+  // 只通过它改 draftId，ref 才能和 state 始终一致（异步写回的判定依赖 ref）
+  const setActiveDraft = (id: string | null) => {
+    draftIdRef.current = id;
+    previewSignaturesRef.current = {};
+    setPolling(false);
+    setDraftId(id);
+  };
+  const clearSelectedDocument = () => {
+    pendingIdRef.current = null;
+    setSelected(null);
+    setActiveDraft(null);
+    setCandidates([]);
+    setCandidatePreviews({});
+    setCandidateText('');
   };
   const choose = async (id: string) => {
+    pendingIdRef.current = id;
     try {
       const doc = await getDesignDocument(id);
+      if (pendingIdRef.current !== id) return;
       setSelected(doc);
-      setDraftId(null);
+      setActiveDraft(null);
       setCandidates([]);
       setCandidatePreviews({});
       const current = doc.currentPublishedVersion;
@@ -194,38 +238,114 @@ export default function DesignLibraryPage() {
       toast.error(error instanceof Error ? error.message : '读取设计文档失败');
     }
   };
+  const refresh = async (preserveId?: string) => {
+    setLoading(true);
+    try {
+      const next = await listDesignDocuments();
+      setDocuments(next);
+      const id = preserveId ?? selected?.id;
+      const item = id
+        ? next.find((entry) => entry.id === id)
+        : (next.find((entry) => entry.kind === kind) ?? next[0]);
+      if (item) {
+        // 首屏：目录里没有当前类型的资产时，筛选跟着数据切过去，避免开局空转
+        if (!id && item.kind !== kind) setKind(item.kind);
+        await choose(item.id);
+      } else clearSelectedDocument();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '读取设计目录失败');
+    } finally {
+      setLoading(false);
+    }
+  };
   useEffect(() => {
     void refresh();
   }, []);
+  // 左栏类型筛选同时是右栏的上下文：类型与当前选中资产必须一致，
+  // 否则「创建草稿 / 复制 CSS / 发布」还会作用在上一个类型的资产上。
+  useEffect(() => {
+    if (loading || activeDocument) return;
+    const first = documents.find((item) => item.kind === kind);
+    if (first) void choose(first.id);
+    else if (selected) clearSelectedDocument();
+  }, [activeDocument, documents, kind, loading, selected]);
   useEffect(() => {
     listReadyDrafts()
       .then(setReadyDrafts)
       .catch(() => undefined);
   }, [draftId, selected]);
   const refreshDraftState = async (id: string) => {
-    const nextCandidates = await listCandidates(id);
+    // 候选与任务并行拉：任务接口按 draftId 过滤，且只返回列表需要的字段
+    const [nextCandidates, nextTasks] = await Promise.all([
+      listCandidates(id),
+      listDesignTasks({ draftId: id }),
+    ]);
+    if (draftIdRef.current !== id) return false;
     setCandidates(nextCandidates);
-    const previews = await Promise.all(
-      nextCandidates.map(
-        async (candidate) =>
-          [candidate.id, await listCandidatePreviews(candidate.id).catch(() => [])] as const,
-      ),
+    setTasks(nextTasks);
+
+    const signatures = Object.fromEntries(
+      nextCandidates.map((candidate) => [candidate.id, previewSignature(candidate)]),
     );
-    setCandidatePreviews(Object.fromEntries(previews));
-    setTasks(await listDesignTasks());
+    const currentIds = new Set(nextCandidates.map((candidate) => candidate.id));
+    const changed = nextCandidates.filter(
+      (candidate) => previewSignaturesRef.current[candidate.id] !== signatures[candidate.id],
+    );
+    const removed = Object.keys(previewSignaturesRef.current).some(
+      (candidateId) => !currentIds.has(candidateId),
+    );
+    if (changed.length || removed) {
+      const previews = await Promise.all(
+        changed.map(async (candidate) => {
+          try {
+            return [candidate.id, await listCandidatePreviews(candidate.id)] as const;
+          } catch {
+            // 失败的候选不记签名，否则一次网络抖动会把「没有预览」永久缓存下来；
+            // 下一轮轮询（或手动刷新）会重新请求。
+            return [candidate.id, null] as const;
+          }
+        }),
+      );
+      if (draftIdRef.current !== id) return false;
+      setCandidatePreviews((current) => {
+        const next = Object.fromEntries(
+          Object.entries(current).filter(([candidateId]) => currentIds.has(candidateId)),
+        );
+        for (const [candidateId, items] of previews) {
+          if (items) next[candidateId] = items;
+        }
+        return next;
+      });
+      for (const [candidateId, items] of previews) {
+        if (!items) delete signatures[candidateId];
+      }
+    }
+    previewSignaturesRef.current = signatures;
+
+    const active = hasActiveWork(nextCandidates, nextTasks);
+    setPolling(active);
+    return active;
   };
   useEffect(() => {
     if (!draftId) return;
     void refreshDraftState(draftId).catch(() => undefined);
+  }, [draftId]);
+  // 有活跃任务才每 3 秒轮询；refreshDraftState 在任务全部结束时把 polling 置回 false
+  useEffect(() => {
+    if (!draftId || !polling) return;
     const timer = window.setInterval(() => {
       void refreshDraftState(draftId).catch(() => undefined);
     }, 3_000);
     return () => window.clearInterval(timer);
-  }, [draftId]);
+  }, [draftId, polling]);
 
   const currentContent = useMemo(
-    () => selected?.currentPublishedVersion?.content ?? '',
-    [selected],
+    () => activeDocument?.currentPublishedVersion?.content ?? '',
+    [activeDocument],
+  );
+  const kindDocuments = useMemo(
+    () => documents.filter((item) => item.kind === kind),
+    [documents, kind],
   );
   // 可作为依赖钉住的主题：必须有已发布版本，否则钉不住具体版本
   const themes = useMemo(
@@ -236,6 +356,7 @@ export default function DesignLibraryPage() {
     setNewName('');
     setNewSlug('');
     setNewThemeId(themes[0]?.id ?? '');
+    setNewKind(kind);
     setNewContent(JSON.stringify(EXAMPLES[kind], null, 2));
     setShowCreate(true);
   };
@@ -252,7 +373,7 @@ export default function DesignLibraryPage() {
       return;
     }
     // 依赖在提交时注入：静态示例里写不出真实 UUID，而校验要求合法 UUID
-    if (PINNED_DEPENDENCY_KINDS.includes(kind)) {
+    if (PINNED_DEPENDENCY_KINDS.includes(newKind)) {
       const theme = themes.find((item) => item.id === newThemeId);
       if (!theme?.currentPublishedVersion?.id) {
         toast.error('请选择一个有已发布版本的主题：该类型必须钉住具体依赖版本');
@@ -268,11 +389,13 @@ export default function DesignLibraryPage() {
       const document = await createDesignDocument({
         name: newName.trim(),
         slug: newSlug.trim(),
-        kind,
+        kind: newKind,
         content,
       });
       toast.success('已创建并发布初始版本');
       setShowCreate(false);
+      // 筛到刚建的类型，否则新资产会被当前筛选过滤掉、看起来像没创建成功
+      setKind(newKind);
       await refresh(document.id);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '创建失败');
@@ -281,11 +404,11 @@ export default function DesignLibraryPage() {
     }
   };
   const beginDraft = async () => {
-    if (!selected) return;
+    if (!activeDocument) return;
     setWorking(true);
     try {
-      const draft = await createDraft(selected.id);
-      setDraftId(draft.id);
+      const draft = await createDraft(activeDocument.id);
+      setActiveDraft(draft.id);
       setCandidates([]);
       setCandidatePreviews({});
       toast.success('草稿已创建');
@@ -312,6 +435,8 @@ export default function DesignLibraryPage() {
         rationale: '由运营台手工调整',
       });
       await renderAndValidateCandidate(candidate.id);
+      // 渲染任务已入队：即使紧接着的刷新失败，也让轮询继续重试
+      setPolling(true);
       await refreshDraftState(draftId);
       toast.success('候选已加入校验队列');
     } catch (error) {
@@ -321,13 +446,13 @@ export default function DesignLibraryPage() {
     }
   };
   const publish = async (candidate: Candidate) => {
-    if (!draftId || !selected) return;
+    if (!draftId || !activeDocument) return;
     setWorking(true);
     try {
       await selectCandidate(candidate.id);
       await publishDraft(draftId);
       toast.success('已发布新版本');
-      await refresh(selected.id);
+      await refresh(activeDocument.id);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '发布失败');
     } finally {
@@ -335,10 +460,10 @@ export default function DesignLibraryPage() {
     }
   };
   const copyExport = async (target: 'css' | 'html') => {
-    if (!selected) return;
+    if (!activeDocument) return;
     setWorking(true);
     try {
-      const result = await exportDesignDocument(selected.id, 'bundle');
+      const result = await exportDesignDocument(activeDocument.id, 'bundle');
       // copyCss 由服务端拼好（含 reducedMotion 降级块），前端不做拼接
       const text = target === 'css' ? result.content.copyCss : result.content.html;
       if (!text) {
@@ -376,9 +501,10 @@ export default function DesignLibraryPage() {
     try {
       await queueAiCandidates(draftId, { intent: aiIntent.trim(), count: 3 });
       toast.success('AI 已加入候选生成队列');
-      window.setTimeout(() => {
-        void refreshDraftState(draftId).catch(() => undefined);
-      }, 1_000);
+      // 任务行已经落库：先乐观开启轮询，再立刻刷一次让 pending 任务进入列表；
+      // 空闲状态下没有常驻轮询，这一步失败也必须靠轮询兜底。
+      setPolling(true);
+      void refreshDraftState(draftId).catch(() => undefined);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'AI 任务创建失败');
     } finally {
@@ -386,12 +512,12 @@ export default function DesignLibraryPage() {
     }
   };
   const restore = async (versionId: string) => {
-    if (!selected || !window.confirm('恢复会创建一个新的正式版本，确认继续？')) return;
+    if (!activeDocument || !window.confirm('恢复会创建一个新的正式版本，确认继续？')) return;
     setWorking(true);
     try {
-      await restoreDesignVersion(selected.id, versionId);
+      await restoreDesignVersion(activeDocument.id, versionId);
       toast.success('已创建恢复版本');
-      await refresh(selected.id);
+      await refresh(activeDocument.id);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '恢复失败');
     } finally {
@@ -410,7 +536,7 @@ export default function DesignLibraryPage() {
       toast.success('多文档 ChangeSet 已原子发布');
       setSelectedDraftIds([]);
       setReadyDrafts(await listReadyDrafts());
-      await refresh(selected?.id);
+      await refresh(activeDocument?.id);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '多文档发布失败');
     } finally {
@@ -421,7 +547,11 @@ export default function DesignLibraryPage() {
     setWorking(true);
     try {
       if (operation === 'cancel') await cancelDesignTask(task.id);
-      else await retryDesignTask(task.id);
+      else {
+        await retryDesignTask(task.id);
+        // 任务回到 pending：即使下面的刷新失败也要靠轮询兜底
+        setPolling(true);
+      }
       if (draftId) await refreshDraftState(draftId);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '任务操作失败');
@@ -439,7 +569,7 @@ export default function DesignLibraryPage() {
         <Link href="/design-library">
           <Button variant="outline" className="gap-2">
             <Wand2 className="h-4 w-4" />
-            创建向导
+            去创建
           </Button>
         </Link>
         <Button onClick={openCreate} disabled={working} className="gap-2">
@@ -451,7 +581,7 @@ export default function DesignLibraryPage() {
         <section className="space-y-3 rounded-md border p-4">
           <div>
             <h3 className="font-medium">
-              新建{KINDS.find((item) => item.value === kind)?.label}资产
+              新建{KINDS.find((item) => item.value === newKind)?.label}资产
             </h3>
             <p className="text-xs text-muted-foreground">
               创建后会立即生成并发布初始版本；后续改动走「创建草稿 → 生成候选 → 渲染校验 → 发布」。
@@ -479,7 +609,7 @@ export default function DesignLibraryPage() {
               onChange={(event) => setNewSlug(event.target.value)}
             />
           </div>
-          {PINNED_DEPENDENCY_KINDS.includes(kind) && (
+          {PINNED_DEPENDENCY_KINDS.includes(newKind) && (
             <div className="space-y-1">
               <label className="text-xs text-muted-foreground">
                 钉住的主题版本（该类型必须固定依赖版本，token 别名从它解析）
@@ -576,36 +706,38 @@ export default function DesignLibraryPage() {
         <aside className="min-h-[540px] border-r pr-3">
           {loading ? (
             <Loader2 className="m-4 h-5 w-5 animate-spin" />
+          ) : kindDocuments.length === 0 ? (
+            <p className="m-4 text-xs text-muted-foreground">
+              该类型下还没有资产，点右上角「新建」创建。
+            </p>
           ) : (
-            documents
-              .filter((item) => item.kind === kind)
-              .map((item) => (
-                <button
-                  key={item.id}
-                  onClick={() => void choose(item.id)}
-                  className={cn(
-                    'mb-1 w-full rounded-md px-3 py-2 text-left',
-                    selected?.id === item.id
-                      ? 'bg-primary text-primary-foreground'
-                      : 'hover:bg-muted',
-                  )}
-                >
-                  <div className="truncate text-sm font-medium">{item.name}</div>
-                  <div className="text-xs opacity-70">
-                    v{item.currentPublishedVersion?.versionNumber ?? 0}
-                  </div>
-                </button>
-              ))
+            kindDocuments.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => void choose(item.id)}
+                className={cn(
+                  'mb-1 w-full rounded-md px-3 py-2 text-left',
+                  activeDocument?.id === item.id
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-muted',
+                )}
+              >
+                <div className="truncate text-sm font-medium">{item.name}</div>
+                <div className="text-xs opacity-70">
+                  v{item.currentPublishedVersion?.versionNumber ?? 0}
+                </div>
+              </button>
+            ))
           )}
         </aside>
         <main className="min-w-0 space-y-4">
-          {selected ? (
+          {activeDocument ? (
             <>
               <section className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <h2 className="text-xl font-semibold">{selected.name}</h2>
+                  <h2 className="text-xl font-semibold">{activeDocument.name}</h2>
                   <p className="text-sm text-muted-foreground">
-                    {selected.slug} · 已发布 v{selected.currentPublishedVersion?.versionNumber}
+                    {activeDocument.slug} · 已发布 v{activeVersionNumber}
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -869,11 +1001,11 @@ export default function DesignLibraryPage() {
             <History className="h-4 w-4" />
             版本历史
           </div>
-          {selected?.versions?.map((version) => (
+          {activeDocument?.versions?.map((version) => (
             <div key={version.id} className="mb-3 border-b pb-3">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium">v{version.versionNumber}</span>
-                {version.id !== selected.currentPublishedVersion?.id && (
+                {version.id !== activeDocument.currentPublishedVersion?.id && (
                   <Button
                     variant="ghost"
                     size="icon"

@@ -107,6 +107,8 @@ model Source {
   autoSyncIntervalHours Int?
   /// 下载目录（相对存储根目录的子目录，如 `civitai/foo`）；null = 默认存储布局
   downloadDirectory     String?
+  /// 同步下载的资源默认归入的资源库文件夹；null = 不归档
+  downloadCategoryId    String?
   lastSyncedAt          DateTime?
   lastSyncStatus        String?
   lastSyncError         String?
@@ -117,10 +119,12 @@ model Source {
   locators      ResourceLocator[]
   provenance    ResourceProvenance[]
   ingestionJobs IngestionJob[]
+  downloadCategory          Category?     @relation("SourceDownloadCategory", fields: [downloadCategoryId], references: [id], onDelete: SetNull)
   referenceTermsAcceptances DesignReferenceTermsAcceptance[]
   designReferenceQuota      DesignReferenceQuota?
 
   @@index([enabled])
+  @@index([downloadCategoryId])
   @@map("sources")
 }
 
@@ -158,6 +162,35 @@ model ResourceLocator {
   @@map("resource_locators")
 }
 
+/// 远端条目台账（tombstone）：记录「这个远端条目已经处理过」。
+///
+/// 为什么不复用 ResourceLocator 判重：locator 随 Resource 级联删除，用户在回收站
+/// 彻底删除后判重依据就没了，下次同步会把同一条目当新资源重新下载。台账刻意不建
+/// 外键，资源删除、来源删除都不影响它，从而保证「同一条目只下载一次」。
+/// state=metadata_only 表示只记录了元数据（未下载文件），不阻止后续下载。
+model SourceItemLedger {
+  id            String   @id @default(uuid())
+  /// 连接器类型（civitai / github / rss），与 ResourceLocator.identityUrl 的前缀一致
+  connectorType String
+  /// 远端条目 ID（Civitai image id 等），来源侧稳定不变
+  externalId    String
+  /// 首次记录该条目的来源，仅用于溯源与按来源清理
+  sourceId      String?
+  /// 最后写入该条目的资源 ID；资源可能已被彻底删除，故只存值、不建关系
+  resourceId    String?
+  /// downloaded | metadata_only
+  state         String   @default("downloaded")
+  sha256        String?
+  sizeBytes     BigInt   @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([connectorType, externalId])
+  @@index([sha256])
+  @@index([sourceId])
+  @@map("source_item_ledger")
+}
+
 // AI 供应商配置（可在「设置 → AI 配置」中管理，无需改 .env 重启）
 // 支持多个配置，同时仅一个生效（isActive）。未配置时回退到环境变量 ANTHROPIC_API_KEY。
 model AiProvider {
@@ -186,6 +219,45 @@ model AiProvider {
 
   @@index([isActive, enabled])
   @@map("ai_providers")
+}
+
+/// AI 用量明细：每发起一次上游模型请求记录一行（成功与失败都记）。
+///
+/// 刻意不建 AiProvider 外键：供应商配置可能被删除/重建，历史用量仍需保留；
+/// providerId / providerName 只是调用当时的快照。
+/// 失败请求通常拿不到 usage，token 字段为 0，仅计入请求次数与成功率。
+model AiUsageLog {
+  id                  String   @id @default(uuid())
+  /// 供应商类型（anthropic）
+  provider            String
+  /// 调用时的 AiProvider.id；环境变量回退时为 null
+  providerId          String?
+  /// 配置名称快照（环境变量回退时为「环境变量」）
+  providerName        String?
+  /// 实际模型名（优先取响应里的 model）
+  model               String
+  /// 调用来源：style.analyze / style.variations / design.generate / design.repair
+  feature             String
+  /// success | error
+  status              String
+  /// 失败分类：connectivity / rate_limit / auth / output / capability / canceled / unknown
+  errorKind           String?
+  /// 失败摘要（截断），便于排查
+  errorMessage        String?
+  inputTokens         Int      @default(0)
+  outputTokens        Int      @default(0)
+  /// 命中缓存的输入 tokens（Anthropic prompt caching）
+  cacheReadTokens     Int      @default(0)
+  /// 写入缓存的输入 tokens
+  cacheCreationTokens Int      @default(0)
+  /// 上游请求耗时（毫秒）
+  latencyMs           Int
+  createdAt           DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([feature, createdAt])
+  @@index([model, createdAt])
+  @@map("ai_usage_logs")
 }
 
 model ResourceProvenance {
@@ -263,6 +335,11 @@ model ResourceFile {
   @@unique([resourceId, fileRole, variant])
   @@index([resourceId])
   @@index([fileRole])
+  // 删除/清空回收站前要按 storagePath 反查引用，一致性检查按 storagePath 排序
+  // 全表读取，仪表盘存储统计按 storagePath 分组求和。带上 resourceId/sizeBytes
+  // 让三条查询都走覆盖索引：单列索引会让分组求和改成沿索引随机回表，实测反而
+  // 慢 3 倍；两列版仍缺 sizeBytes，回表后约慢 2 倍。三列只比两列多占 0.13MB。
+  @@index([storagePath, resourceId, sizeBytes])
   @@map("resource_files")
 }
 
@@ -277,6 +354,7 @@ model Category {
   parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
   children  Category[] @relation("CategoryTree")
   resources Resource[]
+  downloadSources Source[] @relation("SourceDownloadCategory")
 
   @@unique([name, parentId])
   @@map("categories")
@@ -312,6 +390,12 @@ model DesignDocument {
   slug                      String   @unique
   name                      String
   kind                      String
+  format                    String   @default("token") // token | package | legacy
+  subtype                   String?
+  description               String?
+  whenToUse                 String?
+  source                    String   @default("manual") // manual | ai | reference | recipe | import
+  favorite                  Boolean  @default(false)
   status                    String   @default("draft")
   visibility                String   @default("internal")
   currentPublishedVersionId String?
@@ -323,8 +407,11 @@ model DesignDocument {
   dependenciesFrom        DesignDependency[] @relation("DependencyFrom")
   dependenciesTo          DesignDependency[] @relation("DependencyTo")
   drafts                  DesignDraft[]
+  tags                    DesignAssetTagLink[]
   changeSetItems          ChangeSetItem[]
   accessLogs              DesignAccessLog[]
+
+  studioSessions           ChangeSession[]    @relation("DesignStudioSessions")
 
   @@index([kind, status])
   @@index([currentPublishedVersionId])
@@ -335,6 +422,7 @@ model DesignVersion {
   id                    String    @id @default(uuid())
   documentId            String
   versionNumber         Int
+  format                String    @default("token") // token | package | legacy
   baseVersionId         String?
   content               String
   contentHash           String
@@ -358,6 +446,8 @@ model DesignVersion {
   referenceSnapshots    ReferenceSnapshot[]
   validationRuns        ValidationRun[]
   previewSnapshots      PreviewSnapshot[]
+  previewSnapshotJobs   PreviewSnapshotJob[]
+  files                 DesignAssetFile[]
   draftsUsingAsBase     DesignDraft[]        @relation("DraftBaseVersion")
   candidatesUsingAsBase CandidateProposal[]  @relation("CandidateBaseVersion")
 
@@ -365,6 +455,71 @@ model DesignVersion {
   @@index([documentId, publishedAt])
   @@index([baseVersionId])
   @@map("design_versions")
+}
+
+model DesignAssetFile {
+  id        String   @id @default(uuid())
+  versionId String
+  path      String
+  target    String?
+  type      String   // registry:ui | registry:block | registry:file | asset:preview | asset:fixture | asset:doc
+  language  String   // tsx | css | json | md
+  content   String
+  createdAt DateTime @default(now())
+
+  version DesignVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@unique([versionId, path])
+  @@index([versionId])
+  @@map("design_asset_files")
+}
+
+model DesignAssetTag {
+  id    String @id @default(uuid())
+  name  String @unique
+  slug  String @unique
+  links DesignAssetTagLink[]
+
+  @@map("design_asset_tags")
+}
+
+model DesignAssetTagLink {
+  documentId String
+  tagId      String
+
+  document DesignDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  tag      DesignAssetTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([documentId, tagId])
+  @@index([tagId])
+  @@map("design_asset_tag_links")
+}
+
+model PreviewSnapshotJob {
+  id           String    @id @default(uuid())
+  versionId    String
+  viewport     String    @default("desktop")
+  state        String    @default("default")
+  kind         String    @default("full")
+  status       String    @default("pending") // pending | running | succeeded | failed
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(3)
+  availableAt  DateTime  @default(now())
+  leaseUntil   DateTime?
+  workerId     String?
+  error        String?
+  artifactHash String?
+  storagePath  String?
+  createdAt    DateTime  @default(now())
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  version DesignVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@unique([versionId, viewport, state, kind])
+  @@index([status, availableAt])
+  @@index([versionId])
+  @@map("preview_snapshot_jobs")
 }
 
 model DesignDependency {
@@ -392,6 +547,8 @@ model ChangeSession {
   request         String
   status          String   @default("open")
   providerId      String?
+  documentId      String?
+  title           String?
   model           String?
   contextSnapshot String?
   budget          String?
@@ -399,7 +556,9 @@ model ChangeSession {
   updatedAt       DateTime @updatedAt
 
   provider           AiProvider?         @relation("ChangeSessionProvider", fields: [providerId], references: [id], onDelete: SetNull)
+  document           DesignDocument?     @relation("DesignStudioSessions", fields: [documentId], references: [id], onDelete: SetNull)
   drafts             DesignDraft[]
+  messages           StudioMessage[]
   referenceSnapshots ReferenceSnapshot[]
   tasks              DesignTask[]
 
@@ -426,6 +585,8 @@ model DesignDraft {
   baseVersion          DesignVersion        @relation("DraftBaseVersion", fields: [baseVersionId], references: [id], onDelete: Restrict)
   versions             DesignDraftVersion[]
   candidates           CandidateProposal[]
+  files                DesignDraftFile[]
+  snapshots            DesignDraftSnapshot[]
   changeSet            ChangeSet?
   changeSetMemberships ChangeSetDraft[]
 
@@ -433,6 +594,53 @@ model DesignDraft {
   @@index([baseVersionId])
   @@index([sessionId])
   @@map("design_drafts")
+}
+
+model DesignDraftFile {
+  id        String   @id @default(uuid())
+  draftId   String
+  path      String
+  target    String?
+  type      String
+  language  String
+  content   String
+  updatedAt DateTime @updatedAt
+
+  draft DesignDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@unique([draftId, path])
+  @@index([draftId])
+  @@map("design_draft_files")
+}
+
+model DesignDraftSnapshot {
+  id        String   @id @default(uuid())
+  draftId   String
+  revision  Int
+  manifest  String
+  files     String
+  createdAt DateTime @default(now())
+
+  draft DesignDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@unique([draftId, revision])
+  @@index([draftId, revision])
+  @@map("design_draft_snapshots")
+}
+
+model StudioMessage {
+  id          String   @id @default(uuid())
+  sessionId   String
+  role        String   // user | assistant | system
+  content     String
+  candidateId String?
+  status      String   @default("sent")
+  createdAt   DateTime @default(now())
+
+  session ChangeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@map("design_studio_messages")
 }
 
 model DesignDraftVersion {
@@ -587,6 +795,11 @@ model PreviewSnapshot {
   candidateId    String?
   versionId      String?
   viewport       String
+  state          String   @default("default")
+  kind           String   @default("full")
+  format         String   @default("png")
+  width          Int?
+  height         Int?
   browser        String
   fixtureVersion String
   artifactHash   String
@@ -598,6 +811,7 @@ model PreviewSnapshot {
 
   @@index([candidateId, viewport])
   @@index([versionId, viewport])
+  @@unique([versionId, viewport, state, kind])
   @@map("design_preview_snapshots")
 }
 

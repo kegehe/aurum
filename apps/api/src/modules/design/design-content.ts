@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { PSEUDO_STATES } from './design-css';
 import { getPinnedDependencies, validateDesignContent } from './design-schema';
 import type { DesignKind, DomainPatch, JsonRecord } from './design.types';
 
@@ -73,7 +74,118 @@ export function getCandidateContent(serializedPatch: string, expectedKind: Desig
   ) {
     throw new BadRequestException('候选 Patch 不符合受限领域协议');
   }
-  return validateDesignContent(operation.documentKind, operation.value);
+  const content = validateDesignContent(operation.documentKind, operation.value);
+  // 候选是历史数据时也要按当前结构约定解释：旧候选发布/渲染前归一化，
+  // 否则页面预览（已归一化）和最终发布物会不一致。
+  return operation.documentKind === 'component'
+    ? normalizeComponentStateVariants(content)
+    : content;
+}
+
+/**
+ * 把 AI 误写成同级 variant 的交互状态折回 `default.states`。
+ *
+ * 模型的常见手滑：返回 `variants: { hover: {...}, default: {...}, active: {...} }`。
+ * 这在 schema 里是合法文档，但预览/导出只给骨架挂一个 variant 类，`hover` 与
+ * `active` 会永远不生效；而 `default` 还未必是第一个键。这里只做结构归位，
+ * 不改声明值，也不处理带额外字段的变体（可能有别的语义）。
+ */
+export function normalizeComponentStateVariants(content: JsonRecord): JsonRecord {
+  if (!isRecord(content.variants)) return content;
+  const variants = content.variants;
+  const names = Object.keys(variants);
+  const stateNames = new Set<string>(PSEUDO_STATES);
+  const nextVariants: JsonRecord = { ...variants };
+  let changed = false;
+
+  // 模型会把状态写成 `{ "hover": { "declarations": {...} } }`，因为基底里的
+  // variant 就是这种形状。states 的值本身就该是声明对象，这里拆掉多余的一层。
+  for (const name of names) {
+    const variant = nextVariants[name];
+    if (!isRecord(variant) || !isRecord(variant.states)) continue;
+    const states = { ...variant.states };
+    let stateChanged = false;
+    for (const [stateName, state] of Object.entries(states)) {
+      if (!isRecord(state)) continue;
+      const keys = Object.keys(state);
+      if (keys.length === 1 && keys[0] === 'declarations' && isRecord(state.declarations)) {
+        states[stateName] = state.declarations;
+        stateChanged = true;
+      }
+    }
+    if (stateChanged) {
+      nextVariants[name] = { ...variant, states };
+      changed = true;
+    }
+  }
+
+  const baseName = names.includes('default')
+    ? 'default'
+    : names.find((name) => !stateNames.has(name) && isRecord(nextVariants[name]));
+  if (!baseName) return changed ? { ...content, variants: nextVariants } : content;
+  const base = nextVariants[baseName];
+  if (!isRecord(base)) return changed ? { ...content, variants: nextVariants } : content;
+
+  const foldable = names.filter((name) => {
+    if (name === baseName || !stateNames.has(name)) return false;
+    const sibling = nextVariants[name];
+    return (
+      isRecord(sibling) &&
+      isRecord(sibling.declarations) &&
+      Object.keys(sibling).every((key) => key === 'declarations')
+    );
+  });
+  if (foldable.length === 0) return changed ? { ...content, variants: nextVariants } : content;
+
+  const states = isRecord(base.states) ? { ...base.states } : {};
+  for (const name of foldable) {
+    const declarations = (nextVariants[name] as JsonRecord).declarations;
+    if (!isRecord(declarations)) continue;
+    const existing = isRecord(states[name]) ? states[name] : {};
+    // 已经写进 states 的优先级更高：那是模型明确表达的伪状态。
+    states[name] = { ...declarations, ...existing };
+  }
+
+  nextVariants[baseName] = { ...base, states };
+  for (const name of foldable) delete nextVariants[name];
+  return { ...content, variants: nextVariants };
+}
+
+/**
+ * AI 输出专用的宽容归位：在状态结构之外，还丢掉渲染不出东西的伪元素。
+ *
+ * 提示词鼓励模型用 `::before` 放图标，但状态/伪元素是最容易写错形状的两处。
+ * 一个没有 content 的伪元素本来就什么都不会渲染，让它否决整份组件没有意义；
+ * 其余声明照常进校验。此函数只用于 AI 生成链路，不改变用户手写内容的语义。
+ */
+export function normalizeAiComponentContent(content: JsonRecord): JsonRecord {
+  const normalized = normalizeComponentStateVariants(content);
+  if (!isRecord(normalized.variants)) return normalized;
+  const variants: JsonRecord = {};
+  let changed = false;
+  for (const [name, variant] of Object.entries(normalized.variants)) {
+    if (!isRecord(variant) || !isRecord(variant.pseudo)) {
+      variants[name] = variant;
+      continue;
+    }
+    const pseudo: JsonRecord = {};
+    for (const [element, declarations] of Object.entries(variant.pseudo)) {
+      if (
+        (element === 'before' || element === 'after') &&
+        isRecord(declarations) &&
+        typeof declarations.content === 'string' &&
+        /^(["']).*\1$/s.test(declarations.content.trim())
+      ) {
+        pseudo[element] = declarations;
+      } else {
+        changed = true;
+      }
+    }
+    const nextVariant: JsonRecord = { ...variant, pseudo };
+    if (Object.keys(pseudo).length === 0) delete nextVariant.pseudo;
+    variants[name] = nextVariant;
+  }
+  return changed ? { ...normalized, variants } : normalized;
 }
 
 // ==================== 版本与草稿前置条件 ====================

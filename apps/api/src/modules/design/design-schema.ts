@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { validateMediaDescriptor } from './design-media';
 import type { DesignKind, JsonRecord } from './design.types';
 
 const TOKEN_TYPES = new Set([
@@ -177,7 +178,18 @@ function validateComponentDocument(content: JsonRecord): JsonRecord {
   if (schemaVersion === 'aurum.component.v2') {
     validatePinnedDependencies(content, '组件文档 v2');
     validateVariantDeclarations(content.variants as JsonRecord);
+    if (content.media !== undefined) {
+      // 媒体组件用 figure + figcaption 的容器骨架；按钮/文字骨架没有放图的位置。
+      if (content.appliesTo !== 'container') {
+        throw new BadRequestException('带素材的组件必须使用 appliesTo: container');
+      }
+      validateMediaDescriptor(content.media);
+    }
     return content;
+  }
+
+  if (content.media !== undefined) {
+    throw new BadRequestException('媒体素材只支持 aurum.component.v2');
   }
 
   // v1 保持历史语义：variants 内容不做结构约束，渲染/导出退化为 JSON 文本示意

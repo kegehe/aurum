@@ -5,6 +5,8 @@ import {
   canonicalJson,
   contentHash,
   getCandidateContent,
+  normalizeAiComponentContent,
+  normalizeComponentStateVariants,
   resolveFixtureContent,
 } from './design-content';
 
@@ -128,6 +130,102 @@ describe('resolveFixtureContent', () => {
   });
 });
 
+describe('normalizeComponentStateVariants', () => {
+  it('folds hover/active sibling variants into default.states', () => {
+    const content = {
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'lime-pill-button',
+      appliesTo: 'element',
+      variants: {
+        active: { declarations: { transform: 'scale(0.97)' } },
+        default: {
+          declarations: { 'background-color': 'rgb(161, 255, 20)' },
+          states: { hover: { 'background-color': 'rgb(180, 255, 60)' } },
+        },
+        hover: { declarations: { 'background-color': 'rgb(192, 255, 20)' } },
+      },
+    };
+
+    const normalized = normalizeComponentStateVariants(content);
+    const variants = normalized.variants as Record<string, Record<string, unknown>>;
+    expect(Object.keys(variants)).toEqual(['default']);
+    // 已写进 states 的 hover 优先；active 被搬进来。
+    expect(variants.default.states).toEqual({
+      hover: { 'background-color': 'rgb(180, 255, 60)' },
+      active: { transform: 'scale(0.97)' },
+    });
+    // 原对象不被修改。
+    expect(Object.keys(content.variants)).toContain('active');
+  });
+
+  it('uses the first non-state variant when the model drops default', () => {
+    const normalized = normalizeComponentStateVariants({
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'badge',
+      variants: {
+        hover: { declarations: { opacity: '0.8' } },
+        primary: { declarations: { color: '#ffffff' } },
+      },
+    });
+    const variants = normalized.variants as Record<string, Record<string, unknown>>;
+    expect(Object.keys(variants)).toEqual(['primary']);
+    expect(variants.primary.states).toEqual({ hover: { opacity: '0.8' } });
+  });
+
+  it('leaves state-named variants alone when they carry other semantics', () => {
+    const content = {
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'badge',
+      variants: {
+        default: { declarations: { color: '#ffffff' } },
+        hover: { declarations: { opacity: '0.8' }, pseudo: { before: { content: "''" } } },
+      },
+    };
+    expect(normalizeComponentStateVariants(content)).toBe(content);
+  });
+
+  it('unwraps an extra declarations layer inside a state', () => {
+    // 基底的 variant 是 { declarations: {...} }，模型照着写成了 { hover: { declarations: {...} } }。
+    const normalized = normalizeComponentStateVariants({
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'lime-pill-button',
+      variants: {
+        default: {
+          declarations: { color: '#0f172a' },
+          states: {
+            hover: { declarations: { 'background-color': '#c0ff14' } },
+            active: { declarations: { transform: 'scale(0.97)' } },
+          },
+        },
+      },
+    });
+    const variants = normalized.variants as Record<string, Record<string, unknown>>;
+    expect(variants.default.states).toEqual({
+      hover: { 'background-color': '#c0ff14' },
+      active: { transform: 'scale(0.97)' },
+    });
+  });
+
+  it('drops AI pseudo elements that cannot render', () => {
+    const normalized = normalizeAiComponentContent({
+      schemaVersion: 'aurum.component.v2',
+      componentType: 'lime-pill-button',
+      variants: {
+        default: {
+          declarations: { color: '#0f172a' },
+          pseudo: {
+            before: { 'font-size': '14px' },
+            after: { content: "'+'" },
+            placeholder: { content: "''" },
+          },
+        },
+      },
+    });
+    const variants = normalized.variants as Record<string, Record<string, unknown>>;
+    expect(variants.default.pseudo).toEqual({ after: { content: "'+'" } });
+  });
+});
+
 describe('canonicalJson', () => {
   // contentHash 建立在它之上；键序不稳定的话，内容相同但键序不同的文档会算出不同哈希，
   // 去重与"内容未变"判断就全失效。
@@ -186,6 +284,40 @@ describe('getCandidateContent', () => {
 
   it('documentKind 与文档类型不符时拒绝', () => {
     expect(() => getCandidateContent(validPatch, 'theme')).toThrow('不符合受限领域协议');
+  });
+
+  it('把旧候选里写成同级 variant 的状态归一化', () => {
+    const legacyPatch = JSON.stringify({
+      schema: 'aurum.domain-patch.v1',
+      operations: [
+        {
+          op: 'replace_document_content',
+          documentKind: 'component',
+          value: {
+            schemaVersion: 'aurum.component.v2',
+            componentType: 'custom-component',
+            variants: {
+              active: { declarations: { transform: 'scale(0.97)' } },
+              default: { declarations: { 'background-color': '#a1ff14' } },
+              hover: { declarations: { transform: 'translateY(-1px)' } },
+            },
+            dependencies: [
+              {
+                documentId: '2e0c21c4-44f1-4e53-8daa-ff796d722049',
+                versionId: '3e0c21c4-44f1-4e53-8daa-ff796d722049',
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const content = getCandidateContent(legacyPatch, 'component');
+    const variants = content.variants as Record<string, Record<string, unknown>>;
+    expect(Object.keys(variants)).toEqual(['default']);
+    expect(variants.default.states).toEqual({
+      active: { transform: 'scale(0.97)' },
+      hover: { transform: 'translateY(-1px)' },
+    });
   });
 });
 

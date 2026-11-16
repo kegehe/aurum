@@ -23,6 +23,11 @@ export function retryJob(jobId: string): Promise<{ id: string; status: string }>
   return post(`/processing/jobs/${jobId}/retry`);
 }
 
+/** 取消待处理/处理中的任务（卡住任务的恢复入口） */
+export function cancelProcessingJob(jobId: string): Promise<{ id: string; status: string }> {
+  return post(`/processing/jobs/${jobId}/cancel`);
+}
+
 /** 删除指定已结束（terminal）的处理任务记录 */
 export function deleteProcessingJob(jobId: string): Promise<{ id: string; deleted: boolean }> {
   return del(`/processing/jobs/${jobId}`);

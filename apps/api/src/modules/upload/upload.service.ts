@@ -181,12 +181,15 @@ export class UploadService {
         };
       });
     } catch (error) {
-      // 兜底：分类在"校验"与"写入"之间被并发删除时，把 connect 的 P2025 转成可读的 400，
-      // 并清理已移入正式存储的孤儿文件。这里只用 isCategoryConnectError：
-      // 上传事务里 category 通过 connect 写入（P2025），避免把极罕见的 duplicateOf 外键
-      // P2003 误判为分类问题。
+      // 文件在事务之前就已移入正式存储，所以任何事务失败（SQLite busy、约束/外键错误
+      // 等）都会留下没有 resource_files 引用的孤儿对象，必须统一兜底回收。
+      // 内容寻址 key 可能被其它资源共用，清理前做引用检查（见 deleteStorageKeyIfUnreferenced）。
+      await this.deleteStorageKeyIfUnreferenced(storageKey);
+
+      // 分类在"校验"与"写入"之间被并发删除时，把 connect 的 P2025 转成可读的 400。
+      // 这里只用 isCategoryConnectError：上传事务里 category 通过 connect 写入（P2025），
+      // 避免把极罕见的 duplicateOf 外键 P2003 误判为分类问题。
       if (isCategoryConnectError(error)) {
-        await this.storage.delete(storageKey).catch(() => undefined);
         throw categoryDoesNotExistError(body.categoryId ?? null);
       }
       throw error;
@@ -232,6 +235,35 @@ export class UploadService {
       }
     }
     return { results };
+  }
+
+  /**
+   * 事务失败后的兜底清理。
+   *
+   * storage key 按内容哈希生成：上传的是一份已存在的重复文件时，这个 key
+   * 正被已有资源引用，无条件删除会连带清掉对方的原文件。只在没有任何
+   * 资源文件引用时才删。
+   */
+  private async deleteStorageKeyIfUnreferenced(storageKey: string): Promise<void> {
+    try {
+      const references = await this.fileRepo.findStoragePathReferences([storageKey]);
+      const resourceIds = references.get(storageKey);
+      if (resourceIds && resourceIds.size > 0) {
+        this.logger.warn(
+          `Keep uploaded file ${storageKey}: still referenced by ${resourceIds.size} resource(s)`,
+        );
+        return;
+      }
+      await this.storage.delete(storageKey);
+    } catch (cleanupError) {
+      // 清理失败不应掩盖原始错误（数据库不可用时引用检查也会失败，此时保守保留）；
+      // 残留文件可通过一致性检查列出并处理
+      this.logger.warn(
+        `Failed to clean up unreferenced upload ${storageKey}: ${
+          cleanupError instanceof Error ? cleanupError.message : cleanupError
+        }`,
+      );
+    }
   }
 
   /**

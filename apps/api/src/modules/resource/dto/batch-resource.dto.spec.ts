@@ -17,6 +17,31 @@ describe('batch resource DTOs', () => {
     expect(errors[0].constraints).toHaveProperty('arrayMinSize');
   });
 
+  // 原生表单下载只能提交 urlencoded，且 ID 必须挤在一个字段里（多字段会撞上解析器参数上限）
+  describe('urlencoded 表单提交', () => {
+    it('splits a comma joined id list into an array', async () => {
+      const dto = plainToInstance(BatchResourceIdsDto, { resourceIds: 'r1,r2,r3' });
+
+      await expect(validate(dto)).resolves.toHaveLength(0);
+      expect(dto.resourceIds).toEqual(['r1', 'r2', 'r3']);
+    });
+
+    it('accepts a single id and ignores a trailing comma', async () => {
+      const dto = plainToInstance(BatchResourceIdsDto, { resourceIds: 'r1,' });
+
+      await expect(validate(dto)).resolves.toHaveLength(0);
+      expect(dto.resourceIds).toEqual(['r1']);
+    });
+
+    it('rejects an empty joined string', async () => {
+      const dto = plainToInstance(BatchResourceIdsDto, { resourceIds: '' });
+
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].constraints).toHaveProperty('arrayMinSize');
+    });
+  });
+
   it('accepts valid favorite batch payloads', async () => {
     const dto = plainToInstance(BatchFavoriteResourcesDto, {
       resourceIds: ['r1'],

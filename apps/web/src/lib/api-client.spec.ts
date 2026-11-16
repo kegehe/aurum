@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   del,
@@ -81,11 +81,13 @@ describe('查询参数序列化', () => {
     );
   });
 
-  it('嵌套对象展开为 key.sub', async () => {
+  // 用括号形式：后端的 qs 查询解析器会还原成嵌套对象，DTO 的 @ValidateNested 才能校验。
+  // 点号形式（range.min）不会被展开，只会变成一个扁平字段被 whitelist 丢掉。
+  it('嵌套对象展开为 key[sub]', async () => {
     const fetchMock = mockFetch({ json: async () => ({}) });
     await get('/resources', { range: { min: 0, max: 100 } });
     expect(calledUrl(fetchMock)).toBe(
-      'http://localhost:3000/api/resources?range.min=0&range.max=100',
+      'http://localhost:3000/api/resources?range%5Bmin%5D=0&range%5Bmax%5D=100',
     );
   });
 
@@ -179,34 +181,151 @@ describe('design 命名空间', () => {
   });
 });
 
+/** XHR 替身：upload() 必须用 XMLHttpRequest 才能拿到上传进度、真正中断请求 */
+class FakeXhr {
+  static instances: FakeXhr[] = [];
+
+  method = '';
+  url = '';
+  headers: Record<string, string> = {};
+  body: unknown = null;
+  status = 200;
+  statusText = 'OK';
+  responseText = '';
+  aborted = false;
+
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+
+  constructor() {
+    FakeXhr.instances.push(this);
+  }
+
+  open(method: string, url: string) {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(key: string, value: string) {
+    this.headers[key] = value;
+  }
+
+  send(body: unknown) {
+    this.body = body;
+  }
+
+  abort() {
+    this.aborted = true;
+    this.onabort?.();
+  }
+
+  /** 模拟传输进度事件 */
+  emitProgress(loaded: number, total: number) {
+    this.upload.onprogress?.({ loaded, total, lengthComputable: total > 0 } as ProgressEvent);
+  }
+
+  /** 模拟响应到达 */
+  respond(status: number, responseText: string, statusText = '') {
+    this.status = status;
+    this.statusText = statusText;
+    this.responseText = responseText;
+    this.onload?.();
+  }
+}
+
 describe('multipart 上传', () => {
-  it('不设置 Content-Type，交给浏览器生成 boundary', async () => {
-    const fetchMock = mockFetch({ json: async () => ({ id: 'r1' }) });
+  beforeEach(() => {
+    FakeXhr.instances = [];
+    vi.stubGlobal('XMLHttpRequest', FakeXhr);
+  });
+
+  it('POST 到对应地址，不设置 Content-Type，交给浏览器生成 boundary', async () => {
     const form = new FormData();
     form.append('file', new Blob(['x']), 'a.txt');
 
-    await upload('/upload', form);
+    const promise = upload('/upload', form);
+    const xhr = FakeXhr.instances[0];
+    xhr.respond(200, JSON.stringify({ id: 'r1' }));
 
-    const init = calledInit(fetchMock);
-    expect(init.headers).toBeUndefined();
-    expect(init.method).toBe('POST');
-    expect(init.body).toBe(form);
-    expect(calledUrl(fetchMock)).toBe('http://localhost:3000/api/upload');
+    await expect(promise).resolves.toEqual({ id: 'r1' });
+    expect(xhr.method).toBe('POST');
+    expect(xhr.url).toBe('http://localhost:3000/api/upload');
+    expect(xhr.body).toBe(form);
+    expect(xhr.headers).toEqual({});
+  });
+
+  it('把已发送字节数透传给 onProgress，供界面算百分比与速度', async () => {
+    const onProgress = vi.fn();
+    const promise = upload('/upload', new FormData(), { onProgress });
+    const xhr = FakeXhr.instances[0];
+
+    xhr.emitProgress(256, 1024);
+    xhr.emitProgress(1024, 1024);
+    xhr.respond(200, '{}');
+    await promise;
+
+    expect(onProgress).toHaveBeenNthCalledWith(1, { loaded: 256, total: 1024 });
+    expect(onProgress).toHaveBeenNthCalledWith(2, { loaded: 1024, total: 1024 });
+  });
+
+  it('总大小不可知时 total 归零，避免算出 NaN 百分比', async () => {
+    const onProgress = vi.fn();
+    const promise = upload('/upload', new FormData(), { onProgress });
+    FakeXhr.instances[0].emitProgress(512, 0);
+    FakeXhr.instances[0].respond(200, '{}');
+    await promise;
+
+    expect(onProgress).toHaveBeenCalledWith({ loaded: 512, total: 0 });
   });
 
   it('失败时抛出 ApiError，错误标识为 UploadError', async () => {
-    mockFetch({
-      ok: false,
-      status: 413,
-      statusText: 'Payload Too Large',
-      json: async () => {
-        throw new SyntaxError('not json');
-      },
-    });
+    const promise = upload('/upload', new FormData());
+    FakeXhr.instances[0].respond(413, '<html>too large</html>', 'Payload Too Large');
 
-    await expect(upload('/upload', new FormData())).rejects.toMatchObject({
+    await expect(promise).rejects.toMatchObject({
       statusCode: 413,
       error: 'UploadError',
+      message: 'Payload Too Large',
     });
+  });
+
+  it('失败响应是后端错误体时沿用其信息', async () => {
+    const body: ApiErrorResponse = {
+      statusCode: 400,
+      message: '文件类型不支持',
+      error: 'BadRequest',
+    };
+    const promise = upload('/upload', new FormData());
+    FakeXhr.instances[0].respond(400, JSON.stringify(body));
+
+    await expect(promise).rejects.toMatchObject({
+      statusCode: 400,
+      error: 'BadRequest',
+      message: '文件类型不支持',
+    });
+  });
+
+  it('abort 信号触发后中断请求，并以 AbortError 拒绝', async () => {
+    const controller = new AbortController();
+    const promise = upload('/upload', new FormData(), { signal: controller.signal });
+    const xhr = FakeXhr.instances[0];
+
+    controller.abort();
+
+    expect(xhr.aborted).toBe(true);
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('信号已取消时不发起请求', async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(upload('/upload', new FormData(), { signal: controller.signal })).rejects.toMatchObject(
+      { name: 'AbortError' },
+    );
+    expect(FakeXhr.instances).toHaveLength(0);
   });
 });

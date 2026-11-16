@@ -1,6 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import { chromium } from '@playwright/test';
+import type { Browser } from 'playwright-core';
 import sharp from 'sharp';
 import { FileRole } from '../../common/constants/enums';
 import {
@@ -18,6 +18,7 @@ import {
   type PseudoState,
   type TokenTable,
 } from './design-css';
+import { buildMediaSkeleton, getMediaDescriptor, type ResolvedMedia } from './design-media';
 import type { DesignKind, JsonRecord } from './design.types';
 
 const VIEWPORTS: Record<string, { width: number; height: number }> = {
@@ -51,12 +52,21 @@ const ANIMATION_FRAME_COUNT = 6;
 const ANIMATION_MIN_DURATION_MS = 1;
 const ANIMATION_MAX_DURATION_MS = 10_000;
 
+// 只在真正渲染时加载浏览器，避免 API 进程启动时加载 playwright-core。
+async function launchChromium(): Promise<Browser> {
+  const { chromium } = await import('playwright-core');
+  return chromium.launch({ headless: true });
+}
+
 export interface RenderRequest {
   kind: DesignKind;
   /** 候选内容，钉住的依赖内容已注入 __aurumFixtureDependencies */
   content: JsonRecord;
   /** 基准内容，同上 */
   baseContent: JsonRecord;
+  /** 已解析成 data URI 的素材；缺失时渲染「素材不可用」占位 */
+  media?: ResolvedMedia | null;
+  baseMedia?: ResolvedMedia | null;
 }
 
 export interface RenderOutput {
@@ -79,10 +89,10 @@ export class ControlledRendererService {
   constructor(@Inject(STORAGE_SERVICE) private readonly storage: IStorageService) {}
 
   async render(request: RenderRequest, candidateId: string): Promise<RenderResult> {
-    const browser = await chromium.launch({ headless: true });
+    const browser = await launchChromium();
     try {
-      const candidateHtml = buildFixture(request.kind, request.content);
-      const baseHtml = buildFixture(request.kind, request.baseContent);
+      const candidateHtml = buildFixture(request.kind, request.content, request.media);
+      const baseHtml = buildFixture(request.kind, request.baseContent, request.baseMedia);
       const outputs: RenderOutput[] = [];
       for (const [viewport, size] of Object.entries(VIEWPORTS)) {
         const candidatePng = await this.screenshot(browser, candidateHtml, size);
@@ -117,7 +127,7 @@ export class ControlledRendererService {
   }
 
   private async screenshot(
-    browser: Awaited<ReturnType<typeof chromium.launch>>,
+    browser: Browser,
     html: string,
     viewport: { width: number; height: number },
   ) {
@@ -138,11 +148,15 @@ export class ControlledRendererService {
  * 组件 v2 与动画渲真实元素与真实关键帧；其余（v1 组件、布局、样式包、Token）
  * 走既有的示意夹具，保持向后兼容。
  */
-function buildFixture(kind: DesignKind, content: JsonRecord): string {
+function buildFixture(
+  kind: DesignKind,
+  content: JsonRecord,
+  media?: ResolvedMedia | null,
+): string {
   const tokens = collectWithFixtureDependencies(content);
   if (kind === 'animation') return buildAnimationFixture(content, tokens);
   if (kind === 'component' && content.schemaVersion === 'aurum.component.v2') {
-    return buildComponentFixture(content, tokens);
+    return buildComponentFixture(content, tokens, media);
   }
   return buildLegacyFixture(content, tokens);
 }
@@ -156,12 +170,18 @@ body{margin:0;background:#f6f7f9;color:#172033;font-family:${FIXTURE_FONT_STACK}
 .aurum-cell{display:flex;flex-direction:column;gap:6px}
 .aurum-cell-label{font:11px/1.4 monospace;color:#7a828e}
 .aurum-stage{padding:16px;border:1px dashed rgba(0,0,0,.14);border-radius:8px;background:#fff;min-width:110px;display:flex;align-items:center;justify-content:center}
+.aurum-media-stage{width:min(520px,calc(100vw - 72px));min-height:0}
 .aurum-anim-box{width:48px;height:48px;border-radius:8px;background:#1769aa}`;
 
-function buildComponentFixture(content: JsonRecord, tokens: TokenTable): string {
+function buildComponentFixture(
+  content: JsonRecord,
+  tokens: TokenTable,
+  media?: ResolvedMedia | null,
+): string {
   const componentType = String(content.componentType);
-  const appliesTo = typeof content.appliesTo === 'string' ? content.appliesTo : 'element';
   const variants = isRecord(content.variants) ? content.variants : {};
+  const isMedia = getMediaDescriptor(content) !== null;
+  const stageClass = isMedia ? 'aurum-stage aurum-media-stage' : 'aurum-stage';
   const css: string[] = [BASE_CSS];
   const rows: string[] = [];
 
@@ -220,7 +240,7 @@ function buildComponentFixture(content: JsonRecord, tokens: TokenTable): string 
         const classes = [selector.slice(1), state ? stateClassName(state as PseudoState) : '']
           .filter(Boolean)
           .join(' ');
-        return `<div class="aurum-cell"><div class="aurum-cell-label">${escapeHtml(state ?? 'default')}</div><div class="aurum-stage">${renderElement(appliesTo, classes)}</div></div>`;
+        return `<div class="aurum-cell"><div class="aurum-cell-label">${escapeHtml(state ?? 'default')}</div><div class="${stageClass}">${renderElement(content, classes, media)}</div></div>`;
       })
       .join('');
     rows.push(
@@ -286,7 +306,13 @@ ${keyframesCss}
   );
 }
 
-function renderElement(appliesTo: string, classes: string): string {
+function renderElement(
+  content: JsonRecord,
+  classes: string,
+  media?: ResolvedMedia | null,
+): string {
+  if (getMediaDescriptor(content)) return buildMediaSkeleton(content, classes, media);
+  const appliesTo = typeof content.appliesTo === 'string' ? content.appliesTo : 'element';
   const attribute = ` class="${escapeHtml(classes)}"`;
   if (appliesTo === 'container') {
     return `<div${attribute}><strong>Card title</strong><p style="margin:4px 0 0;opacity:.75">Supporting line</p></div>`;

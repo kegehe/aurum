@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useRef } from 'react';
+import { memo, useCallback, useRef } from 'react';
 import { cn } from '@/lib/utils';
 import type { ResourceListItem } from '@/lib/types';
 import { ResourceCard } from './resource-card';
@@ -121,6 +121,21 @@ function ResourceGridComponent({
   // 未拖动的普通点击在 pointerup 时切换该卡片的选择状态。
   const sweepRef = useRef<SweepState | null>(null);
 
+  // 选中回调必须保持稳定引用：卡片是 memo 的，父级每次渲染新建闭包会让整页卡片重渲染。
+  // 这里用 ref 读最新的选中集合，回调本身只依赖 onSelectionChange。
+  const selectedIdsRef = useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
+  const toggleId = useCallback(
+    (id: string) => {
+      if (!onSelectionChange) return;
+      const next = new Set(selectedIdsRef.current ?? []);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      onSelectionChange(next);
+    },
+    [onSelectionChange],
+  );
+
   const commitSweepSelection = (sweep: SweepState) => {
     // 不能直接传递并继续修改同一个 Set：React state 需要一个稳定快照。
     onSelectionChange?.(new Set(sweep.selection));
@@ -158,7 +173,8 @@ function ResourceGridComponent({
 
     // 尚未越过阈值：视为点击，仅记录
     if (!sweep.dragged) {
-      if (Math.hypot(e.clientX - sweep.startX, e.clientY - sweep.startY) < DRAG_THRESHOLD_PX) return;
+      if (Math.hypot(e.clientX - sweep.startX, e.clientY - sweep.startY) < DRAG_THRESHOLD_PX)
+        return;
       sweep.dragged = true;
       // 检查整段轨迹，避免快速移动时只切换事件终点而漏掉中间卡片。
       if (toggleCardsAlongSegment(e.currentTarget, sweep, e.clientX, e.clientY)) {
@@ -212,25 +228,10 @@ function ResourceGridComponent({
           resource={resource}
           selected={selectedIds?.has(resource.id)}
           contextQuery={contextQuery}
-          onToggle={
-            onSelectionChange
-              ? () => {
-                  const next = new Set<string>(selectedIds ?? new Set());
-                  if (next.has(resource.id)) next.delete(resource.id);
-                  else next.add(resource.id);
-                  onSelectionChange(next);
-                }
-              : undefined
-          }
+          onToggleId={onSelectionChange ? toggleId : undefined}
           onDelete={onDelete}
           onRestore={onRestore}
-          onDragStart={
-            selectMode
-              ? undefined
-              : onResourceDragStart
-                ? (event) => onResourceDragStart(resource, event)
-                : undefined
-          }
+          onDragStart={selectMode ? undefined : onResourceDragStart}
           selectMode={selectMode}
         />
       ))}

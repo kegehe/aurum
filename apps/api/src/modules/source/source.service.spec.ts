@@ -56,6 +56,42 @@ describe('SourceService', () => {
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
+    it('rejects a download folder that does not exist', async () => {
+      const { service, sourceRepo } = createService({
+        findCategoryById: vi.fn().mockResolvedValue(null),
+      });
+      sourceRepo.findBySlug.mockResolvedValue(null);
+
+      await expect(
+        service.createSource({
+          name: 'Test',
+          slug: 'test-source',
+          sourceType: SourceType.link_metadata,
+          downloadCategoryId: 'missing-folder',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(sourceRepo.create).not.toHaveBeenCalled();
+    });
+
+    it('stores the configured download folder id', async () => {
+      const { service, sourceRepo } = createService({
+        findCategoryById: vi.fn().mockResolvedValue({ id: 'folder-1' }),
+      });
+      sourceRepo.findBySlug.mockResolvedValue(null);
+      sourceRepo.create.mockResolvedValue({ id: 'new-source' });
+
+      await service.createSource({
+        name: 'Test',
+        slug: 'test-source',
+        sourceType: SourceType.civitai,
+        downloadCategoryId: 'folder-1',
+      });
+
+      expect(sourceRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ downloadCategoryId: 'folder-1' }),
+      );
+    });
+
     it('creates a source with default values', async () => {
       const { service, sourceRepo } = createService();
       sourceRepo.findBySlug.mockResolvedValue(null);
@@ -171,6 +207,31 @@ describe('SourceService', () => {
         'source-1',
         expect.objectContaining({ autoSyncIntervalHours: 6 }),
       );
+    });
+
+    it('clears downloadCategoryId when null is passed', async () => {
+      const { service, sourceRepo } = createService();
+      sourceRepo.findById.mockResolvedValue({ id: 'source-1', slug: 'same-slug' });
+      sourceRepo.update.mockResolvedValue({ id: 'source-1' });
+
+      await service.updateSource('source-1', { downloadCategoryId: null });
+
+      expect(sourceRepo.update).toHaveBeenCalledWith(
+        'source-1',
+        expect.objectContaining({ downloadCategoryId: null }),
+      );
+    });
+
+    it('rejects updating to a non-existent download folder', async () => {
+      const { service, sourceRepo } = createService({
+        findCategoryById: vi.fn().mockResolvedValue(null),
+      });
+      sourceRepo.findById.mockResolvedValue({ id: 'source-1', slug: 'same-slug' });
+
+      await expect(
+        service.updateSource('source-1', { downloadCategoryId: 'missing-folder' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(sourceRepo.update).not.toHaveBeenCalled();
     });
   });
 

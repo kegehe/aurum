@@ -3,7 +3,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { AlertTriangle, CheckCircle2, Clock, Loader2, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Trash2,
+  XCircle,
+} from 'lucide-react';
 import { JobStatus, JobType } from '@aurum/shared-types';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
@@ -19,6 +28,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
+  cancelProcessingJob,
   clearProcessingJobs,
   deleteProcessingJob,
   getProcessingStats,
@@ -53,7 +63,7 @@ const statusVariant = (status: JobStatus) =>
         ? 'warning'
         : 'secondary';
 
-export default function ProcessingTasks() {
+export default function ProcessingTasks({ active = true }: { active?: boolean }) {
   const searchParams = useSearchParams();
   const statusFromUrl = useMemo(() => {
     const value = searchParams.get('status');
@@ -68,6 +78,7 @@ export default function ProcessingTasks() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [deleteTarget, setDeleteTarget] = useState<ProcessingJobItem | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<ProcessingJobItem | null>(null);
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const fetching = useRef(false);
   const pageSize = 20;
@@ -81,6 +92,7 @@ export default function ProcessingTasks() {
       if (quiet && fetching.current) return;
       fetching.current = true;
       if (!quiet) setLoading(true);
+      let refetching = false;
       try {
         const [result, nextStats] = await Promise.all([
           listProcessingJobs({
@@ -91,15 +103,25 @@ export default function ProcessingTasks() {
           }),
           getProcessingStats(),
         ]);
-        setJobs(result.items);
+        // 清空/删除让总数变少后，当前页码可能越界：这一页会查不到任何数据，
+        // 若 total 同时归零，分页栏也会一起消失，界面就卡在一个假的空页上。
+        // 先回到最后一个有效页，由 page 变化触发的 effect 重新拉取。
         setTotal(result.total);
         setStats(nextStats);
         setError(undefined);
+        const lastPage = Math.max(1, Math.ceil(result.total / pageSize));
+        if (page > lastPage) {
+          // 保持 loading，避免在重新拉取前闪一帧刚被删掉的旧数据
+          refetching = true;
+          setPage(lastPage);
+          return;
+        }
+        setJobs(result.items);
       } catch (reason) {
         if (!quiet) setError(reason instanceof Error ? reason.message : '加载失败');
       } finally {
         fetching.current = false;
-        if (!quiet) setLoading(false);
+        if (!quiet && !refetching) setLoading(false);
       }
     },
     [jobType, page, status],
@@ -107,25 +129,38 @@ export default function ProcessingTasks() {
   useEffect(() => {
     void fetchData();
   }, [fetchData]);
-  const active = (stats?.pending ?? 0) + (stats?.processing ?? 0) > 0;
+  const hasActiveJobs = (stats?.pending ?? 0) + (stats?.processing ?? 0) > 0;
   useEffect(() => {
+    // 隐藏的 tab 不轮询：两个面板都常驻挂载后，后台白跑请求会变成持续抖动
+    if (!active) return;
     const timer = window.setInterval(
       () => {
         if (!document.hidden) void fetchData(true);
       },
-      active ? 1000 : 15000,
+      hasActiveJobs ? 1000 : 15000,
     );
     return () => window.clearInterval(timer);
+  }, [active, hasActiveJobs, fetchData]);
+
+  // 从另一个 tab 切回来时补一次静默刷新，不闪骨架
+  const prevActiveRef = useRef(active);
+  useEffect(() => {
+    const wasActive = prevActiveRef.current;
+    prevActiveRef.current = active;
+    if (active && !wasActive) void fetchData(true);
   }, [active, fetchData]);
-  const retry = async (job: ProcessingJobItem) => {
-    try {
-      await retryJob(job.id);
-      toast.success('任务已重新排队');
-      await fetchData();
-    } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : '重试失败');
-    }
-  };
+  const retry = useCallback(
+    async (job: ProcessingJobItem) => {
+      try {
+        await retryJob(job.id);
+        toast.success('任务已重新排队');
+        await fetchData();
+      } catch (reason) {
+        toast.error(reason instanceof Error ? reason.message : '重试失败');
+      }
+    },
+    [fetchData],
+  );
   const remove = async (job: ProcessingJobItem) => {
     try {
       await deleteProcessingJob(job.id);
@@ -136,6 +171,19 @@ export default function ProcessingTasks() {
       toast.error(reason instanceof Error ? reason.message : '删除任务记录失败');
     }
   };
+  const cancel = useCallback(
+    async (job: ProcessingJobItem) => {
+      try {
+        await cancelProcessingJob(job.id);
+        toast.success('任务已取消，可重新排队或删除');
+        setCancelTarget(null);
+        await fetchData();
+      } catch (reason) {
+        toast.error(reason instanceof Error ? reason.message : '取消任务失败');
+      }
+    },
+    [fetchData],
+  );
   const clear = async () => {
     try {
       const result = await clearProcessingJobs();
@@ -146,82 +194,96 @@ export default function ProcessingTasks() {
       toast.error(reason instanceof Error ? reason.message : '清空任务记录失败');
     }
   };
-  const columns: Column<ProcessingJobItem>[] = [
-    {
-      key: 'jobType',
-      header: '任务类型',
-      render: (job) => <span className="font-medium">{TYPE_LABELS[job.jobType]}</span>,
-    },
-    {
-      key: 'status',
-      header: '状态',
-      className: 'w-28',
-      render: (job) => (
-        <Badge variant={statusVariant(job.status)} className="gap-1">
-          {job.status === 'processing' && <Loader2 className="h-3 w-3 animate-spin" />}
-          {STATUS_LABELS[job.status]}
-        </Badge>
-      ),
-    },
-    {
-      key: 'retryCount',
-      header: '重试',
-      className: 'w-20 text-right',
-      render: (job) => job.retryCount,
-    },
-    {
-      key: 'resource',
-      header: '资源',
-      className: 'w-44',
-      render: (job) => (
-        <Link
-          className="font-mono text-xs text-primary hover:underline"
-          href={`/resources/${job.resourceId}`}
-        >
-          {job.resourceId.slice(0, 8)}
-        </Link>
-      ),
-    },
-    {
-      key: 'error',
-      header: '错误',
-      render: (job) => (
-        <span className="line-clamp-1 text-muted-foreground">{job.errorMessage || '-'}</span>
-      ),
-    },
-    {
-      key: 'updatedAt',
-      header: '更新时间',
-      className: 'w-44',
-      render: (job) => (
-        <span className="text-muted-foreground">{formatDateTime(job.updatedAt)}</span>
-      ),
-    },
-    {
-      key: 'actions',
-      header: '操作',
-      className: 'w-40 text-right',
-      render: (job) => (
-        <div className="flex justify-end gap-1">
-          {job.status === 'failed' || job.status === 'canceled' ? (
-            <Button variant="ghost" size="sm" title="重新排队" onClick={() => retry(job)}>
-              <RotateCcw className="h-4 w-4" />
-            </Button>
-          ) : null}
-          {job.status === 'completed' || job.status === 'failed' || job.status === 'canceled' ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              title="删除记录"
-              onClick={() => setDeleteTarget(job)}
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          ) : null}
-        </div>
-      ),
-    },
-  ];
+  // columns 必须稳定：否则 tab 切换/轮询时 DataTable 的行级 memo 全部失效
+  const columns: Column<ProcessingJobItem>[] = useMemo(
+    () => [
+      {
+        key: 'jobType',
+        header: '任务类型',
+        render: (job) => <span className="font-medium">{TYPE_LABELS[job.jobType]}</span>,
+      },
+      {
+        key: 'status',
+        header: '状态',
+        className: 'w-28',
+        render: (job) => (
+          <Badge variant={statusVariant(job.status)} className="gap-1">
+            {job.status === 'processing' && <Loader2 className="h-3 w-3 animate-spin" />}
+            {STATUS_LABELS[job.status]}
+          </Badge>
+        ),
+      },
+      {
+        key: 'retryCount',
+        header: '重试',
+        className: 'w-20 text-right',
+        render: (job) => job.retryCount,
+      },
+      {
+        key: 'resource',
+        header: '资源',
+        className: 'w-44',
+        render: (job) => (
+          <Link
+            className="font-mono text-xs text-primary hover:underline"
+            href={`/resources/${job.resourceId}`}
+          >
+            {job.resourceId.slice(0, 8)}
+          </Link>
+        ),
+      },
+      {
+        key: 'error',
+        header: '错误',
+        render: (job) => (
+          <span className="line-clamp-1 text-muted-foreground">{job.errorMessage || '-'}</span>
+        ),
+      },
+      {
+        key: 'updatedAt',
+        header: '更新时间',
+        className: 'w-44',
+        render: (job) => (
+          <span className="text-muted-foreground">{formatDateTime(job.updatedAt)}</span>
+        ),
+      },
+      {
+        key: 'actions',
+        header: '操作',
+        className: 'w-40 text-right',
+        render: (job) => (
+          <div className="flex justify-end gap-1">
+            {job.status === 'pending' || job.status === 'processing' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                title="取消任务（卡住时可从这里恢复）"
+                onClick={() => setCancelTarget(job)}
+              >
+                <XCircle className="h-4 w-4" />
+              </Button>
+            ) : null}
+            {job.status === 'failed' || job.status === 'canceled' ? (
+              <Button variant="ghost" size="sm" title="重新排队" onClick={() => retry(job)}>
+                <RotateCcw className="h-4 w-4" />
+              </Button>
+            ) : null}
+            {job.status === 'completed' || job.status === 'failed' || job.status === 'canceled' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                title="删除记录"
+                onClick={() => setDeleteTarget(job)}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            ) : null}
+          </div>
+        ),
+      },
+    ],
+    [cancel, retry],
+  );
   const cards = useMemo(
     () =>
       [
@@ -236,16 +298,16 @@ export default function ProcessingTasks() {
   return (
     <>
       <div className="mb-6 flex justify-end">
-        <Button variant="outline" size="sm" className="gap-1" onClick={() => setClearConfirmOpen(true)}>
-          <Trash2 className="h-4 w-4" />
-          清空已结束任务
-        </Button>
         <Button
           variant="outline"
           size="sm"
-          className="ml-2 gap-1"
-          onClick={() => fetchData()}
+          className="gap-1"
+          onClick={() => setClearConfirmOpen(true)}
         >
+          <Trash2 className="h-4 w-4" />
+          清空已结束任务
+        </Button>
+        <Button variant="outline" size="sm" className="ml-2 gap-1" onClick={() => fetchData()}>
           <RefreshCw className="h-4 w-4" />
           刷新
         </Button>
@@ -310,7 +372,7 @@ export default function ProcessingTasks() {
         data={jobs}
         loading={loading}
         error={error}
-        onRetry={fetchData}
+        onRetry={() => void fetchData()}
         emptyTitle="暂无处理任务"
         emptyDescription="上传文件后，处理任务将在这里显示"
         keyExtractor={(job) => job.id}
@@ -341,6 +403,19 @@ export default function ProcessingTasks() {
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={!!cancelTarget}
+        onOpenChange={(open) => {
+          if (!open) setCancelTarget(null);
+        }}
+        title="取消任务"
+        description={`确定要取消这条"${cancelTarget ? TYPE_LABELS[cancelTarget.jobType] : ''}"任务吗？任务会标记为已取消，之后可以重新排队或删除记录。`}
+        variant="destructive"
+        confirmLabel="确认取消"
+        onConfirm={() => {
+          if (cancelTarget) void cancel(cancelTarget);
+        }}
+      />
       <ConfirmDialog
         open={!!deleteTarget}
         onOpenChange={(open) => {

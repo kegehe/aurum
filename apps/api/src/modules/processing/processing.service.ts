@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
 import { ProcessingJobRepository } from './repositories/processing-job.repository';
 import { ResourceRepository } from '../resource/repositories/resource.repository';
 import { JobStatus } from '../../common/constants/enums';
@@ -11,6 +11,8 @@ import { resolveResourceProcessingStatus } from './resource-status.util';
  */
 @Injectable()
 export class ProcessingService {
+  private readonly logger = new Logger(ProcessingService.name);
+
   constructor(
     private readonly jobRepo: ProcessingJobRepository,
     private readonly resourceRepo: ResourceRepository,
@@ -101,11 +103,18 @@ export class ProcessingService {
 
   /** 根据资源全部任务重算 processingStatus（与调度器共用同一份判定） */
   private async refreshResourceStatus(resourceId: string): Promise<void> {
-    const jobs = await this.jobRepo.findByResourceId(resourceId);
-    await this.resourceRepo.updateProcessingStatus(
-      resourceId,
-      resolveResourceProcessingStatus(jobs),
-    );
+    try {
+      const jobs = await this.jobRepo.findByResourceId(resourceId);
+      await this.resourceRepo.updateProcessingStatus(
+        resourceId,
+        resolveResourceProcessingStatus(jobs),
+      );
+    } catch (err) {
+      // 状态重算失败不应让已经完成的重试/取消返回错误，与调度器的处理保持一致
+      this.logger.error(
+        `Failed to refresh processing status for resource ${resourceId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** 删除指定已结束（terminal）的任务记录；活跃任务需先取消 */
@@ -120,6 +129,8 @@ export class ProcessingService {
     if (!(await this.jobRepo.deleteTerminal(jobId))) {
       throw new BadRequestException('Job is no longer terminal');
     }
+    // 刻意不重算资源状态：删除任务记录不改变资源本身的状态（与 clearJobs 一致），
+    // 否则删掉最后一条已完成任务会把健康资源按「空任务集」算成 failed
     return { id: jobId, deleted: true };
   }
 

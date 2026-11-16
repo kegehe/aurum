@@ -10,7 +10,10 @@ export interface ResourceTypeStatsItem {
 
 export interface DashboardStats {
   resourceTotal: number;
+  /** 已登记资源文件占用（按 storagePath 去重，包含回收站中的文件） */
   totalStorageBytes: string;
+  /** 其中仅被回收站引用、清空后可释放的字节数 */
+  trashStorageBytes: string;
   processingStats: {
     pending: number;
     processing: number;
@@ -64,10 +67,10 @@ export class StatsService {
   }
 
   async getDashboardStats(): Promise<DashboardStats> {
-    const [resourceTotal, totalStorageBytes, processingStats, resourceTypes, recentFailedJobs] =
+    const [resourceTotal, storageUsage, processingStats, resourceTypes, recentFailedJobs] =
       await Promise.all([
         this.statsRepo.countResources(),
-        this.statsRepo.totalStorageBytes(),
+        this.statsRepo.storageUsage(),
         this.statsRepo.processingStats(),
         this.getResourceTypeStats(),
         this.statsRepo.recentFailedJobs(),
@@ -75,7 +78,8 @@ export class StatsService {
 
     return {
       resourceTotal,
-      totalStorageBytes: totalStorageBytes.toString(),
+      totalStorageBytes: storageUsage.totalBytes.toString(),
+      trashStorageBytes: storageUsage.trashBytes.toString(),
       processingStats: {
         pending: processingStats.pending ?? 0,
         processing: processingStats.processing ?? 0,

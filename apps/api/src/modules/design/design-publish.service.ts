@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DesignDocumentService } from './design-document.service';
+import { DesignMediaService } from './design-media.service';
 import {
   assertDependenciesPublished,
   assertDraftCurrent,
@@ -36,6 +37,7 @@ export class DesignPublishService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly documents: DesignDocumentService,
+    private readonly media: DesignMediaService,
   ) {}
 
   /**
@@ -51,7 +53,16 @@ export class DesignPublishService {
       where: { id: { in: ids } },
       include: {
         document: true,
-        candidates: { where: { status: 'selected' }, include: { validationRuns: true } },
+        candidates: {
+          where: { status: 'selected' },
+          include: {
+            validationRuns: {
+              where: { status: { in: ['succeeded', 'failed'] } },
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+            },
+          },
+        },
       },
     });
     if (drafts.length !== ids.length) throw new NotFoundException('至少一个草稿不存在');
@@ -65,7 +76,8 @@ export class DesignPublishService {
       ) {
         throw new ConflictException(`草稿 ${draft.id} 尚未准备好或基准版本已过期`);
       }
-      if (!draft.candidates[0]?.validationRuns.some((run) => run.status === 'succeeded')) {
+      // 只看最近一次校验：后续重试若门禁失败，不能被更早的成功记录掩盖
+      if (draft.candidates[0]?.validationRuns[0]?.status !== 'succeeded') {
         throw new BadRequestException(`草稿 ${draft.id} 没有已校验且被选择的候选方案`);
       }
     }
@@ -130,7 +142,19 @@ export class DesignPublishService {
             },
           },
         },
-        items: { include: { candidate: { include: { validationRuns: true } } } },
+        items: {
+          include: {
+            candidate: {
+              include: {
+                validationRuns: {
+                  where: { status: { in: ['succeeded', 'failed'] } },
+                  orderBy: { createdAt: 'desc' },
+                  take: 1,
+                },
+              },
+            },
+          },
+        },
       },
     });
     if (!changeSet) throw new NotFoundException(`ChangeSet ${changeSetId} 不存在`);
@@ -147,20 +171,29 @@ export class DesignPublishService {
         draft.status !== 'ready' ||
         draft.document.currentPublishedVersionId !== draft.baseVersionId ||
         candidate?.status !== 'selected' ||
-        !candidate.validationRuns.some((run) => run.status === 'succeeded')
+        candidate.validationRuns[0]?.status !== 'succeeded'
       ) {
         throw new ConflictException(`ChangeSet 中的草稿 ${draft.id} 已过期或未校验`);
       }
     }
+    // 发布是严格边界：素材必须仍然可读。候选校验时允许用占位渲染，但正式发布
+    // 不能把「素材不可用」的占位固化成正式版本（与 composeAndPublish 保持一致）。
+    const prepared = members.map((draft) => {
+      const item = changeSet.items.find((entry) => entry.documentId === draft.documentId)!;
+      if (!item.selectedPatch) {
+        throw new ConflictException('ChangeSet is missing its frozen candidate patch');
+      }
+      return {
+        draft,
+        candidate: item.candidate!,
+        content: getCandidateContent(item.selectedPatch, draft.document.kind as DesignKind),
+      };
+    });
+    for (const entry of prepared) await this.media.assertAvailable(entry.content);
+
     return this.prisma.$transaction(async (tx) => {
       const versions: Array<{ documentId: string; versionId: string }> = [];
-      for (const draft of members) {
-        const item = changeSet.items.find((entry) => entry.documentId === draft.documentId)!;
-        const candidate = item.candidate!;
-        if (!item.selectedPatch) {
-          throw new ConflictException('ChangeSet is missing its frozen candidate patch');
-        }
-        const content = getCandidateContent(item.selectedPatch, draft.document.kind as DesignKind);
+      for (const { draft, candidate, content } of prepared) {
         const max = await tx.designVersion.aggregate({
           where: { documentId: draft.documentId },
           _max: { versionNumber: true },
@@ -219,7 +252,16 @@ export class DesignPublishService {
       include: {
         document: true,
         baseVersion: true,
-        candidates: { where: { status: 'selected' }, include: { validationRuns: true } },
+        candidates: {
+          where: { status: 'selected' },
+          include: {
+            validationRuns: {
+              where: { status: { in: ['succeeded', 'failed'] } },
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+            },
+          },
+        },
         changeSet: { include: { drafts: true } },
         changeSetMemberships: { include: { changeSet: { include: { drafts: true } } } },
       },
@@ -236,12 +278,22 @@ export class DesignPublishService {
       throw new ConflictException('草稿已加入多文档 ChangeSet，必须通过 ChangeSet 原子发布');
     }
     const candidate = draft.candidates[0];
-    if (!candidate || !candidate.validationRuns.some((run) => run.status === 'succeeded')) {
+    if (!candidate || candidate.validationRuns[0]?.status !== 'succeeded') {
       throw new BadRequestException('没有可发布的已校验候选方案');
     }
     assertDraftCurrent(draft, draft.document);
     const content = getCandidateContent(candidate.patch, draft.document.kind as DesignKind);
     await assertDependenciesPublished(this.prisma, content, draft.documentId);
+    const encoded = canonicalJson(content);
+    const nextHash = contentHash(encoded);
+    // 创建向导会先写入 v1，再把同一份内容走一遍草稿发布。内容没变就不要再叠一版，
+    // 否则版本历史里会出现两条相同哈希，后一条说明还是「尚未经过人工审核」。
+    if (draft.baseVersion?.contentHash && draft.baseVersion.contentHash === nextHash) {
+      return this.adoptCurrentVersion(draft, candidate.id);
+    }
+    // 与 ChangeSet 发布、创建向导发布一致：素材已被删除时拒绝发布，而不是把
+    // 「素材不可用」的占位固化成正式版本。放在幂等分支之后，避免内容未变的重试被误拒。
+    await this.media.assertAvailable(content);
 
     return this.prisma.$transaction(async (tx) => {
       const versionNumber =
@@ -256,8 +308,8 @@ export class DesignPublishService {
           documentId: draft.documentId,
           versionNumber,
           baseVersionId: draft.baseVersionId,
-          content: canonicalJson(content),
-          contentHash: contentHash(canonicalJson(content)),
+          content: encoded,
+          contentHash: nextHash,
           summary: candidate.rationale || `采用候选方案 ${candidate.label}`,
           changeKind: 'update',
           publishedAt: new Date(),
@@ -289,6 +341,47 @@ export class DesignPublishService {
         });
       }
       return version;
+    });
+  }
+
+  /**
+   * 候选内容和当前正式版本一致时，只把草稿和候选标成已发布，不新建版本。
+   */
+  private async adoptCurrentVersion(
+    draft: {
+      id: string;
+      documentId: string;
+      baseVersionId: string;
+      changeSet: { id: string; drafts: Array<{ id: string }> } | null;
+    },
+    candidateId: string,
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.designDocument.updateMany({
+        where: { id: draft.documentId, currentPublishedVersionId: draft.baseVersionId },
+        data: { status: 'published' },
+      });
+      if (updated.count !== 1)
+        throw new ConflictException('正式版本已变化，草稿已过期；请基于新版本重新生成候选方案');
+      await tx.candidateProposal.update({
+        where: { id: candidateId },
+        data: { status: 'published' },
+      });
+      await tx.designDraft.update({
+        where: { id: draft.id },
+        data: { status: 'published', lockVersion: { increment: 1 } },
+      });
+      if (draft.changeSet && draft.changeSet.drafts.length <= 1) {
+        await tx.changeSet.update({
+          where: { id: draft.changeSet.id },
+          data: { status: 'published', publishTransactionId: randomUUID() },
+        });
+        await tx.changeSetItem.updateMany({
+          where: { changeSetId: draft.changeSet.id },
+          data: { status: 'published' },
+        });
+      }
+      return tx.designVersion.findUniqueOrThrow({ where: { id: draft.baseVersionId } });
     });
   }
 

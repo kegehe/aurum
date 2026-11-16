@@ -11,6 +11,9 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     include: ['src/**/*.spec.{ts,tsx}'],
+    // 组件用例要跑多轮 userEvent + 异步取数，jsdom 下实测 4~17s（并行跑时更慢），
+    // 默认 5s 会让正确的用例随机超时。
+    testTimeout: 30000,
     clearMocks: true,
     restoreMocks: true,
     // setup 放在 src/ 下：tsconfig 的 include 只覆盖 src/**，

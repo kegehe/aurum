@@ -137,6 +137,26 @@ describe('buildComponentExport', () => {
       'space.md',
     ]);
   });
+
+  it('prefers the default variant for the skeleton even when another key comes first', () => {
+    // 模型经常按 active/default/hover 的顺序返回；盲取第一个会让实时预览只挂上
+    // `.active` 的那条 transform，按钮的尺寸、底色、圆角全部丢失。
+    const exported = buildComponentExport(
+      {
+        schemaVersion: 'aurum.component.v2',
+        componentType: 'lime-pill-button',
+        appliesTo: 'element',
+        variants: {
+          active: { declarations: { transform: 'scale(0.97)' } },
+          default: { declarations: { 'background-color': 'rgb(161, 255, 20)' } },
+          hover: { declarations: { 'background-color': 'rgb(192, 255, 20)' } },
+        },
+      },
+      {},
+    );
+    expect(exported.html).toContain('class="aurum-lime-pill-button-default"');
+    expect(exported.html).not.toContain('aurum-lime-pill-button-active');
+  });
 });
 
 describe('buildAnimationExport', () => {
@@ -215,5 +235,52 @@ describe('buildBundle', () => {
     const bundle = buildBundle('style_pack', stylePack, collectWithFixtureDependencies(stylePack));
     expect(bundle.css).toContain('--color-action-primary: #1769aa;');
     expect(bundle.css).toContain('--easing-out: cubic-bezier(0.2, 0, 0, 1);');
+  });
+});
+
+describe('buildBundle media material', () => {
+  const mediaComponent = withDependencies({
+    schemaVersion: 'aurum.component.v2',
+    componentType: 'media-showcase',
+    appliesTo: 'container',
+    dependencies: [{ documentId: UUID, versionId: UUID_V }],
+    media: {
+      resourceId: '2e0c21c4-44f1-4e53-8daa-ff796d722049',
+      kind: 'image',
+      alt: '示例图片',
+      width: 800,
+      height: 600,
+    },
+    variants: { default: { declarations: { color: '{color.text.onPrimary}' } } },
+  });
+
+  it('embeds the resolved data URI in the exported HTML only', () => {
+    const bundle = buildBundle(
+      'component',
+      mediaComponent,
+      collectWithFixtureDependencies(mediaComponent),
+      {
+        dataUri: 'data:image/png;base64,AAAA',
+        mimeType: 'image/png',
+        kind: 'image',
+      },
+    );
+    expect(bundle.html).toContain('<img');
+    expect(bundle.html).toContain('src="data:image/png;base64,AAAA"');
+    expect(bundle.html).toContain('alt="示例图片"');
+    // JSON 导出保留资源引用，不把 base64 写进版本内容
+    expect(bundle.json).toBe(mediaComponent);
+    expect(JSON.stringify(bundle.json)).not.toContain('data:image');
+  });
+
+  it('renders a placeholder when the media cannot be resolved', () => {
+    const bundle = buildBundle(
+      'component',
+      mediaComponent,
+      collectWithFixtureDependencies(mediaComponent),
+      null,
+    );
+    expect(bundle.html).toContain('素材不可用');
+    expect(bundle.html).not.toContain('<img');
   });
 });

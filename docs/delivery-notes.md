@@ -28,8 +28,12 @@
   - 新增 `DELETE /design/candidates/:id`：人工候选原先只占名额、永不释放，加上没有
     删除入口，同一草稿连续 3 次失败即永久锁死。删除会一并回收预览产物。
   - **本轮补齐（面向外行的对话式创建）**：
-    - **创建向导**（`/design-library`）：选配色 → 挑现成效果或描述一句 → 在实时预览里
-      微调 → 一键发布。原来的专业界面整体移到 `/design-library/review`，两个入口互相链接。
+    - **创建向导**（`/design-library/advanced`）：选配色 → 挑现成效果或描述一句 → 在实时预览里
+      微调 → 一键发布；专业审核界面在 `/design-library/review`，三处入口互相链接。
+    - **一句话生成**（`/design-library`，`POST /design/compose/auto`）：入口只留一个输入框。
+      类别不再由用户选择——三份基底（配色 / 组件 / 动效）一起交给模型，由它判断意图、
+      决定类别并顺带给资产命名；发布仍走同一套 `compose/publish` 门禁。原向导保留在
+      `/design-library/advanced`，供需要选配色、微调与参考图的场景使用。
     - **AI 输出自修复**：模型产出被 `validateDesignContent` 拒绝时，把错误原文回喂模型
       只修该处，最多两轮；整批只在一个合规候选都没有时才判失败，任务结果里带上失败
       标签与原因。此前一处格式错误会让**整批**候选丢失。
@@ -60,12 +64,15 @@
     同样成立，已一并修掉。
 - 处理任务可拆独立 Worker 进程（`@aurum/worker` 转发 `@aurum/api` 的 worker 入口）：环境变量决定本进程是否执行处理任务 / 是否跑摄入调度，默认保持单进程全开。
 - 直连下载抽成独立连接器 `DirectDownloadConnector`（SSRF 逐跳重定向校验、限量流式落盘、SHA-256、魔数 MIME 识别、写正式存储），IngestionService 只保留任务控制与资源记录；来源同步 / 单资源镜像 / 后续批量下载与独立 Worker 共用同一份实现。
+- 来源同步的「同一条目只下载一次」由 `SourceItemLedger`（远端条目台账）保证，判重不再依赖 `ResourceLocator`：台账不建外键，资源被彻底删除、来源被删除都不影响它，所以从回收站彻底删除后再同步**不会**重复下载。`state=metadata_only` 的条目只记过元数据，不阻止后续下载；需要重新下载时清除台账（来源页「清除下载记录」，或 `DELETE /ingestion/sync-history?sourceId=...`）；按来源清理会同时重置该来源的翻页游标，否则已翻过的页不会再被翻到，清台账也不会触发重新下载。迁移会回填现存外部条目，但历史上已经彻底删除的资源没有记录可回填，仍会重下一次。
 - 出站 DNS 与失败下载重试（本轮补齐）：
   - **SSRF 校验改用 DoH 解析**（`DohResolver`，`SAFE_URL_DNS_MODE=auto|doh|system`）：配置代理时默认走 DoH（A+AAAA 并行、TTL 缓存、失败冷却后回退系统 DNS），并在同一个代理上查询。此前后端用系统 DNS 校验、由代理远端连接，本机 DNS 被污染时会把 `image.civitai.com` 解析成假地址/保留地址，校验直接判「blocked network address」；改用 DoH 后校验看到的地址与代理实际连接的目标一致。
   - **同步内瞬时重试**：网络层错误（`fetch failed`/`ECONN*`/超时/5xx 等）在本次下载内立即重试 2 次（1s、3s）；4xx、超限、策略拒绝不重试。
   - **失败后持久退避**：失败写入 `ResourceLocator.lastError`，并累计 `downloadAttempts`、按 30m→1h→2h→4h（上限 24h）写入 `nextDownloadAttemptAt`；后台扫描（默认每分钟、每轮 20 条，约等于 2s/文件的下载节流上限）只补漏「来源启用且无需人工审核」的到期条目，最多 5 次。成功后计数清零。
   - **手动兜底**：`POST /ingestion/retry-failed-downloads?sourceId=&limit=`（上限 200）批量重排失败下载；来源页每行新增「重试失败下载」按钮。手动重试不受自动补漏次数上限约束，仍逐条走来源策略门禁。
   - **失败可见**：资源列表/卡片/仪表盘显示「下载失败」（悬停给出原因）或「待下载」，详情页显示失败次数；不再一律显示「远程资源」。
+- 资源库多选「下载到本地」（`POST /resources/batch/mirror`）：逐条复用单资源镜像的策略门禁与幂等入队；前端按 100 条分片提交，服务端单请求上限 500 条。已有本地原文件、无下载地址、缺少来源配置、来源禁用/不允许镜像等原因会被跳过并在提示里按原因汇总。
+- 手动/批量镜像下载与自动同步共用同一份来源速率预算（`rateLimitPerMinute` / `downloadIntervalMs`），避免两条链路叠加后超过来源限制。手动任务拿不到速率槽时不阻塞摄入队列，而是把 `download_file` 任务释放回 pending 并按剩余间隔设置 `nextRunAt`，同时给该来源留一个短暂优先窗口，让同步等待者让出下一槽位，避免手动任务被同步的 250ms 轮询长期挤在后面；同步等待与下载执行期间都按 `staleJobTimeout/3`（上限 5s）刷新任务 `startedAt` 心跳，长等待/长下载不会被 60s 的 stale 恢复中途重置。
 - 已移除集合（collection）、标签（tag）、许可证（license）模块。
 - 已补充测试与验收文档。
 
@@ -143,8 +150,23 @@ pnpm build:web
 
 ## 复查修复（2026-11-11）
 
-- 处理任务租约心跳与卡死回收：启动与定期扫描超过心跳超时的 `processing` 任务重新排队，
-  单次执行超过上限的强制回收；退出时把仍在跑的任务放回队列。
+- 预览快照不再强制等待 `[data-part=root]`：静态产物只有 `#root` 时也能出图，
+  悬停态按实际存在的根节点回退，不再把可渲染页面判成超时。
+- 受控渲染器绑定非回环地址（如容器里的 `0.0.0.0`）且未设置
+  `DESIGN_RENDERER_KEY` 时拒绝启动；`DESIGN_RENDERER_URL` / `KEY` 已纳入 Joi 校验。
+- 设计库一键发布轮询超时不再报"保存失败"：改为提示后台仍在渲染并刷新列表；
+  重试前先拦 slug 冲突，避免文档已存在时收到 409。
+- 清空回收站第一阶段中途失败时仍会清理已删除记录的文件；本地存储改为写临时文件
+  再原子 rename，失败不会截断已有的内容寻址文件。
+- 草稿版本号改为事务内读取，并发保存/撤销不再撞 `(draftId, revision)` 唯一约束。
+- 样式档案收敛非法行高/字重/负数间距，字体名过滤会破坏 `font-family` 的字符。
+- 设计工作台保存后预览刷新失败不再误报"保存失败"；有未保存修改时离开页面会确认。
+- 资源列表筛选变化时清空旧选择；表格全选只增删当前页，保留其他页勾选。
+- 上传拖拽区可用键盘聚焦，并用 Enter/Space 打开文件选择。
+- 预览降级补齐：原文件**记录**缺失（不只是磁盘文件丢失）时也回退缩略图，
+  不再让只有缩略图的资源预览整块 404。
+- AI 用量把客户端断开（`canceled`）从失败数与成功率分母中剥离，概览/趋势/功能/
+  模型维度都单独计数，明细显示"已取消"而不是"请求失败"。
 - 处理任务释放并发槽后立刻补位，不再空等到下一次 5 秒轮询。改前实测缩略图任务
   排队 p50 1297s / p90 2944s，而执行 p50 仅 0.1s；补位后排队主要由任务本身耗时决定，
   空转窗口消失。
@@ -161,8 +183,57 @@ pnpm build:web
 - 批量资源操作与 DTO 校验。
 - 资源服务/仓储、永久删除与回收站清空顺序。
 - 上传分类校验报错。
+- 上传进度与取消：XHR 上传进度上报、abort 中断请求、取消后文件退回待上传。
 - 外部资源接入：来源策略、SSRF 防护、Civitai/GitHub/LinkMetadata 连接器、导入任务与调度。
 - 样式实验室：分析服务、Claude Vision（mock）、本地降级、CSS Tokens 导出。
+  降级粒度与退避策略：样式档案失败才整体回退本地；变体生成失败只回退变体、保留
+  AI 档案（`variationsSource` 如实标注）。档案与变体两步都会**先重试一次**——实测
+  当前网关/模型会随机返回无效输出（同一个模型、同一张图，7 次真实调用里 3 次失败：
+  2 次变体为空、1 次档案读不到图），连接/鉴权/限流类失败则不重试（只会再白等一个
+  超时）。降级缓存按失败类型区分 TTL：连接/鉴权 15 分钟、限流 2 分钟、模型输出
+  无效 1 分钟。统一 15 分钟会让用户误以为"配了 AI 却始终走本地"。「模型读不到图」
+  （`capability`）单列 15 分钟：它是配置/能力问题（换模型才能解决），与"随机吐出
+  无效 JSON"不是一回事，混在 1 分钟档里会让配错模型的用户每次分析都白打两次完整
+  视觉调用（含图片上传 + 4096 tokens）。该档仍保留一次重试——"网关本次未转发图片"
+  是瞬时的、重试往往就能恢复，而重试成功不写缓存，所以长退避只在两次都失败后生效。
+  `/style/health` 透出 `degraded` 与 `degradation.reason`，`POST /style/ai-retry`
+  供前端「立即重试 AI」。
+  另：`normalizeProfile` 会校验模型给的颜色（`primary/background/accent/scale`）是否为
+  可解析且**不透明**的颜色值（`isUsableColor`），不合格时回退到**像素派生的本地档案**
+  而非通用灰——AI 档案会流进 `local-style` 的变体模板与 `css-tokens` 导出，而那里的
+  `hexToRgb` 对非法值静默返回黑色、`scale[0]/[1]` 会被直接写成 `--color-text/--color-muted`，
+  缺这层校验时模型偶尔抽风就会渲染出全黑变体、或导出被浏览器丢弃的颜色声明。只判
+  "可解析"不够：`transparent` / `#00000000` / `rgba(0,0,0,0)` 都能解析成 `a=0`，但
+  `hexToRgb` 会丢掉 alpha 当成纯黑，于是变体模板按"黑底"算出浅色文字、CSS 又原样导出
+  全透明背景，最终文字看不见——正是这层校验要防的事。同一处还会校验其余字段的类型
+  （`normalizeText`/`normalizeOptionalText`/`normalizeNumber`/`isNumberArray`/
+  `normalizeStringArray`/`normalizeDensity`/`normalizeGrid`），按后果分两类：
+  进 CSS 的（`familyTrait` 非字符串会让 `familyTrait.toLowerCase()` 抛 TypeError、整个
+  analyze 变 500，用户付了 token 只拿到 Internal server error；`spacing.scale` 非数值会
+  导出 `--space-NaN: NaNpx`）和只进导出文本/界面的（`mood`、`layout.composition`、
+  `regions`、`balance`、`textureMood.gradient`、`keywords`、`styleGuideText` 会被直接插进
+  模板字符串，导出成 `[object Object]`）。两个特例值得单列：`spacing.density` 在 tool
+  schema 里是三档枚举，越界值按违规兜底（前端拿它查 `DENSITY_LABELS` 渲染中文标签）；
+  `layout.grid.columns` 必须查有限性——`typeof NaN === 'number'` 为真，只判 typeof 会让
+  style-lab 渲染出"NaN 栏栅格"。归一化只兜底非法值，合法值一律原样保留（有测试守着）。
+  还有一类不是类型错、而是**内容错**：模型会把说明文字写进 CSS 值字段。真实调用实测
+  `radius: '矩形 0px 硬角，圆为完美正圆，无任何中间圆角规格'`、`shadow: '无投影、无内外
+  阴影，纯平涂矢量块面'`，它们会被原样写进 `--radius` / `--shadow`，浏览器整条丢弃
+  （用 `CSS.supports('border-radius' | 'box-shadow', …)` 在 Chromium 实测均为 false），
+  导出的 token 看着成功、实际少了这两项。所以 `radius` 只接受 1–4 个 CSS 长度
+  （`normalizeRadius`）、`shadow` 只接受 `none` 或含至少一个 CSS 长度的值
+  （`normalizeShadow`），不合格回退到**像素派生的本地档案**里的值——与颜色同一原则：
+  能确定性算出来的东西不交给模型猜，也不硬编码通用值。同时给这几个字段补了 tool schema
+  description（`radius`/`shadow`/`gradient`/`suggestedFont`/`letterSpacing`），从源头引导
+  模型填 CSS 值——回退只是保底，模型照做才能拿到贴合这张图的圆角。
+  CSS 导出的 `--font-*` 层级 token 原来也不是合法 CSS，两处都修了（`css-tokens.exporter`）：
+  一是把 `letter-spacing` 塞进了 `font` 简写（`800 96px/1.5 -0.02em`），简写里 family 是
+  必填项，`CSS.supports('font', …)` 实测 false、整条声明被丢弃——实测那次真实调用 5 个
+  层级 token 全部丢失；二是没有字距时用 `normal` 占位，虽然能通过解析，但 Chromium 实测
+  `computed font-family` 就是字面量 `normal`，等于把字体重置成浏览器默认而不是继承页面
+  字体。现在简写末尾统一补 `var(--font-family)`，字距另出 `--font-<id>-letter-spacing`
+  （实测 `font: var(--font-display)` 能正确算出 800/96px/Inter）。
+  这也是本模块"颜色必须来自像素、不靠模型猜"的既有原则（见 `extractors/color-extractor`）。
 - AI 配置管理与设计运营台工作流（含受控渲染）。
 - 设计资产声明契约：属性白名单、别名解析、类型兼容、对比度门禁、导出器。
 - 反推控件：取值类别到色板/档位/滑轨/下拉的映射，以及"控件改不动结构"的边界
@@ -199,6 +270,10 @@ pnpm build:web
   自建的老主题若缺 `color.primary` 这类语义 token，成品会退化成不可换肤的固定色。
 - 创建向导暂不支持**布局**（`layout`）类资产的对话生成：布局夹具仍是旧的 JSON 文本形态，
   AI 很容易产出"看着对但结构错"的布局，而当前没有能验证它的检查。
+- 批量下载走两条路：Chromium 系用 File System Access API 边收边写盘（页内进度 + 取消，
+  需在系统保存对话框里确认位置）；Firefox/Safari 不支持该 API，退化为隐藏表单 POST 让浏览器
+  自己下载（进度与取消在浏览器下载列表里，页面读不到打包/跳过数量）。两条路都不把压缩包
+  读进 JS 内存，但能力差异来自平台，无法统一。
 
 ## 尚未自动化
 

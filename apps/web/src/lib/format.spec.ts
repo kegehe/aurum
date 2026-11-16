@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatByteString, formatDate, formatDateTime } from './format';
+import {
+  formatBytes,
+  formatByteString,
+  formatCompactNumber,
+  formatDate,
+  formatDateTime,
+  formatDurationMs,
+} from './format';
 
 describe('formatBytes', () => {
   it('0 与负数都归零', () => {
@@ -96,5 +103,31 @@ describe('formatDate / formatDateTime', () => {
   it('formatDateTime 含时分', () => {
     const result = formatDateTime('2026-09-29T10:30:00.000Z');
     expect(result).toMatch(/\d{1,2}:\d{2}/);
+  });
+});
+
+describe('formatCompactNumber', () => {
+  it('小于一千返回整数', () => {
+    expect(formatCompactNumber(0)).toBe('0');
+    expect(formatCompactNumber(999)).toBe('999');
+  });
+
+  it('万级使用紧凑单位', () => {
+    expect(formatCompactNumber(12345)).toBe('1.2万');
+  });
+
+  it('非法值归零', () => {
+    expect(formatCompactNumber(Number.NaN)).toBe('0');
+  });
+});
+
+describe('formatDurationMs', () => {
+  it('小于一秒显示毫秒', () => {
+    expect(formatDurationMs(0)).toBe('0 ms');
+    expect(formatDurationMs(500)).toBe('500 ms');
+  });
+
+  it('超过一秒保留一位小数', () => {
+    expect(formatDurationMs(1500)).toBe('1.5 s');
   });
 });

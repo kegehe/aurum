@@ -22,6 +22,6 @@ import { CategoryModule } from '../category/category.module';
   ],
   controllers: [ResourceController],
   providers: [ResourceService, ResourceRepository],
-  exports: [ResourceRepository],
+  exports: [ResourceRepository, ResourceService],
 })
 export class ResourceModule {}

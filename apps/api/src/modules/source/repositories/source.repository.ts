@@ -25,6 +25,11 @@ export class SourceRepository {
     });
   }
 
+  /** 来源下载文件夹（Category）是否存在 */
+  findCategoryById(id: string) {
+    return this.prisma.category.findUnique({ where: { id }, select: { id: true } });
+  }
+
   /** 返回所有已配置的来源下载目录（去重、舍弃空值） */
   findDownloadDirectories() {
     return this.prisma.source.findMany({
@@ -91,6 +96,7 @@ export class SourceRepository {
     config?: string;
     autoSyncIntervalHours?: number | null;
     downloadDirectory?: string | null;
+    downloadCategoryId?: string | null;
   }) {
     return this.prisma.source.create({ data });
   }
@@ -113,6 +119,7 @@ export class SourceRepository {
       config?: string | null;
       autoSyncIntervalHours?: number | null;
       downloadDirectory?: string | null;
+      downloadCategoryId?: string | null;
       lastSyncedAt?: Date | null;
       lastSyncStatus?: string | null;
       lastSyncError?: string | null;

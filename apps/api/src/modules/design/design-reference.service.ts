@@ -1,8 +1,9 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
-import { AcquisitionMode } from '../../common/constants/enums';
+import { AcquisitionMode, SourceType } from '../../common/constants/enums';
 import { SafeUrlService } from '../../common/security/safe-url.service';
+import { isUrlWithinSourceBase } from '../../common/security/source-url-policy';
 import { SourceRepository } from '../source/repositories/source.repository';
 import { PrismaService } from '../prisma/prisma.service';
 import { DesignService } from './design.service';
@@ -30,6 +31,15 @@ export class DesignReferenceService {
     if (!source.enabled || !source.baseUrl) {
       throw new BadRequestException(
         'Reference source must be enabled and have an approved base URL',
+      );
+    }
+    if (source.sourceType === SourceType.rss) {
+      // RSS 来源的 baseUrl 是 Feed 地址，不是可供审批的页面路径范围：
+      // 条目链接可能落在任意路径，甚至由第三方 feed 托管在别的域名。
+      // 设计参考需要真实的来源范围来做条款/robots 治理，因此明确拒绝，
+      // 而不是拿 Feed 地址当路径前缀（那会让所有合法链接都被误判为越界）。
+      throw new BadRequestException(
+        'RSS sources cannot be used as design reference sources: their base URL is a feed address, not an approved page scope',
       );
     }
     const modes = source.allowedModes.split(',').map((mode) => mode.trim());
@@ -82,7 +92,8 @@ export class DesignReferenceService {
     if (!source?.termsUrl) throw new BadRequestException('Reference source has no terms URL');
     const version = termsVersion.trim();
     const operator = acceptedBy.trim();
-    if (!version || !operator) throw new BadRequestException('Terms version and operator are required');
+    if (!version || !operator)
+      throw new BadRequestException('Terms version and operator are required');
     const terms = await this.loadTerms(source.termsUrl);
     return this.sourceRepository.createDesignReferenceTermsAcceptance({
       sourceId,
@@ -95,13 +106,7 @@ export class DesignReferenceService {
 
   private assertInSource(rawBaseUrl: string, target: URL) {
     const base = this.safeUrl.normalize(rawBaseUrl);
-    const normalizePath = (path: string) => path.replace(/\/+$/, '') || '/';
-    const basePath = normalizePath(base.pathname);
-    const targetPath = normalizePath(target.pathname);
-    if (
-      target.origin !== base.origin ||
-      (basePath !== '/' && targetPath !== basePath && !targetPath.startsWith(`${basePath}/`))
-    ) {
+    if (!isUrlWithinSourceBase(base, target)) {
       throw new BadRequestException('URL is outside the approved source base URL');
     }
   }

@@ -11,6 +11,7 @@ import {
   Database,
   ExternalLink,
   Globe,
+  Clock,
   RotateCcw,
 } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
@@ -66,8 +67,8 @@ export default function DashboardPage() {
               <CardContent className="flex items-center gap-4 pt-6">
                 <Skeleton className="h-12 w-12 rounded-lg" />
                 <div className="flex-1">
-                  <Skeleton className="h-6 w-12 mb-1" />
-                  <Skeleton className="h-4 w-16" />
+                  <Skeleton className="h-8 w-12 mb-1" />
+                  <Skeleton className="h-5 w-16" />
                 </div>
               </CardContent>
             </Card>
@@ -90,6 +91,9 @@ export default function DashboardPage() {
   const visibleTypeStats =
     overview?.resourceTypes.filter((item) => item.count > 0).slice(0, 6) ?? [];
   const recentFailedJobs = overview?.recentFailedJobs ?? [];
+  const trashStorageBytes = overview?.trashStorageBytes ?? '0';
+  // trashStorageBytes 是可释放量：回收站里的文件若仍被正常资源共用则为 0，此时不展示
+  const hasReclaimableTrash = trashStorageBytes !== '0';
 
   const handleRetryJob = async (jobId: string) => {
     try {
@@ -131,11 +135,31 @@ export default function DashboardPage() {
             <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-amber-100">
               <Database className="h-6 w-6 text-amber-600" />
             </div>
-            <div>
+            <div title="按已登记的资源文件去重统计，包含回收站中尚未清理的文件">
               <p className="text-2xl font-bold">
                 {formatByteString(overview?.totalStorageBytes ?? '0')}
               </p>
               <p className="text-sm text-muted-foreground">存储占用</p>
+              {hasReclaimableTrash && (
+                <p className="text-xs text-muted-foreground">
+                  其中回收站可释放 {formatByteString(trashStorageBytes)}
+                </p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="flex items-center gap-4 pt-6">
+            <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-violet-100">
+              <Clock className="h-6 w-6 text-violet-600" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold">
+                {(overview?.processingStats.pending ?? 0) +
+                  (overview?.processingStats.processing ?? 0)}
+              </p>
+              <p className="text-sm text-muted-foreground">进行中任务</p>
             </div>
           </CardContent>
         </Card>

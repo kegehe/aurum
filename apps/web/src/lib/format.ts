@@ -55,17 +55,39 @@ function safeDate(dateStr: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
+// Intl 格式化器的构造远贵于 format()：列表里每张卡片每次渲染都新建一个，
+// 一页 50 条就要多花 ~7ms。格式化器本身与数据无关，模块级复用即可。
+const dateFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+const dateTimeCompactFormatter = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+const numberFormatter = new Intl.NumberFormat('zh-CN');
+const compactNumberFormatter = new Intl.NumberFormat('zh-CN', {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+});
+
 /**
  * 格式化日期（ISO 字符串 → 中文短格式）
  */
 export function formatDate(dateStr: string): string {
   const d = safeDate(dateStr);
   if (!d) return dateStr;
-  return d.toLocaleDateString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
+  return dateFormatter.format(d);
 }
 
 /**
@@ -74,11 +96,37 @@ export function formatDate(dateStr: string): string {
 export function formatDateTime(dateStr: string): string {
   const d = safeDate(dateStr);
   if (!d) return dateStr;
-  return d.toLocaleString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return dateTimeFormatter.format(d);
+}
+
+/**
+ * 紧凑数字（999 → 999，12345 → 1.2万，1234567 → 123.5万）
+ * 用于指标卡等空间有限的位置；明细表仍用 formatNumber 展示精确值。
+ */
+export function formatCompactNumber(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  if (Math.abs(value) < 1000) return String(Math.round(value));
+  return compactNumberFormatter.format(value);
+}
+
+/** 精确整数（千分位） */
+export function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  return numberFormatter.format(value);
+}
+
+/** 毫秒 → 可读耗时（<1s 显示毫秒，否则保留一位小数的秒） */
+export function formatDurationMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0 ms';
+  // 先取整再判断单位，避免 999.6ms 显示成 "1000 ms" 而不是 "1.0 s"
+  const rounded = Math.round(ms);
+  if (rounded < 1000) return `${rounded} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+/** 短日期时间（MM-DD HH:mm），用于紧凑列表 */
+export function formatDateTimeCompact(dateStr: string): string {
+  const d = safeDate(dateStr);
+  if (!d) return dateStr;
+  return dateTimeCompactFormatter.format(d);
 }

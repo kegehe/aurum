@@ -45,6 +45,11 @@ jobs:
       - name: 模块边界
         run: pnpm depcruise
 
+      # @aurum/api 的编译依赖 @aurum/design-preview/dist（包入口指向 dist）。
+      # 全新 clone 上 dist 不存在，必须先构建共享包，否则报 TS2307。
+      - name: 构建共享预览包
+        run: pnpm build:preview
+
       # Worker 的 typecheck 依赖 @aurum/api/dist/worker，必须先构建 API。
       # 顺序不能调换，否则全新 clone 上 worker 会报 TS2307。
       - name: 构建 API
@@ -53,8 +58,10 @@ jobs:
       # controlled-renderer 的测试会真的启动 Chromium 渲染设计稿。
       # 浏览器不随 pnpm install 下载（也不在 pnpm-workspace.yaml 的 allowBuilds 里），
       # 缺了它这几个测试会以 "Executable doesn't exist" 硬失败。
+      # 运行时用的是 @aurum/api 依赖的 playwright-core，这里用同一个 CLI 安装浏览器，
+      # 不需要额外引入 @playwright/test。
       - name: 安装 Playwright 浏览器
-        run: pnpm --filter @aurum/api exec playwright install chromium
+        run: pnpm --filter @aurum/api exec playwright-core install chromium
 
       - name: 类型检查
         run: pnpm typecheck

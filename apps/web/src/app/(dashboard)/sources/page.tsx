@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
-import { FolderOpen, Plus, Power, PowerOff, RefreshCw, RotateCcw, Square } from 'lucide-react';
+import { History, Plus, Power, PowerOff, RefreshCw, RotateCcw, Square } from 'lucide-react';
 import { PageHeader } from '@/components/shared/page-header';
 import { DataTable, type Column } from '@/components/shared/data-table';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -33,14 +33,29 @@ import {
   getIngestionJob,
   cancelIngestionJob,
   listIngestionJobs,
-  listSourceDownloadDirectories,
+  clearSyncHistory,
 } from '@/lib/api/sources';
 import { retryFailedDownloads } from '@/lib/api/ingestion';
+import { listCategories } from '@/lib/api/categories';
 import { SOURCE_TYPE_LABELS } from '@/lib/constants';
 import { IngestionJobStatus, IngestionJobType } from '@aurum/shared-types';
-import type { SourceItem, IngestionJobItem } from '@/lib/types';
+import type { SourceItem, IngestionJobItem, CategoryTreeNode } from '@/lib/types';
 
 const SOURCE_TYPES = Object.entries(SOURCE_TYPE_LABELS);
+
+/** 下载目录选择器里「不归档」的哨兵值（Radix Select 不允许空字符串） */
+const NO_DOWNLOAD_FOLDER_VALUE = '__no_download_folder__';
+
+/** 把资源库的文件夹树摊平成「父 / 子」形式的选项 */
+function flattenFolderOptions(
+  nodes: CategoryTreeNode[],
+  prefix = '',
+): { id: string; label: string }[] {
+  return nodes.flatMap((node) => {
+    const label = prefix ? `${prefix} › ${node.name}` : node.name;
+    return [{ id: node.id, label }, ...flattenFolderOptions(node.children, label)];
+  });
+}
 
 /** 有后台连接器、支持 sync_source 的来源类型 */
 const SYNC_SOURCE_TYPES = new Set(['civitai', 'github', 'rss']);
@@ -117,9 +132,10 @@ export default function SourcesPage() {
   const [formLimit, setFormLimit] = useState('100');
   const [formMaxPages, setFormMaxPages] = useState('1');
   const [formAutoSyncInterval, setFormAutoSyncInterval] = useState('off');
-  const [formDownloadDirectory, setFormDownloadDirectory] = useState('');
-  // 可选的下载目录（已有来源目录 + 存储根下的自定义目录），供 datalist 建议
-  const [availableDirectories, setAvailableDirectories] = useState<string[]>([]);
+  // 下载目录 = 资源库里的文件夹（Category.id）；空串 = 不归档
+  const [formDownloadCategoryId, setFormDownloadCategoryId] = useState('');
+  // 资源库文件夹（树摊平后供下拉选择）
+  const [folderOptions, setFolderOptions] = useState<{ id: string; label: string }[]>([]);
 
   // 可同步的来源类型（有后台连接器支持 sync_source）：civitai / github / rss
   const isSyncSource = SYNC_SOURCE_TYPES.has(formSourceType);
@@ -127,7 +143,6 @@ export default function SourcesPage() {
   // 同步状态
   const [activeSyncJobs, setActiveSyncJobs] = useState<Record<string, IngestionJobItem>>({});
   const [stoppingSyncSourceIds, setStoppingSyncSourceIds] = useState<string[]>([]);
-  const [retryingFailedSourceIds, setRetryingFailedSourceIds] = useState<string[]>([]);
   // 组件卸载后停止同步轮询（避免在其它页面弹出 toast / 更新已卸载组件）
   const syncPollCancelledRef = useRef(false);
   useEffect(() => {
@@ -139,6 +154,8 @@ export default function SourcesPage() {
 
   // 删除确认
   const [deleteTarget, setDeleteTarget] = useState<SourceItem | null>(null);
+  const [resetTarget, setResetTarget] = useState<SourceItem | null>(null);
+  const [retryingFailedSourceIds, setRetryingFailedSourceIds] = useState<string[]>([]);
 
   const fetchSources = useCallback(async () => {
     setLoading(true);
@@ -173,20 +190,19 @@ export default function SourcesPage() {
     fetchSources();
   }, [fetchSources]);
 
-  // 加载可选的下载目录（编辑弹窗“选择目录”用）
-  useEffect(() => {
-    let cancelled = false;
-    listSourceDownloadDirectories()
-      .then((dirs) => {
-        if (!cancelled) setAvailableDirectories(dirs);
-      })
-      .catch(() => {
-        /* 目录建议加载失败不阻塞弹窗，仅少一组建议 */
-      });
-    return () => {
-      cancelled = true;
-    };
+  // 加载资源库文件夹（下载目录选择用）。打开弹窗前会再拉一次，避免文件夹是刚建的。
+  const loadFolderOptions = useCallback(async () => {
+    try {
+      const { items } = await listCategories();
+      setFolderOptions(flattenFolderOptions(items));
+    } catch {
+      /* 文件夹加载失败不阻塞弹窗，下拉里只剩「不归档」 */
+    }
   }, []);
+
+  useEffect(() => {
+    void loadFolderOptions();
+  }, [loadFolderOptions]);
 
   useEffect(() => {
     const activeJobs = Object.values(activeSyncJobs);
@@ -240,12 +256,13 @@ export default function SourcesPage() {
     setFormLimit('100');
     setFormMaxPages('1');
     setFormAutoSyncInterval('off');
-    setFormDownloadDirectory('');
+    setFormDownloadCategoryId('');
   };
 
   const openCreate = () => {
     setEditingSource(null);
     resetForm();
+    void loadFolderOptions();
     setDialogOpen(true);
   };
 
@@ -314,7 +331,8 @@ export default function SourcesPage() {
         ? String(source.autoSyncIntervalHours)
         : 'off',
     );
-    setFormDownloadDirectory(source.downloadDirectory ?? '');
+    setFormDownloadCategoryId(source.downloadCategoryId ?? '');
+    void loadFolderOptions();
     setDialogOpen(true);
   };
 
@@ -450,22 +468,9 @@ export default function SourcesPage() {
         ? null
         : Number.parseInt(formAutoSyncInterval, 10)
       : undefined;
-    // 下载目录：仅同步型来源可配置。规整用户输入（反斜杠转正斜杠、去首尾斜杠、去空白），
-    // 与后端 DTO 规则一致：由 / 分隔的若干段，每段为字母/数字/下划线/连字符。
-    // 同步来源：填了写目录、留空传 null 清除（回到默认存储布局）；非同步来源：不发送字段。
-    const rawDir = formDownloadDirectory
-      .trim()
-      .replace(/\\/g, '/')
-      .replace(/^\/+|\/+$/g, '');
-    const downloadDirectoryValue = !isSyncSource
-      ? undefined
-      : rawDir
-        ? rawDir
-            .split('/')
-            .map((seg) => seg.replace(/[^a-zA-Z0-9_-]/g, ''))
-            .filter(Boolean)
-            .join('/') || null
-        : null;
+    // 下载目录：仅同步型来源可配置——选资源库里的文件夹，下载的资源会自动归入该文件夹。
+    // 选中写 id、留空传 null 清除；非同步来源不发送该字段。
+    const downloadCategoryId = isSyncSource ? formDownloadCategoryId || null : undefined;
     try {
       if (editingSource) {
         // 更新：null 表示清除字段，undefined 表示不更新
@@ -478,7 +483,7 @@ export default function SourcesPage() {
           ...syncPolicy,
           config: config ?? null,
           autoSyncIntervalHours,
-          downloadDirectory: downloadDirectoryValue,
+          downloadCategoryId,
         });
         toast.success('来源已更新');
       } else {
@@ -492,9 +497,7 @@ export default function SourcesPage() {
           ...syncPolicy,
           config,
           autoSyncIntervalHours: autoSyncIntervalHours ?? undefined,
-          ...(downloadDirectoryValue !== undefined
-            ? { downloadDirectory: downloadDirectoryValue || undefined }
-            : {}),
+          ...(downloadCategoryId ? { downloadCategoryId } : {}),
         });
         toast.success('来源已创建');
       }
@@ -611,6 +614,18 @@ export default function SourcesPage() {
     }
   };
 
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      await deleteSource(deleteTarget.id);
+      toast.success(`已删除来源 "${deleteTarget.name}"`);
+      setDeleteTarget(null);
+      await fetchSources();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '删除失败');
+    }
+  };
+
   /** 批量重排该来源下载失败的远程资源（不受自动补漏次数上限限制） */
   const handleRetryFailedDownloads = async (source: SourceItem) => {
     setRetryingFailedSourceIds((ids) => [...ids, source.id]);
@@ -638,15 +653,20 @@ export default function SourcesPage() {
     }
   };
 
-  const handleDelete = async () => {
-    if (!deleteTarget) return;
+  /** 清除同步记录：删除台账后，已彻底删除的条目会在下次同步时重新下载 */
+  const handleClearSyncHistory = async () => {
+    if (!resetTarget) return;
     try {
-      await deleteSource(deleteTarget.id);
-      toast.success(`已删除来源 "${deleteTarget.name}"`);
-      setDeleteTarget(null);
-      await fetchSources();
+      const { deleted, cursorReset } = await clearSyncHistory(resetTarget.id);
+      const cursorNote = cursorReset ? '，并已重置翻页游标' : '';
+      toast.success(
+        deleted > 0
+          ? `已清除来源 "${resetTarget.name}" 的 ${deleted} 条下载记录${cursorNote}，下次同步会重新下载这些条目`
+          : `来源 "${resetTarget.name}" 没有可清除的下载记录${cursorNote}`,
+      );
+      setResetTarget(null);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : '删除失败');
+      toast.error(e instanceof Error ? e.message : '清除下载记录失败');
     }
   };
 
@@ -815,7 +835,7 @@ export default function SourcesPage() {
     {
       key: 'actions',
       header: '操作',
-      className: 'w-40 text-right',
+      className: 'w-48 text-right',
       render: (s) => (
         <div className="flex justify-end gap-1">
           {SYNC_SOURCE_TYPES.has(s.sourceType) && activeSyncJobs[s.id] ? (
@@ -859,6 +879,16 @@ export default function SourcesPage() {
               title="重试下载失败的远程资源（最多 200 条）"
             >
               <RotateCcw className="h-3.5 w-3.5" />
+            </Button>
+          )}
+          {SYNC_SOURCE_TYPES.has(s.sourceType) && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setResetTarget(s)}
+              title="清除下载记录（允许重新下载已删除的条目）"
+            >
+              <History className="h-3.5 w-3.5" />
             </Button>
           )}
           <Button variant="ghost" size="sm" onClick={() => openEdit(s)}>
@@ -1180,36 +1210,38 @@ export default function SourcesPage() {
                     </p>
                   </div>
                 </div>
-                {/* 下载目录：相对存储根目录的子目录，下拉可复选已有目录，也可手动输入新子目录 */}
+                {/* 下载目录：从资源库文件夹里选，下载的资源自动归入该文件夹 */}
                 <div className="space-y-2">
-                  <Label htmlFor="source-download-directory" className="text-xs">
+                  <Label htmlFor="source-download-folder" className="text-xs">
                     下载目录
                   </Label>
-                  <div className="relative">
-                    <FolderOpen className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      id="source-download-directory"
-                      value={formDownloadDirectory}
-                      onChange={(e) => setFormDownloadDirectory(e.target.value)}
-                      placeholder={
-                        formSourceType === 'github'
-                          ? '如 github/owner-repo'
-                          : formSourceType === 'rss'
-                            ? '如 rss/my-feed'
-                            : '如 civitai/my-images'
-                      }
-                      list="source-download-directory-options"
-                      maxLength={200}
-                      className="h-8 pl-8 text-xs"
-                    />
-                    <datalist id="source-download-directory-options">
-                      {availableDirectories.map((dir) => (
-                        <option key={dir} value={dir} />
+                  <Select
+                    value={formDownloadCategoryId || NO_DOWNLOAD_FOLDER_VALUE}
+                    onValueChange={(value) =>
+                      setFormDownloadCategoryId(value === NO_DOWNLOAD_FOLDER_VALUE ? '' : value)
+                    }
+                  >
+                    <SelectTrigger id="source-download-folder" className="h-8 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NO_DOWNLOAD_FOLDER_VALUE}>不归档（默认）</SelectItem>
+                      {folderOptions.map((folder) => (
+                        <SelectItem key={folder.id} value={folder.id}>
+                          {folder.label}
+                        </SelectItem>
                       ))}
-                    </datalist>
-                  </div>
+                      {/* 文件夹列表尚未加载完（或加载失败）时先兜住当前值，避免显示成「不归档」 */}
+                      {formDownloadCategoryId &&
+                        !folderOptions.some((folder) => folder.id === formDownloadCategoryId) && (
+                          <SelectItem value={formDownloadCategoryId}>当前文件夹</SelectItem>
+                        )}
+                    </SelectContent>
+                  </Select>
                   <p className="text-xs text-muted-foreground">
-                    下载的原文件将保存到指定子目录；留空则使用默认存储布局。
+                    {folderOptions.length === 0
+                      ? '资源库还没有文件夹，可在「资源库」页新建后再选；不选则不归档。'
+                      : '同步下载的资源会自动归入所选文件夹；选「不归档」则不归入任何文件夹。'}
                   </p>
                 </div>
               </div>
@@ -1246,6 +1278,18 @@ export default function SourcesPage() {
         variant="destructive"
         confirmLabel="删除"
         onConfirm={handleDelete}
+      />
+
+      {/* 清除下载记录确认 */}
+      <ConfirmDialog
+        open={!!resetTarget}
+        onOpenChange={(v) => {
+          if (!v) setResetTarget(null);
+        }}
+        title="清除下载记录"
+        description={`清除来源 "${resetTarget?.name}" 的远端条目台账，并重置翻页游标（否则已翻过的页不会再被抓到）。清除后这些条目在下次同步时会重新下载；未被清除的已下载条目仍会被跳过。`}
+        confirmLabel="清除"
+        onConfirm={handleClearSyncHistory}
       />
     </div>
   );

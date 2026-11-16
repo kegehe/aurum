@@ -6,17 +6,20 @@ import {
   Get,
   Headers,
   Inject,
+  NotFoundException,
   Param,
   Post,
   Query,
+  Req,
   Res,
   UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
 import { timingSafeEqual } from 'node:crypto';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { CreateCandidateDto } from './dto/create-candidate.dto';
 import {
+  ComposeAutoDto,
   ComposeGenerateDto,
   ComposePreviewDto,
   ComposePublishDto,
@@ -33,6 +36,27 @@ import {
   type IStorageService,
 } from '../storage/interfaces/storage-service.interface';
 import { DesignInternalGuard } from './design-internal.guard';
+import { DesignAssetService, type AssetExportFormat, type AssetListQuery } from './design-asset.service';
+import { CreateDesignAssetDto } from './dto/create-design-asset.dto';
+import { CreateStudioSessionDto } from './dto/create-studio-session.dto';
+import { SaveDesignAssetVersionDto } from './dto/save-design-asset-version.dto';
+import { SaveDesignTokenVersionDto } from './dto/save-design-token-version.dto';
+import { RebuildTokenDependentsDto } from './dto/rebuild-token-dependents.dto';
+import { TokenAiDto } from './dto/token-ai.dto';
+import { TokenContentDto } from './dto/token-content.dto';
+import { SaveStudioSessionDto } from './dto/save-studio-session.dto';
+import { SendStudioMessageDto } from './dto/send-studio-message.dto';
+import { DesignStudioService } from './design-studio.service';
+import {
+  PreviewCompileService,
+  type PreviewFile,
+  type PreviewManifest,
+} from './preview/preview-compiler.service';
+import {
+  PreviewSnapshotService,
+  type PreviewState,
+  type PreviewViewport,
+} from './preview/preview-snapshot.service';
 import type { ExportFormat } from './design-export';
 
 @Controller('design')
@@ -41,8 +65,331 @@ export class DesignController {
   constructor(
     private readonly designService: DesignService,
     private readonly designReferenceService: DesignReferenceService,
+    private readonly designAssetService: DesignAssetService,
+    private readonly designStudioService: DesignStudioService,
+    private readonly previewCompile: PreviewCompileService,
+    private readonly previewSnapshot: PreviewSnapshotService,
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
   ) {}
+
+  @Post('assets')
+  createAsset(@Body() dto: CreateDesignAssetDto) {
+    return this.designAssetService.create({
+      manifest: dto.manifest as unknown as PreviewManifest,
+      files: dto.files as unknown as PreviewFile[],
+      publish: dto.publish,
+      tags: dto.tags,
+    });
+  }
+
+  @Get('assets')
+  listAssets(@Query() query: AssetListQuery) {
+    return this.designAssetService.list(query);
+  }
+
+  @Post('assets/seed-sample')
+  seedSampleAsset() {
+    return this.designAssetService.seedSample();
+  }
+
+  @Get('assets/:idOrSlug')
+  getAsset(@Param('idOrSlug') idOrSlug: string) {
+    return this.designAssetService.get(idOrSlug);
+  }
+
+  @Get('assets/:idOrSlug/preview')
+  getAssetPreview(@Param('idOrSlug') idOrSlug: string) {
+    return this.designAssetService.previewAsset(idOrSlug);
+  }
+
+  @Post('assets/:idOrSlug/versions')
+  saveAssetVersion(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() dto: SaveDesignAssetVersionDto,
+  ) {
+    return this.designAssetService.saveVersion(idOrSlug, {
+      files: dto.files as unknown as PreviewFile[],
+      summary: dto.summary,
+      publish: dto.publish,
+      expectedBaseVersionId: dto.baseVersionId,
+    });
+  }
+
+  @Get('assets/:idOrSlug/dependents')
+  listAssetTokenDependents(@Param('idOrSlug') idOrSlug: string) {
+    return this.designAssetService.listTokenDependents(idOrSlug);
+  }
+
+  @Post('assets/:idOrSlug/dependents/rebuild')
+  rebuildAssetTokenDependents(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() dto: RebuildTokenDependentsDto,
+  ) {
+    return this.designAssetService.rebuildTokenDependents(
+      idOrSlug,
+      dto.documentIds,
+    );
+  }
+
+  @Post('assets/:idOrSlug/token-ai')
+  generateAssetTokenPatch(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() dto: TokenAiDto,
+  ) {
+    return this.designAssetService.generateTokenPatch(
+      idOrSlug,
+      dto.content,
+      dto.request,
+    );
+  }
+
+  @Post('assets/:idOrSlug/token-contrast')
+  checkAssetTokenContrast(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() dto: TokenContentDto,
+  ) {
+    return this.designAssetService.checkTokenContrast(idOrSlug, dto.content);
+  }
+
+  @Post('assets/:idOrSlug/token-versions')
+  saveAssetTokenVersion(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() dto: SaveDesignTokenVersionDto,
+  ) {
+    return this.designAssetService.saveTokenVersion(idOrSlug, {
+      content: dto.content,
+      summary: dto.summary,
+    });
+  }
+
+  @Get('assets/:idOrSlug/versions')
+  listAssetVersions(@Param('idOrSlug') idOrSlug: string) {
+    return this.designAssetService.listVersions(idOrSlug);
+  }
+
+  @Get('assets/:idOrSlug/versions/:versionId')
+  getAssetVersion(
+    @Param('idOrSlug') idOrSlug: string,
+    @Param('versionId') versionId: string,
+  ) {
+    return this.designAssetService.getVersion(idOrSlug, versionId);
+  }
+
+  @Get('assets/:idOrSlug/versions/:versionId/diff')
+  diffAssetVersion(
+    @Param('idOrSlug') idOrSlug: string,
+    @Param('versionId') versionId: string,
+    @Query('againstVersionId') againstVersionId?: string,
+  ) {
+    if (!againstVersionId) throw new BadRequestException('缺少 againstVersionId');
+    return this.designAssetService.diffVersions(idOrSlug, versionId, againstVersionId);
+  }
+
+  @Get('assets/:idOrSlug/cover')
+  async getAssetCover(@Param('idOrSlug') idOrSlug: string, @Res() res: Response) {
+    const png = await this.designAssetService.getCover(idOrSlug);
+    if (!png) throw new NotFoundException('该资产还没有封面快照');
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(png);
+  }
+
+  @Post('assets/:idOrSlug/snapshot')
+  captureAssetSnapshot(@Param('idOrSlug') idOrSlug: string) {
+    return this.designAssetService.captureSnapshot(idOrSlug);
+  }
+
+  @Get('assets/:idOrSlug/export')
+  exportAsset(
+    @Param('idOrSlug') idOrSlug: string,
+    @Query('format') format: AssetExportFormat = 'json',
+  ) {
+    if (!['json', 'react', 'css', 'html', 'registry', 'ai'].includes(format)) {
+      throw new BadRequestException('不支持的导出格式');
+    }
+    return this.designAssetService.exportAsset(idOrSlug, format);
+  }
+
+  @Post('assets/:id/favorite')
+  toggleAssetFavorite(@Param('id') id: string) {
+    return this.designAssetService.toggleFavorite(id);
+  }
+
+  @Delete('assets/:id')
+  archiveAsset(@Param('id') id: string) {
+    return this.designAssetService.archive(id);
+  }
+
+  @Post('studio/sessions')
+  createStudioSession(@Body() dto: CreateStudioSessionDto) {
+    return this.designStudioService.createSession(dto.assetId);
+  }
+
+  @Get('studio/sessions')
+  listStudioSessions(@Query('assetId') assetId?: string) {
+    if (!assetId) throw new BadRequestException('缺少 assetId');
+    return this.designStudioService.listSessions(assetId);
+  }
+
+  @Get('studio/sessions/:id')
+  getStudioSession(@Param('id') id: string) {
+    return this.designStudioService.getSession(id);
+  }
+
+  @Post('studio/sessions/:id/close')
+  closeStudioSession(@Param('id') id: string) {
+    return this.designStudioService.closeSession(id);
+  }
+
+  @Get('studio/sessions/:id/snapshots')
+  listStudioSnapshots(@Param('id') id: string) {
+    return this.designStudioService.listSnapshots(id);
+  }
+
+  @Post('studio/sessions/:id/snapshots/:revision/restore')
+  restoreStudioSnapshot(
+    @Param('id') id: string,
+    @Param('revision') revision: string,
+  ) {
+    return this.designStudioService.restoreSnapshot(id, Number(revision));
+  }
+
+  @Post('studio/sessions/:id/messages')
+  sendStudioMessage(@Param('id') id: string, @Body() dto: SendStudioMessageDto) {
+    return this.designStudioService.sendMessage(id, dto.content);
+  }
+
+  @Post('studio/sessions/:id/messages/stream')
+  async streamStudioMessage(
+    @Param('id') id: string,
+    @Body() dto: SendStudioMessageDto,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    req.on('close', onClose);
+    req.on('aborted', onClose);
+    res.on('close', onClose);
+    const send = (event: string, data: unknown) => {
+      if (controller.signal.aborted) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    try {
+      await this.designStudioService.streamMessage(
+        id,
+        dto.content,
+        send,
+        controller.signal,
+      );
+    } catch (error) {
+      send('error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      req.off('close', onClose);
+      req.off('aborted', onClose);
+      res.off('close', onClose);
+      res.end();
+    }
+  }
+
+  @Post('studio/sessions/:id/messages/retry/stream')
+  async retryStudioMessage(
+    @Param('id') id: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    req.on('close', onClose);
+    req.on('aborted', onClose);
+    res.on('close', onClose);
+    const send = (event: string, data: unknown) => {
+      if (controller.signal.aborted) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    try {
+      await this.designStudioService.retryMessage(id, send, controller.signal);
+    } catch (error) {
+      send('error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      req.off('close', onClose);
+      req.off('aborted', onClose);
+      res.off('close', onClose);
+      res.end();
+    }
+  }
+
+  @Post('studio/sessions/:id/discard')
+  discardStudioSession(@Param('id') id: string) {
+    return this.designStudioService.discardSession(id);
+  }
+
+  @Get('studio/sessions/:id/preview')
+  previewStudioSession(@Param('id') id: string) {
+    return this.designStudioService.previewSession(id);
+  }
+
+  @Post('studio/sessions/:id/save')
+  saveStudioSession(@Param('id') id: string, @Body() dto: SaveStudioSessionDto) {
+    return this.designStudioService.saveSession(
+      id,
+      dto.summary,
+      dto.files as unknown as PreviewFile[] | undefined,
+    );
+  }
+
+  @Post('studio/candidates/:id/apply')
+  applyStudioCandidate(@Param('id') id: string) {
+    return this.designStudioService.applyCandidate(id);
+  }
+
+  @Post('studio/candidates/:id/reject')
+  rejectStudioCandidate(@Param('id') id: string) {
+    return this.designStudioService.rejectCandidate(id);
+  }
+
+  @Post('studio/sessions/:id/undo')
+  undoStudioSession(@Param('id') id: string) {
+    return this.designStudioService.undoSession(id);
+  }
+
+  @Get('preview/sample')
+  getPreviewSample() {
+    return this.previewCompile.compileSample();
+  }
+
+  @Get('preview/sample/snapshot')
+  async getPreviewSampleSnapshot(
+    @Query('viewport') viewport: PreviewViewport = 'desktop',
+    @Query('state') state: PreviewState = 'default',
+    @Res() res: Response,
+  ) {
+    if (!['desktop', 'tablet', 'mobile'].includes(viewport)) {
+      throw new BadRequestException('viewport 必须是 desktop / tablet / mobile');
+    }
+    if (!['default', 'hover'].includes(state)) {
+      throw new BadRequestException('state 必须是 default / hover');
+    }
+    const result = await this.previewCompile.compileSample();
+    const png = await this.previewSnapshot.capture(result.html, viewport, state);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(png);
+  }
 
   @Get('documents')
   listDocuments(@Query('kind') kind?: string) {
@@ -165,6 +512,15 @@ export class DesignController {
   @Post('compose/generate')
   composeGenerate(@Body() dto: ComposeGenerateDto) {
     return this.designService.composeGenerate(dto);
+  }
+
+  /**
+   * 一句话生成：不传类别，模型自己判断是配色、组件还是动效。
+   * 与 `compose/generate` 共用任务表与修复链，产物仍在任务 result 里。
+   */
+  @Post('compose/auto')
+  composeAuto(@Body() dto: ComposeAutoDto) {
+    return this.designService.composeAuto(dto);
   }
 
   /**
@@ -292,8 +648,8 @@ export class DesignController {
   }
 
   @Get('tasks')
-  listTasks(@Query('status') status?: string) {
-    return this.designService.listTasks(status);
+  listTasks(@Query('status') status?: string, @Query('draftId') draftId?: string) {
+    return this.designService.listTasks({ status, draftId });
   }
 
   /** 单个任务。创建向导轮询生成进度用，避免拉整张任务表。 */

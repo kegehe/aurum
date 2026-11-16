@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { canonicalJson, contentHash } from './design-content';
 import { DesignDocumentService } from './design-document.service';
 import { DesignPublishService } from './design-publish.service';
 
@@ -69,6 +70,7 @@ function buildPublishHarness(draftOverrides: Record<string, unknown> = {}) {
         .fn()
         .mockResolvedValue({ id: '6e0c21c4-44f1-4e53-8daa-ff796d722049', versionNumber: 4 }),
       findFirst: vi.fn().mockResolvedValue({ id: '3e0c21c4-44f1-4e53-8daa-ff796d722049' }),
+      findUniqueOrThrow: vi.fn().mockResolvedValue({ id: BASE_VERSION_ID, versionNumber: 1 }),
     },
     designDocument: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     candidateProposal: { update: vi.fn().mockResolvedValue({}) },
@@ -89,11 +91,13 @@ function buildPublishHarness(draftOverrides: Record<string, unknown> = {}) {
     $transaction: vi.fn(async (fn: (client: unknown) => unknown) => fn(tx)),
   };
 
+  const media = { assertAvailable: vi.fn().mockResolvedValue(undefined) };
   const service = new DesignPublishService(
     prisma as never,
     new DesignDocumentService(prisma as never),
+    media as never,
   );
-  return { service, prisma, tx };
+  return { service, prisma, tx, media };
 }
 
 describe('DesignService.publishDraft', () => {
@@ -162,6 +166,38 @@ describe('DesignService.publishDraft', () => {
     await expect(service.publishDraft(DRAFT_ID)).rejects.toThrow('没有可发布的已校验候选方案');
   });
 
+  it('最近一次校验失败时拒绝发布，旧的成功记录不能兜底', async () => {
+    const { service, prisma } = buildPublishHarness({
+      candidates: [
+        {
+          id: CANDIDATE_ID,
+          label: '方案 A',
+          rationale: '',
+          patch: serializedPatch(componentContent()),
+          // 查询已按 createdAt desc + take 1；这里模拟最新一条是 failed
+          validationRuns: [{ status: 'failed' }, { status: 'succeeded' }],
+        },
+      ],
+    });
+
+    await expect(service.publishDraft(DRAFT_ID)).rejects.toThrow('没有可发布的已校验候选方案');
+    expect(prisma.designDraft.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.objectContaining({
+          candidates: expect.objectContaining({
+            include: {
+              validationRuns: {
+                where: { status: { in: ['succeeded', 'failed'] } },
+                orderBy: { createdAt: 'desc' },
+                take: 1,
+              },
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
   it('草稿基准版本已过期时拒绝发布', async () => {
     const { service } = buildPublishHarness({
       document: {
@@ -193,6 +229,14 @@ describe('DesignService.publishDraft', () => {
         status: 'published',
       },
     });
+  });
+
+  it('发布前校验素材仍可读，缺失时拒绝发布且不建版本', async () => {
+    const { service, media, tx } = buildPublishHarness();
+    media.assertAvailable.mockRejectedValue(new Error('素材不可用'));
+
+    await expect(service.publishDraft(DRAFT_ID)).rejects.toThrow('素材不可用');
+    expect(tx.designVersion.create).not.toHaveBeenCalled();
   });
 
   it('版本号取 max+1，changeKind 为 update', async () => {
@@ -241,6 +285,30 @@ describe('DesignService.publishDraft', () => {
     expect(typeof changeSetUpdate.data.publishTransactionId).toBe('string');
     expect(tx.changeSetItem.updateMany).toHaveBeenCalledWith({
       where: { changeSetId: 'cs-1' },
+      data: { status: 'published' },
+    });
+  });
+
+  it('内容与当前正式版本相同时不另建版本', async () => {
+    const encoded = canonicalJson(componentContent());
+    const { service, tx } = buildPublishHarness({
+      baseVersion: {
+        id: BASE_VERSION_ID,
+        content: encoded,
+        contentHash: contentHash(encoded),
+      },
+    });
+
+    const version = await service.publishDraft(DRAFT_ID);
+
+    expect(tx.designVersion.create).not.toHaveBeenCalled();
+    expect(version).toEqual({ id: BASE_VERSION_ID, versionNumber: 1 });
+    expect(tx.designDocument.updateMany).toHaveBeenCalledWith({
+      where: { id: DOCUMENT_ID, currentPublishedVersionId: BASE_VERSION_ID },
+      data: { status: 'published' },
+    });
+    expect(tx.candidateProposal.update).toHaveBeenCalledWith({
+      where: { id: CANDIDATE_ID },
       data: { status: 'published' },
     });
   });
@@ -297,6 +365,7 @@ describe('DesignService.restoreVersion', () => {
     const service = new DesignPublishService(
       prisma as never,
       new DesignDocumentService(prisma as never),
+      { assertAvailable: vi.fn().mockResolvedValue(undefined) } as never,
     );
     return { service, prisma, tx };
   }
@@ -424,6 +493,7 @@ describe('DesignPublishService.createChangeSet', () => {
     const service = new DesignPublishService(
       prisma as never,
       new DesignDocumentService(prisma as never),
+      { assertAvailable: vi.fn().mockResolvedValue(undefined) } as never,
     );
     return { service, prisma, tx };
   }
@@ -570,11 +640,13 @@ describe('DesignPublishService.publishChangeSet', () => {
       },
       $transaction: vi.fn(async (fn: (client: unknown) => unknown) => fn(tx)),
     };
+    const media = { assertAvailable: vi.fn().mockResolvedValue(undefined) };
     const service = new DesignPublishService(
       prisma as never,
       new DesignDocumentService(prisma as never),
+      media as never,
     );
-    return { service, prisma, tx };
+    return { service, prisma, tx, media };
   }
 
   const twoMembers = () => [
@@ -632,6 +704,14 @@ describe('DesignPublishService.publishChangeSet', () => {
       .mockResolvedValueOnce({ count: 0 });
 
     await expect(service.publishChangeSet('cs-1')).rejects.toThrow('已整体取消');
+  });
+
+  it('发布前校验每个成员的素材，缺失时整体拒绝且不建版本', async () => {
+    const { service, media, tx } = build(twoMembers());
+    media.assertAvailable.mockRejectedValueOnce(new Error('素材不可用'));
+
+    await expect(service.publishChangeSet('cs-1')).rejects.toThrow('素材不可用');
+    expect(tx.designVersion.create).not.toHaveBeenCalled();
   });
 
   it('成功发布：为每个文档建版本、认领指针、写发布事务号', async () => {

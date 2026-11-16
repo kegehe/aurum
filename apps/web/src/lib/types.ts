@@ -40,8 +40,10 @@ export interface ResourceListItem {
   width: number | null;
   height: number | null;
   durationSeconds: string | null;
-  /** Remote preview image/video URL for resources without a local thumbnail. */
+  /** 来源单独提供的远端缩略图（preview 定位器）；没有时前端可回退 downloadUrl */
   previewUrl?: string | null;
+  /** 远端媒体真实地址（下载定位器）；视频卡片用它播放，避免把预览缩略图当成视频源 */
+  downloadUrl?: string | null;
   /** 远程资源最近一次下载失败的原因；null 表示没有失败记录 */
   downloadError?: string | null;
   /** 该下载地址累计失败次数（成功后归零） */
@@ -111,6 +113,31 @@ export interface UpdateResourceData {
   categoryId?: string | null;
   source?: string | null;
   author?: string | null;
+}
+
+/** 回收站统计：资源数 / 可回收文件数 / 可释放字节（按磁盘文件去重，大整数以字符串传输） */
+export interface TrashStats {
+  resourceCount: number;
+  fileCount: number;
+  totalSizeBytes: string;
+}
+
+/** 清空回收站的实时进度 */
+export interface EmptyTrashProgress {
+  totalResources: number;
+  totalFiles: number;
+  processedResources: number;
+  processedFiles: number;
+  deletedResources: number;
+  deletedFiles: number;
+  skippedResources: number;
+}
+
+/** 清空回收站的最终结果 */
+export interface EmptyTrashResult {
+  deletedResources: number;
+  deletedFiles: number;
+  skippedResources: number;
 }
 
 export interface SearchResourcesParams {
@@ -266,7 +293,10 @@ export interface ResourceTypeStatsItem {
 
 export interface DashboardOverview {
   resourceTotal: number;
+  /** 已登记资源文件占用（按 storagePath 去重，包含回收站中的文件） */
   totalStorageBytes: string;
+  /** 其中仅被回收站引用、清空后可释放的字节数 */
+  trashStorageBytes: string;
   processingStats: ProcessingJobStats;
   resourceTypes: ResourceTypeStatsItem[];
   recentFailedJobs: Array<
@@ -278,6 +308,82 @@ export interface DashboardOverview {
       };
     }
   >;
+}
+
+// ==================== AI 用量 ====================
+
+export interface AiUsageTotals {
+  requests: number;
+  success: number;
+  failed: number;
+  canceled: number;
+  successRate: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  avgLatencyMs: number;
+}
+
+export interface AiUsageSeriesPoint {
+  /** 本地日期 YYYY-MM-DD */
+  date: string;
+  requests: number;
+  failed: number;
+  canceled: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+}
+
+export interface AiUsageFeatureItem {
+  feature: string;
+  requests: number;
+  failed: number;
+  canceled: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  avgLatencyMs: number;
+}
+
+export interface AiUsageModelItem {
+  model: string;
+  requests: number;
+  failed: number;
+  canceled: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface AiUsageLogItem {
+  id: string;
+  provider: string;
+  providerId: string | null;
+  providerName: string | null;
+  model: string;
+  feature: string;
+  status: string;
+  errorKind: string | null;
+  errorMessage: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  latencyMs: number;
+  createdAt: string;
+}
+
+export interface AiUsageOverview {
+  range: { days: number; from: string; to: string };
+  totals: AiUsageTotals;
+  series: AiUsageSeriesPoint[];
+  features: AiUsageFeatureItem[];
+  models: AiUsageModelItem[];
+  recent: AiUsageLogItem[];
 }
 
 // ==================== 来源 ====================
@@ -299,6 +405,8 @@ export interface SourceItem {
   config: string | null;
   autoSyncIntervalHours: number | null;
   downloadDirectory: string | null;
+  /** 同步下载的资源默认归入的资源库文件夹（Category.id）；null = 不归档 */
+  downloadCategoryId: string | null;
   lastSyncedAt: string | null;
   lastSyncStatus: string | null;
   lastSyncError: string | null;
@@ -324,6 +432,7 @@ export interface CreateSourceData {
   config?: string;
   autoSyncIntervalHours?: number | null;
   downloadDirectory?: string;
+  downloadCategoryId?: string;
 }
 
 export interface UpdateSourceData {
@@ -342,6 +451,7 @@ export interface UpdateSourceData {
   config?: string | null;
   autoSyncIntervalHours?: number | null;
   downloadDirectory?: string | null;
+  downloadCategoryId?: string | null;
 }
 
 // ==================== 样式实验室 ====================
@@ -427,8 +537,13 @@ export interface StyleExports {
 }
 
 export interface StyleAnalyzeResult {
-  /** 分析来源：ai = 视觉 AI；local = 本地确定性分析（AI 未配置/失败时自动降级） */
+  /** 样式档案来源 */
   source: 'ai' | 'local';
+  /**
+   * 布局变体来源。变体生成失败时保留 AI 档案、仅变体回退本地模板，
+   * 此字段与 source 不同即表示「档案是 AI、变体是本地」。
+   */
+  variationsSource: 'ai' | 'local';
   image: { width: number; height: number; format: string };
   detectedColors: string[];
   profile: StyleProfile;
@@ -442,6 +557,23 @@ export interface StyleHealth {
   /** 当前分析来源：ai / local */
   source: 'ai' | 'local';
   model: string;
+  /** AI 已配置，但因近期调用失败被临时降级 —— 与「未配置 AI」是两回事 */
+  degraded: boolean;
+  /** 降级详情；未降级时为 null */
+  degradation: {
+    /**
+     * 后端定义的失败分类（apps/api/src/modules/style/types.ts 的 `AiFailureKind`）。
+     *
+     * 这里刻意**不镜像**那份联合类型：前端不据此分支，只展示 reason 与 retryAfterMs，
+     * 镜像一份只会随后端新增档位静默漂移 —— CI 的 `check:enums` 只覆盖
+     * `common/constants/enums.ts`，管不到 style 模块的类型。
+     */
+    kind: string;
+    /** 面向用户的可读原因 */
+    reason: string;
+    /** 距自动重试的剩余毫秒数 */
+    retryAfterMs: number;
+  } | null;
 }
 
 // ==================== AI 配置（设置 → AI 配置） ====================
@@ -508,4 +640,21 @@ export interface TestAiProviderData {
   apiKey: string;
   model?: string;
   name?: string;
+}
+
+// ==================== 存储一致性 ====================
+
+/** 数据库与文件存储一致性检查报告（只读，不包含清理动作） */
+export interface StorageConsistencyReport {
+  checkedAt: string;
+  databaseFileCount: number;
+  storageFileCount: number;
+  missingStorageFiles: string[];
+  orphanStorageFiles: string[];
+  expiredTempFiles: string[];
+  summary: {
+    missingStorageFiles: number;
+    orphanStorageFiles: number;
+    expiredTempFiles: number;
+  };
 }

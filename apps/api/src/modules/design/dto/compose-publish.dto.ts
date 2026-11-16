@@ -68,6 +68,36 @@ export class ComposeRecipeDto {
   themeDocumentId?: string;
 }
 
+/**
+ * 一句话生成：只有意图。类别与配色由服务端与模型决定，调用方不需要知道
+ * "theme / component / animation"这套分类。
+ */
+export class ComposeAutoDto {
+  @IsString()
+  @MinLength(2)
+  @MaxLength(2_000)
+  intent!: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(3)
+  count?: number;
+
+  /** 图片/URL 参考档案（不可信数据，只作视觉意图） */
+  @IsOptional()
+  @IsObject()
+  reference?: Record<string, unknown>;
+
+  /**
+   * 资源库素材：只传资源 ID，kind/alt/fit 全由服务端从资源记录生成。
+   * 有素材时一句话生成固定走 component。
+   */
+  @IsOptional()
+  @IsUUID()
+  mediaResourceId?: string;
+}
+
 export class ComposeGenerateDto {
   @IsIn(DESIGN_KINDS)
   kind!: DesignKind;

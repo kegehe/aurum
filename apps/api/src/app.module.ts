@@ -10,17 +10,15 @@ import { ResourceModule } from './modules/resource/resource.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { FileModule } from './modules/file/file.module';
 import { ProcessingModule } from './modules/processing/processing.module';
-import { MetadataModule } from './modules/metadata/metadata.module';
-import { PreviewModule } from './modules/preview/preview.module';
 import { SearchModule } from './modules/search/search.module';
 import { CategoryModule } from './modules/category/category.module';
-import { TrashModule } from './modules/trash/trash.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { ConsistencyModule } from './modules/consistency/consistency.module';
 import { SourceModule } from './modules/source/source.module';
 import { IngestionModule } from './modules/ingestion/ingestion.module';
 import { StyleModule } from './modules/style/style.module';
 import { AiSettingsModule } from './modules/ai-settings/ai-settings.module';
+import { AiUsageModule } from './modules/ai-usage/ai-usage.module';
 import { DesignModule } from './modules/design/design.module';
 
 @Module({
@@ -39,17 +37,15 @@ import { DesignModule } from './modules/design/design.module';
     StorageModule,
     FileModule,
     ProcessingModule,
-    MetadataModule,
-    PreviewModule,
     SearchModule,
     CategoryModule,
-    TrashModule,
     StatsModule,
     ConsistencyModule,
     SourceModule,
     IngestionModule,
     StyleModule,
     AiSettingsModule,
+    AiUsageModule,
     DesignModule,
     // Resource/Upload 模块的 controller/service 在后续步骤填充，
     // 注册顺序：Resource 依赖 Storage/File/Processing/Category

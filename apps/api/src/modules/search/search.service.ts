@@ -123,10 +123,13 @@ export class SearchService {
   buildOrderBy(
     sortBy?: ResourceSortField,
     sortOrder?: SortOrder,
-  ): Prisma.ResourceOrderByWithRelationInput {
+  ): Prisma.ResourceOrderByWithRelationInput[] {
     const field = sortBy ?? ResourceSortField.createdAt;
     const order = sortOrder ?? SortOrder.desc;
-    return { [field]: order };
+    // id 作为第二排序键：
+    // - 并列值（批量导入常见同一 createdAt）时顺序确定，skip/take 翻页不会重复或漏行
+    // - 与详情页相邻导航的 (字段, id asc) 全序保持一致，箭头顺序和列表完全对齐
+    return [{ [field]: order }, { id: 'asc' }];
   }
 
   /**

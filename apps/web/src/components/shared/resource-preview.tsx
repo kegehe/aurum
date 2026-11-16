@@ -241,7 +241,10 @@ export function ResourcePreview({
   const isRemote = isRemoteResource(resource);
   const hasLocal = hasLocalThumbnail(resource);
   const localThumbSrc = hasLocal ? getResourceThumbnailUrl(resource.id) : null;
-  const remotePreview = resource.previewUrl ?? null;
+  // 空串按缺失处理，避免 <img src=""> 反而去请求当前页面
+  const remotePreview = resource.previewUrl || null;
+  // 真实远端媒体地址（下载定位器）。视频卡片必须用它播放：previewUrl 可能是缩略图。
+  const remoteMedia = resource.downloadUrl || remotePreview;
   const mimeType = resource.mimeType ?? '';
 
   useEffect(() => {
@@ -260,7 +263,7 @@ export function ResourcePreview({
     setThumbFailed(false);
     setThumbRetrying(false);
     setThumbAttempt(0);
-  }, [resource.id, localThumbSrc, remotePreview, resource.processingStatus]);
+  }, [resource.id, localThumbSrc, remotePreview, remoteMedia, resource.processingStatus]);
 
   // 稳定引用：AnimatedImage 用它标记首帧就绪，闭包每次新建会让 effect 白跑一遍
   const handleFirstFrame = useCallback(() => setThumbLoaded(true), []);
@@ -343,17 +346,26 @@ export function ResourcePreview({
     isAnimatedImage && !originalFailed
       ? hasLocal
         ? getResourcePreviewUrl(resource.id)
-        : remotePreview
+        : remoteMedia
       : null;
 
-  // 缩略图地址：动图取原文件，其余本地缩略图优先，其次是图片资源的远端预览
+  // 远端缩略图：来源单独提供的缩略图对视频/音频等任意类型都适用；
+  // 图片/动图没有独立缩略图时，媒体本身就可以当预览。
+  const remoteThumb =
+    remotePreview ??
+    (resource.resourceType === 'image' || isImageMime || isAnimatedImage ? remoteMedia : null);
+
+  // 缩略图地址：动图取原文件，其余本地缩略图优先，其次才是远端缩略图。
+  // 本地缩略图仍只给视觉类资源（图片/视频/动图）；来源单独提供的远端缩略图
+  // 对音频等类型也可作为封面展示。
+  const canShowThumb =
+    isVideo ||
+    resource.resourceType === 'image' ||
+    isImageMime ||
+    isAnimatedImage ||
+    remotePreview !== null;
   const thumbSrc: string | null = withThumbAttempt(
-    animatedSrc ??
-      (isVideo
-        ? localThumbSrc
-        : resource.resourceType === 'image' || isImageMime || isAnimatedImage
-          ? (localThumbSrc ?? remotePreview)
-          : null),
+    animatedSrc ?? (canShowThumb ? (localThumbSrc ?? remoteThumb) : null),
     localThumbSrc,
     thumbAttempt,
   );
@@ -370,8 +382,8 @@ export function ResourcePreview({
     isVideo && !videoError
       ? hasLocal
         ? getResourcePreviewUrl(resource.id)
-        : remotePreview && mimeType.startsWith('video/')
-          ? remotePreview
+        : remoteMedia && mimeType.startsWith('video/')
+          ? remoteMedia
           : null
       : null;
   const isPlaying = videoSrc !== null && inView;
@@ -379,7 +391,7 @@ export function ResourcePreview({
   if (variant === 'compact') {
     // 表格行：只给静态缩略图，一页 100 行不能每行都去解码视频/动图
     const compactSrc = withThumbAttempt(
-      localThumbSrc ?? (isImageMime || isAnimatedImage ? remotePreview : null),
+      localThumbSrc ?? remotePreview ?? (isImageMime || isAnimatedImage ? remoteMedia : null),
       localThumbSrc,
       thumbAttempt,
     );
@@ -466,8 +478,13 @@ export function ResourcePreview({
           referrerPolicy={isRemote ? 'no-referrer' : undefined}
           draggable={selectMode ? false : undefined}
           onReady={handleFirstFrame}
-          // 有静态缩略图就退回它，没有（远端动图）就直接标记缩略图失败，别在同一张破图上打转
-          onError={() => (localThumbSrc ? setOriginalFailed(true) : setThumbFailed(true))}
+          // 有静态缩略图（本地或来源单独提供的远端缩略图）就退回它；
+          // 没有（远端动图本身就是唯一可展示的图）就直接标记缩略图失败，别在同一张破图上打转
+          onError={() =>
+            localThumbSrc || (remoteThumb && remoteThumb !== animatedSrc)
+              ? setOriginalFailed(true)
+              : setThumbFailed(true)
+          }
         />
       ) : showThumbImage && thumbSrc ? (
         <img

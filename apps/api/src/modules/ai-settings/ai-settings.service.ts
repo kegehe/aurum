@@ -6,8 +6,8 @@
  * - 配置 CRUD、设为生效、连通性测试
  * - 提供给 ClaudeVisionClient 构建 Anthropic 客户端
  *
- * 生效配置缓存在内存中，任何 CRUD/激活/停用/删除操作后调用 refresh() 立即生效，
- * 无需重启 API。
+ * 生效配置缓存在内存中，任何 CRUD/激活/停用/删除操作后调用 refresh() 立即生效；
+ * 另外定时轮询数据库，让 worker 等独立进程也能感知配置切换，无需重启。
  */
 import {
   BadRequestException,
@@ -17,6 +17,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Interval } from '@nestjs/schedule';
 import Anthropic from '@anthropic-ai/sdk';
 import { AiProviderRepository } from './repositories/ai-provider.repository';
 import { CreateAiProviderDto } from './dto/create-ai-provider.dto';
@@ -32,11 +33,16 @@ import {
   normalizeBaseUrl,
 } from './ai-provider.types';
 
+/** API 与 worker 各自持有本服务实例，需要轮询才能同步配置变更 */
+const AI_SETTINGS_REFRESH_INTERVAL_MS = 5_000;
+
 @Injectable()
 export class AiSettingsService implements OnModuleInit {
   private readonly logger = new Logger(AiSettingsService.name);
   private active: ResolvedAiProvider | null = null;
   private activeId: string | null = null;
+  private refreshSeq = 0;
+  private lastPollError: string | null = null;
 
   constructor(
     private readonly repo: AiProviderRepository,
@@ -60,9 +66,14 @@ export class AiSettingsService implements OnModuleInit {
    * 任何配置变更后调用，使新配置立即生效。
    */
   async refresh(): Promise<void> {
+    // 轮询与 CRUD 触发的刷新可能并发；只让最新一次刷新落地，
+    // 避免旧快照在晚到时覆盖刚保存的配置。
+    const seq = ++this.refreshSeq;
     const row = await this.repo.findActive();
+    if (seq !== this.refreshSeq) return;
     if (row && row.enabled) {
       this.active = {
+        id: row.id,
         provider: row.provider,
         apiKey: row.apiKey,
         baseUrl: row.baseUrl ?? undefined,
@@ -77,6 +88,7 @@ export class AiSettingsService implements OnModuleInit {
     const envKey = this.config.get<string>('ai.anthropicApiKey');
     if (envKey) {
       this.active = {
+        id: null,
         provider: 'anthropic',
         apiKey: envKey,
         baseUrl: this.config.get<string>('ai.baseUrl') || undefined,
@@ -89,6 +101,25 @@ export class AiSettingsService implements OnModuleInit {
 
     this.active = null;
     this.activeId = null;
+  }
+
+  /**
+   * 定时从数据库重读生效配置。
+   * CRUD 触发的 refresh() 只刷新处理请求的那个进程；API 改完模型后，
+   * worker 若继续用内存里的旧配置，设计任务会随机命中已下线的旧模型。
+   */
+  @Interval(AI_SETTINGS_REFRESH_INTERVAL_MS)
+  async pollActiveProvider(): Promise<void> {
+    try {
+      await this.refresh();
+      this.lastPollError = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== this.lastPollError) {
+        this.logger.warn(`定时刷新 AI 配置失败: ${message}`);
+        this.lastPollError = message;
+      }
+    }
   }
 
   get activeProvider(): ResolvedAiProvider | null {
@@ -292,6 +323,8 @@ export class AiSettingsService implements OnModuleInit {
     const startedAt = Date.now();
     try {
       const client = this.buildClient(provider);
+      // 连通性测试不写入 AI 用量统计：它只是一次 16-token 探活，
+      // 计入会污染真实使用趋势（见 ai-usage 模块）。
       // 单次请求 15s 超时，避免对不可达地址测试时长时间挂起
       const response = await client.messages.create(
         {

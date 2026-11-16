@@ -1,0 +1,22 @@
+{
+  "name": "@aurum/design-renderer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aurum 独立预览渲染服务（无数据库、无存储）",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@aurum/design-preview": "workspace:*",
+    "@nestjs/common": "^10.4.6",
+    "reflect-metadata": "^0.2.2",
+    "tailwindcss": "4.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

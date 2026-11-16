@@ -13,11 +13,6 @@ export function listAiProviders(): Promise<AiProviderItem[]> {
   return get('/ai-settings');
 }
 
-/** 获取单个 AI 配置 */
-export function getAiProvider(id: string): Promise<AiProviderItem> {
-  return get(`/ai-settings/${id}`);
-}
-
 /** 当前生效配置摘要（含环境变量回退状态） */
 export function getAiSettingsSummary(): Promise<AiProviderSummary> {
   return get('/ai-settings/summary');

@@ -6,6 +6,18 @@ export interface ResourceTypeCount {
   count: number;
 }
 
+export interface StorageUsage {
+  /** 所有已登记资源文件按 storagePath 去重后的总占用（含回收站中尚未清理的文件） */
+  totalBytes: bigint;
+  /** 仅被回收站资源引用、清空回收站后可释放的字节数 */
+  trashBytes: bigint;
+}
+
+interface StorageUsageRow {
+  totalBytes: string | null;
+  trashBytes: string | null;
+}
+
 /**
  * 统计仓储
  * 封装 dashboard 需要的聚合查询。
@@ -32,12 +44,50 @@ export class StatsRepository {
     return this.prisma.resource.count({ where: { deletedAt: null } });
   }
 
-  async totalStorageBytes(): Promise<bigint> {
-    const result = await this.prisma.resource.aggregate({
-      where: { deletedAt: null },
-      _sum: { sizeBytes: true },
-    });
-    return result._sum.sizeBytes ?? BigInt(0);
+  /**
+   * 存储占用。
+   *
+   * 以 resource_files 为准而不是对 Resource.sizeBytes 求和：
+   * - 只有真正落盘的文件才有 ResourceFile 记录，元数据类资源的 sizeBytes
+   *   可能是远端大小或 0；
+   * - 缩略图、提取文本等派生文件同样占用磁盘；
+   * - 存储 key 按内容哈希生成，同一份磁盘文件常被多条资源引用（重复上传、
+   *   回收站中删除后又上传同一文件），必须按 storagePath 去重。
+   *
+   * trashBytes 与回收站「可释放空间」口径一致（见 ResourceService.getTrashStats）：
+   * 只有所有引用方都处于回收站的文件才算可回收。
+   *
+   * 用一条 SQL 同时算出两个值：
+   * - 两个值必须来自同一快照，拆成两次查询会在并发上传/删除时把新文件
+   *   误判成回收站占用；
+   * - 数组式 $transaction 在 SQLite 上以 BEGIN IMMEDIATE 开启写事务，
+   *   会让仪表盘读取阻塞上传与 Worker 写入；
+   * - 聚合在数据库内完成，只回传一行，避免把两万多个分组读进内存。
+   */
+  async storageUsage(): Promise<StorageUsage> {
+    const rows = await this.prisma.$queryRaw<StorageUsageRow[]>`
+      SELECT
+        CAST(SUM(grouped.size_bytes) AS TEXT) AS "totalBytes",
+        CAST(
+          SUM(CASE WHEN grouped.has_active = 0 THEN grouped.size_bytes ELSE 0 END) AS TEXT
+        ) AS "trashBytes"
+      FROM (
+        SELECT
+          MAX(rf."sizeBytes") AS size_bytes,
+          MAX(CASE WHEN r."deletedAt" IS NULL THEN 1 ELSE 0 END) AS has_active
+        FROM "resource_files" AS rf
+        INNER JOIN "resources" AS r ON r."id" = rf."resourceId"
+        GROUP BY rf."storagePath"
+      ) AS grouped
+    `;
+
+    // 空库时 SUM 返回 NULL；CAST AS TEXT 让 SQLite/PostgreSQL 都返回字符串，
+    // 避免大整数经驱动转成 number 丢精度。
+    const row = rows[0];
+    return {
+      totalBytes: BigInt(row?.totalBytes ?? '0'),
+      trashBytes: BigInt(row?.trashBytes ?? '0'),
+    };
   }
 
   async processingStats(): Promise<Record<string, number>> {

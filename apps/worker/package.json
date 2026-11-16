@@ -10,7 +10,7 @@
     "lint": "eslint \"src/**/*.ts\" --fix",
     "lint:check": "eslint \"src/**/*.ts\"",
     "start": "cd ../api && node ../worker/dist/main.js",
-    "start:dev": "cd ../api && node ../worker/dist/main.js"
+    "start:dev": "cd ../api && node ../../scripts/wait-for-api.mjs 3000 180000 && node ../worker/dist/main.js"
   },
   "dependencies": {
     "@aurum/api": "workspace:*"

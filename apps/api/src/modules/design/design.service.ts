@@ -4,6 +4,7 @@ import {
   ConflictException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
@@ -21,6 +22,8 @@ import {
   ensureDraftExists,
   getCandidateContent,
   isRecord,
+  normalizeAiComponentContent,
+  normalizeComponentStateVariants,
   parseContent,
   resolveFixtureContent,
 } from './design-content';
@@ -56,6 +59,12 @@ import {
   STORAGE_SERVICE,
   type IStorageService,
 } from '../storage/interfaces/storage-service.interface';
+import {
+  DesignMediaService,
+  DESIGN_MEDIA_EXPORT_MAX_EDGE,
+  DESIGN_MEDIA_PREVIEW_MAX_EDGE,
+} from './design-media.service';
+import { getMediaDescriptor, type MediaDescriptor } from './design-media';
 
 const ACTIVE_CANDIDATE_LIMIT = 3;
 const POLICY_VERSION = 'aurum.publish.v1';
@@ -70,9 +79,23 @@ type AiComposeInput = JsonRecord & {
   baseContent: JsonRecord;
   reference?: JsonRecord;
 };
+/**
+ * 一句话生成的任务输入：带 `mode: 'auto'`，类别由模型在 `bases` 里挑。
+ * 与 `AiComposeInput` 并存而不是合并，是为了让旧任务的输入保持原样可回放。
+ */
+type AiAutoComposeInput = JsonRecord & {
+  mode: 'auto';
+  intent: string;
+  count: number;
+  bases: JsonRecord;
+  themeDocumentId: string;
+  reference?: JsonRecord;
+};
 
 @Injectable()
 export class DesignService {
+  private readonly logger = new Logger(DesignService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly designAgent: DesignAgentService,
@@ -80,6 +103,7 @@ export class DesignService {
     @Inject(STORAGE_SERVICE) private readonly storage: IStorageService,
     private readonly documents: DesignDocumentService,
     private readonly publish: DesignPublishService,
+    private readonly media: DesignMediaService,
   ) {}
 
   /** 效果配方清单，供创建向导的"试试这些"芯片使用。 */
@@ -169,11 +193,22 @@ export class DesignService {
     // 只看顶层 content.tokens 的话，样式包（它根本没有该字段）永远导出为空。
     const resolved = await resolveFixtureContent(this.prisma, asset.content);
     const kind = asset.document.kind as DesignKind;
-    const tokens = collectWithFixtureDependencies(resolved);
+    // 已发布的历史内容不做迁移；导出 CSS/骨架时按当前结构约定解释。
+    const renderable = kind === 'component' ? normalizeComponentStateVariants(resolved) : resolved;
+    const tokens = collectWithFixtureDependencies(renderable);
+    // 导出时把素材内嵌成 data URI；资源已被删除则导出占位，不影响其余内容。
+    const media =
+      format === 'bundle' || format === 'css'
+        ? await this.media.resolveContent(asset.content, {
+            strict: false,
+            maxEdge: DESIGN_MEDIA_EXPORT_MAX_EDGE,
+          })
+        : null;
 
-    if (format === 'bundle') return { format, content: buildBundle(kind, resolved, tokens) };
+    if (format === 'bundle')
+      return { format, content: buildBundle(kind, renderable, tokens, media) };
     if (format === 'css') {
-      const bundle = buildBundle(kind, resolved, tokens);
+      const bundle = buildBundle(kind, renderable, tokens, media);
       return {
         format,
         content: bundle.css || '/* 该资产不含可导出的 CSS。 */\n',
@@ -227,6 +262,7 @@ export class DesignService {
 
   async createDocument(dto: CreateDesignDocumentDto) {
     const content = validateDesignContent(dto.kind, dto.content);
+    await this.media.assertAvailable(content);
     const encoded = canonicalJson(content);
     const hash = contentHash(encoded);
 
@@ -237,6 +273,7 @@ export class DesignService {
             slug: dto.slug,
             name: dto.name.trim(),
             kind: dto.kind,
+            description: dto.description?.trim() || null,
             status: 'draft',
             visibility: 'internal',
           },
@@ -336,9 +373,8 @@ export class DesignService {
           },
         });
         // 这条记录只覆盖结构校验，刻意**不写成 succeeded**：
-        // selectCandidate / publishDraft 都有"存在任一 succeeded run 即可"的检查，
-        // 一条什么都没测却宣称 passed 的记录会让那个条件恒真，将来再加一道
-        // 只查"有没有成功 run"的门禁就会静默失效。
+        // selectCandidate / publishDraft 只认最近一次真正的门禁 run（succeeded/failed），
+        // 一条什么都没测却宣称 passed 的记录不能参与那个判断。
         await tx.validationRun.create({
           data: {
             candidateId: candidate.id,
@@ -468,13 +504,21 @@ export class DesignService {
   async selectCandidate(candidateId: string) {
     const candidate = await this.prisma.candidateProposal.findUnique({
       where: { id: candidateId },
-      include: { draft: { include: { document: true } }, validationRuns: true },
+      include: {
+        draft: { include: { document: true } },
+        // 只看最近一次真正的门禁 run：结构校验的 skipped 记录不参与
+        validationRuns: {
+          where: { status: { in: ['succeeded', 'failed'] } },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        },
+      },
     });
     if (!candidate) throw new NotFoundException(`候选方案 ${candidateId} 不存在`);
     if (candidate.status !== 'validated')
       throw new BadRequestException('只有通过校验的候选方案可以被选择');
-    if (!candidate.validationRuns.some((run) => run.status === 'succeeded')) {
-      throw new BadRequestException('候选方案缺少成功的校验记录');
+    if (candidate.validationRuns[0]?.status !== 'succeeded') {
+      throw new BadRequestException('候选方案最近一次校验未通过');
     }
     assertDraftCurrent(candidate.draft, candidate.draft.document);
 
@@ -597,8 +641,18 @@ export class DesignService {
         resolveFixtureContent(this.prisma, content),
         resolveFixtureContent(this.prisma, baseContent),
       ]);
+      const [media, baseMedia] = await Promise.all([
+        this.media.resolveContent(fixtureContent, {
+          strict: false,
+          maxEdge: DESIGN_MEDIA_PREVIEW_MAX_EDGE,
+        }),
+        this.media.resolveContent(fixtureBaseContent, {
+          strict: false,
+          maxEdge: DESIGN_MEDIA_PREVIEW_MAX_EDGE,
+        }),
+      ]);
       const rendered = await this.renderer.render(
-        { kind, content: fixtureContent, baseContent: fixtureBaseContent },
+        { kind, content: fixtureContent, baseContent: fixtureBaseContent, media, baseMedia },
         candidate.id,
       );
       const screenshots = rendered.outputs;
@@ -684,8 +738,11 @@ export class DesignService {
             data: { status: 'validated' },
           });
         } else {
-          // 只有 'validated' 的候选能被选择，所以这里刻意不改状态：
-          // 门禁不通过的候选自然卡在 generated，发布不出去。
+          // 已选中的候选若这次门禁失败，必须降级并把草稿退回编辑态：
+          // 否则「最近一次门禁失败」会同时挡住发布、重渲染（只接受未选中）
+          // 和重新选择（只接受 validated），运营只能废弃整份草稿。
+          await this.demoteSelectedCandidate(tx, candidate.id, candidate.draftId);
+          // 未选中的候选维持原行为：卡在 generated/rendered，发布不出去。
           await tx.candidateProposal.updateMany({
             where: { id: candidate.id, status: { in: ['generated', 'rendered'] } },
             data: { status: 'rendered' },
@@ -757,7 +814,11 @@ export class DesignService {
     edits?: Record<string, string | number>;
   }) {
     const withTheme = await this.attachThemeDependency(input.content, input.themeDocumentId);
-    const base = validateDesignContent(input.kind, withTheme);
+    // 历史/模型内容可能把 hover/active 写成同级 variant；预览与后续发布都用
+    // 规范化后的内容，否则骨架只会挂上其中一个 variant 类。
+    const canonical =
+      input.kind === 'component' ? normalizeComponentStateVariants(withTheme) : withTheme;
+    const base = validateDesignContent(input.kind, canonical);
     // 控件要按主题的 token 分组推导（"圆角：小/中/大"），所以这里先要 token 表
     const tokens = collectWithFixtureDependencies(await resolveFixtureContent(this.prisma, base));
 
@@ -773,7 +834,12 @@ export class DesignService {
       tokens: editedTokens,
       validation,
     } = await this.resolveAndEvaluate(input.kind, validated);
-    const bundle = buildBundle(input.kind, resolved, editedTokens);
+    // 素材缺失不应让运营看不到自己的内容：预览用占位，发布时再严格校验。
+    const media = await this.media.resolveContent(validated, {
+      strict: false,
+      maxEdge: DESIGN_MEDIA_PREVIEW_MAX_EDGE,
+    });
+    const bundle = buildBundle(input.kind, resolved, editedTokens, media);
 
     return {
       content: validated,
@@ -813,10 +879,19 @@ export class DesignService {
     themeDocumentId?: string;
     summary?: string;
   }) {
+    const withTheme = await this.attachThemeDependency(input.content, input.themeDocumentId);
     const content = validateDesignContent(
       input.kind,
-      await this.attachThemeDependency(input.content, input.themeDocumentId),
+      input.kind === 'component' ? normalizeComponentStateVariants(withTheme) : withTheme,
     );
+    // 发布是严格边界：素材必须读得到字节，否则一个字都不写库。
+    await this.media.assertAvailable(content);
+    if (getMediaDescriptor(content)) {
+      await this.media.resolveContent(content, {
+        strict: true,
+        maxEdge: DESIGN_MEDIA_PREVIEW_MAX_EDGE,
+      });
+    }
     const { validation } = await this.resolveAndEvaluate(input.kind, content);
     if (validation.errors.length > 0) {
       return {
@@ -829,18 +904,20 @@ export class DesignService {
       };
     }
 
+    const summary = input.summary?.trim() || '由创建向导发布';
     const document = await this.createDocument({
       name: input.name,
       slug: input.slug,
       kind: input.kind,
       content,
-      summary: input.summary ?? '由创建向导发布',
+      summary,
+      description: summary,
     });
     const draft = await this.createDraft(document.id);
     const candidate = await this.createCandidate(draft.id, {
       label: '一键保存',
       content,
-      rationale: '由创建向导生成，尚未经过人工审核',
+      rationale: '由创建向导直接发布',
     });
     const task = await this.renderAndValidateCandidate(candidate.id, { autoPublish: true });
 
@@ -851,6 +928,29 @@ export class DesignService {
       candidateId: candidate.id,
       taskId: task.id,
     };
+  }
+
+  /**
+   * 门禁失败时把已选中的候选降级，并让草稿退回编辑态。
+   *
+   * 不降级会形成死角：发布要求最近一次门禁成功，重渲染只接受未选中状态，
+   * 重新选择只接受 validated——三条恢复路径会同时关闭。
+   */
+  private async demoteSelectedCandidate(
+    tx: Prisma.TransactionClient,
+    candidateId: string,
+    draftId: string,
+  ): Promise<void> {
+    const demoted = await tx.candidateProposal.updateMany({
+      where: { id: candidateId, status: 'selected' },
+      data: { status: 'rendered' },
+    });
+    if (demoted.count > 0) {
+      await tx.designDraft.updateMany({
+        where: { id: draftId, status: 'ready' },
+        data: { status: 'editing' },
+      });
+    }
   }
 
   /**
@@ -867,9 +967,65 @@ export class DesignService {
     validation: AssetValidation,
   ) {
     if (gatePassed) {
+      let versionId: string;
       try {
-        await this.selectCandidate(candidateId);
-        await this.publishDraft(draftId);
+        const state = await this.prisma.candidateProposal.findUnique({
+          where: { id: candidateId },
+          select: {
+            status: true,
+            draft: { select: { status: true, documentId: true, baseVersionId: true } },
+          },
+        });
+        if (state?.draft.status === 'published') {
+          // 草稿已发布，但发布它的不一定是本候选：publishDraft 会把真正发布的
+          // 候选置为 published。否则（例如运营改选了别的候选）不能把本候选的
+          // 封面复制到别人的版本上。
+          if (state.status !== 'published') {
+            this.logger.warn(
+              `草稿 ${draftId} 已由其它候选发布，跳过候选 ${candidateId} 的封面复制`,
+            );
+            return this.prisma.designTask.findUnique({ where: { id: taskId } });
+          }
+          // publishDraft 的幂等分支返回「文档当前版本」，期间若又有人发布新版本，
+          // 直接复制会把旧封面盖到新版本上。按候选内容哈希定位本草稿发布出的版本。
+          // 解析失败只影响封面：发布已经生效，不能让任务显示成发布失败。
+          let resolvedVersionId: string | null;
+          try {
+            resolvedVersionId = await this.resolvePublishedVersionId(
+              candidateId,
+              state.draft.documentId,
+              state.draft.baseVersionId,
+            );
+          } catch (error) {
+            this.logger.error(
+              `无法解析候选 ${candidateId} 对应的正式版本，跳过封面复制：${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return this.prisma.designTask.findUnique({ where: { id: taskId } });
+          }
+          if (!resolvedVersionId) {
+            this.logger.warn(`找不到候选 ${candidateId} 对应的正式版本，跳过封面复制`);
+            return this.prisma.designTask.findUnique({ where: { id: taskId } });
+          }
+          versionId = resolvedVersionId;
+        } else {
+          // 重试路径：上一轮可能已经选择过候选。selectCandidate 只接受 validated，
+          // 再调一次必然失败，所以「已选择」按幂等成功处理。
+          if (state?.status !== 'selected') {
+            await this.selectCandidate(candidateId);
+          }
+          const published = await this.publishDraft(draftId);
+          if (!('versionNumber' in published) || typeof published.versionNumber !== 'number') {
+            // 并发窗口：读状态时草稿还没发布，publishDraft 却走了幂等分支，
+            // 说明另一个候选刚刚抢先发布。不要用本候选的封面覆盖它。
+            this.logger.warn(
+              `草稿 ${draftId} 在发布过程中已被其它候选发布，跳过候选 ${candidateId} 的封面复制`,
+            );
+            return this.prisma.designTask.findUnique({ where: { id: taskId } });
+          }
+          versionId = published.id;
+        }
       } catch (error) {
         // 发布本身失败（例如基准版本被并发改动）必须与门禁失败区分开：否则
         // 运营会跑去改颜色，而真正的问题在别处。
@@ -881,6 +1037,18 @@ export class DesignService {
             errorMessage: error instanceof Error ? error.message : String(error),
           },
         });
+        return this.prisma.designTask.findUnique({ where: { id: taskId } });
+      }
+      // 版本已经上线：封面复制只是展示产物，失败不能把成功发布改写成失败，
+      // 否则运营会对着一个已经生效的版本反复点重试。
+      try {
+        await this.copyCandidateSnapshotsToVersion(candidateId, versionId);
+      } catch (error) {
+        this.logger.error(
+          `设计版本 ${versionId} 已发布，但候选 ${candidateId} 的封面复制失败：${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
       return this.prisma.designTask.findUnique({ where: { id: taskId } });
     }
@@ -895,6 +1063,83 @@ export class DesignService {
       },
     });
     return this.prisma.designTask.findUnique({ where: { id: taskId } });
+  }
+
+  /**
+   * 渲染图挂在候选上。资产库封面读的是正式版本的桌面快照，
+   * 所以发布后把同一批图再记到该版本，候选上的原件留着给审核台。
+   */
+  private async copyCandidateSnapshotsToVersion(candidateId: string, versionId: string) {
+    const snapshots = await this.prisma.previewSnapshot.findMany({ where: { candidateId } });
+    for (const snapshot of snapshots) {
+      const existing = await this.prisma.previewSnapshot.findFirst({
+        where: {
+          versionId,
+          viewport: snapshot.viewport,
+          state: snapshot.state,
+          kind: snapshot.kind,
+        },
+        select: { id: true },
+      });
+      const data = {
+        viewport: snapshot.viewport,
+        state: snapshot.state,
+        kind: snapshot.kind,
+        format: snapshot.format,
+        width: snapshot.width,
+        height: snapshot.height,
+        browser: snapshot.browser,
+        fixtureVersion: snapshot.fixtureVersion,
+        artifactHash: snapshot.artifactHash,
+        storagePath: snapshot.storagePath,
+      };
+      if (existing) {
+        await this.prisma.previewSnapshot.update({ where: { id: existing.id }, data });
+      } else {
+        await this.prisma.previewSnapshot.create({ data: { ...data, versionId } });
+      }
+    }
+  }
+
+  /**
+   * 定位本草稿发布出的正式版本。
+   *
+   * 不能只看 baseVersionId：adoptCurrentVersion 不新建版本，之后基于同一基准
+   * 创建的新草稿又会产出新的版本。因此用候选内容哈希做二次校验——发布事务
+   * 创建的版本一定是这个哈希，内容与基准一致时则直接是 baseVersion 本身。
+   * 找不到匹配时返回 null，调用方应跳过复制而不是猜一个版本。
+   */
+  private async resolvePublishedVersionId(
+    candidateId: string,
+    documentId: string,
+    baseVersionId: string,
+  ): Promise<string | null> {
+    const candidate = await this.prisma.candidateProposal.findUnique({
+      where: { id: candidateId },
+      select: {
+        patch: true,
+        draft: {
+          select: {
+            document: { select: { kind: true } },
+            baseVersion: { select: { contentHash: true } },
+          },
+        },
+      },
+    });
+    if (!candidate) return null;
+    const hash = contentHash(
+      canonicalJson(
+        getCandidateContent(candidate.patch, candidate.draft.document.kind as DesignKind),
+      ),
+    );
+    // 内容与基准一致时 publishDraft 走 adoptCurrentVersion，不新建版本
+    if (candidate.draft.baseVersion.contentHash === hash) return baseVersionId;
+    const successor = await this.prisma.designVersion.findFirst({
+      where: { documentId, baseVersionId, contentHash: hash },
+      orderBy: { versionNumber: 'desc' },
+      select: { id: true },
+    });
+    return successor?.id ?? null;
   }
 
   /**
@@ -994,6 +1239,83 @@ export class DesignService {
     return { taskId: task.id };
   }
 
+  /**
+   * 一句话生成：只收意图，类别、配色、命名全由服务端与模型决定。
+   *
+   * 与 `composeGenerate` 的差别是**没有 kind**：调用方不必先教用户区分"配色/
+   * 组件/动效"。服务端把三种基底一起交给模型，由它挑最贴合意图的那一种。
+   *
+   * 配色基底固定用内置靛蓝：主题类没有"最小骨架"（少一个 token 就不成体系），
+   * 而随便选一套已有主题会让模型以为那是用户的选择。
+   */
+  async composeAuto(input: {
+    intent: string;
+    count?: number;
+    reference?: JsonRecord;
+    mediaResourceId?: string;
+  }) {
+    if (input.intent.trim().length < 2) throw new BadRequestException('请多描述一点你想要的效果');
+    if (input.intent.length > 2_000)
+      throw new BadRequestException('设计意图长度必须在 2 到 2000 个字符之间');
+    const theme = await this.prisma.designDocument.findFirst({
+      where: { kind: 'theme', status: 'published', currentPublishedVersionId: { not: null } },
+      orderBy: { updatedAt: 'desc' },
+      select: { id: true, currentPublishedVersionId: true },
+    });
+    if (!theme)
+      throw new BadRequestException(
+        '还没有可用的配色方案。先在高级模式里装一套内置配色，再回来一句话生成。',
+      );
+
+    // 配色基底必须就是这套默认主题本身：三份基底共享同一套 token 词表，模型
+    // 在组件里引用 {color.muted} 这类别名时才一定能解析到。此前用内置靛蓝当
+    // 配色基底，模型照着它编别名，一旦默认主题缺同名 token，方案就会在门禁里
+    // 反复失败。
+    const themeVersionId = theme.currentPublishedVersionId;
+    if (!themeVersionId)
+      throw new BadRequestException('默认配色还没有正式版本，请先重新发布一套配色');
+    const themeVersion = await this.prisma.designVersion.findUnique({
+      where: { id: themeVersionId },
+    });
+    if (!themeVersion) throw new BadRequestException('默认配色的正式版本缺失，请重新发布一套配色');
+    // 带素材时只给 component 基底：素材只能作为组件的媒体区，模型不该再选配色/动效。
+    const mediaDescriptor = input.mediaResourceId
+      ? await this.media.describe(input.mediaResourceId)
+      : null;
+    const bases: JsonRecord = mediaDescriptor
+      ? {
+          component: await this.attachThemeDependency(
+            minimalMediaComposeBase(mediaDescriptor),
+            theme.id,
+          ),
+        }
+      : {
+          theme: parseContent(themeVersion.content),
+          component: await this.attachThemeDependency(minimalComposeBase('component'), theme.id),
+          animation: await this.attachThemeDependency(minimalComposeBase('animation'), theme.id),
+        };
+    // 基底本身必须合法：否则模型会照着非法骨架抄，修复轮次全花在替它擦屁股上。
+    for (const [baseKind, base] of Object.entries(bases)) {
+      validateDesignContent(baseKind as DesignKind, base);
+    }
+
+    const task = await this.prisma.designTask.create({
+      data: {
+        taskType: 'ai_compose',
+        status: 'pending',
+        input: canonicalJson({
+          mode: 'auto',
+          intent: input.intent.trim(),
+          count: Math.min(Math.max(input.count ?? 3, 1), 3),
+          bases,
+          themeDocumentId: theme.id,
+          reference: input.reference,
+        }),
+      },
+    });
+    return { taskId: task.id, themeDocumentId: theme.id };
+  }
+
   async getTask(taskId: string) {
     const task = await this.prisma.designTask.findUnique({ where: { id: taskId } });
     if (!task) throw new NotFoundException(`设计任务 ${taskId} 不存在`);
@@ -1006,6 +1328,10 @@ export class DesignService {
     leaseToken: string;
   }) {
     const input = parseContent(task.input ?? '{}');
+    if (input.mode === 'auto') {
+      if (!isAiAutoComposeInput(input)) throw new BadRequestException('AI 生成任务输入损坏');
+      return this.processAutoComposeTask(task, input);
+    }
     if (!isAiComposeInput(input)) throw new BadRequestException('AI 生成任务输入损坏');
 
     const candidates = await this.designAgent.generateCandidates({
@@ -1036,6 +1362,107 @@ export class DesignService {
 
     // 一个都没过才算失败。部分成功时用户仍然有可选的方案，失败的标签与原因
     // 摆在结果里——把整批判死会让一次格式失误吃掉全部产出。
+    if (accepted.length === 0) {
+      throw new BadRequestException(
+        `设计 AI 未能生成任何合规方案：${failures
+          .map((item) => `${item.label}（${item.error}）`)
+          .join('；')}`,
+      );
+    }
+
+    const completed = await this.prisma.designTask.updateMany({
+      where: { id: task.id, status: 'running', leaseToken: task.leaseToken },
+      data: {
+        status: 'succeeded',
+        result: canonicalJson({ candidates: accepted, failures }),
+        finishedAt: new Date(),
+        leaseToken: null,
+        leaseExpiresAt: null,
+      },
+    });
+    if (completed.count !== 1) return null;
+    return this.prisma.designTask.findUnique({ where: { id: task.id } });
+  }
+
+  /**
+   * 一句话生成的落地：模型给什么类别就按什么类别校验，一个都没过才算失败。
+   *
+   * 候选的 `kind` 必须随结果回传——发布时要用它选 schema，用户也不需要知道。
+   */
+  private async processAutoComposeTask(
+    task: { id: string; input: string | null; leaseToken: string },
+    input: AiAutoComposeInput,
+  ) {
+    const bases = input.bases as Record<string, JsonRecord | undefined>;
+    const candidates = await this.designAgent.generateAutoCandidates({
+      intent: input.intent,
+      bases: {
+        theme: bases.theme,
+        component: bases.component,
+        animation: bases.animation,
+      },
+      count: input.count,
+      reference: isRecord(input.reference) ? input.reference : undefined,
+    });
+
+    const accepted: JsonRecord[] = [];
+    const failures: Array<{ label: string; error: string }> = [];
+    for (const [index, candidate] of candidates.entries()) {
+      await this.assertTaskLease(task.id, task.leaseToken);
+      const label = candidate.label || `方案 ${index + 1}`;
+      const baseContent = bases[candidate.kind];
+      if (!isRecord(baseContent)) {
+        failures.push({ label, error: `不支持的类别：${candidate.kind}` });
+        continue;
+      }
+      // 依赖一律钉成基底里的那一份。不能只依赖 `attachThemeDependency`
+      // （它只在内容没有 dependencies 时才补）：模型抄错或编造 documentId 是真实
+      // 存在的失败模式，而一句话生成只有一套默认配色，直接覆盖比让它在修复轮次
+      // 里猜对更可靠。主题基底不带依赖时保持原样。
+      const baseDependencies = baseContent.dependencies;
+      let content: JsonRecord =
+        Array.isArray(baseDependencies) && baseDependencies.length > 0
+          ? { ...candidate.content, dependencies: baseDependencies }
+          : candidate.kind === 'theme'
+            ? candidate.content
+            : await this.attachThemeDependency(candidate.content, input.themeDocumentId);
+      // 素材是服务端锁定的结构：模型可以改声明，但不能改素材、骨架类型或 schema。
+      // 修复轮返回的新内容也要重新锁，否则“删掉可选 media 字段”会静默通过校验。
+      const lockContent =
+        baseContent.media !== undefined
+          ? (next: JsonRecord): JsonRecord => ({
+              ...next,
+              schemaVersion: 'aurum.component.v2',
+              appliesTo: 'container',
+              media: baseContent.media,
+              // 依赖同样不能让修复轮改：编造的 versionId 会在 resolveFixtureContent
+              // 里直接抛错，连修复机会都没有。
+              ...(Array.isArray(baseDependencies) && baseDependencies.length > 0
+                ? { dependencies: baseDependencies }
+                : {}),
+            })
+          : undefined;
+      if (lockContent) content = lockContent(content);
+      const outcome = await this.composeCandidateWithRepair(
+        candidate.kind,
+        baseContent,
+        { ...candidate, content },
+        { taskId: task.id, leaseToken: task.leaseToken },
+        lockContent,
+      );
+      if ('error' in outcome) {
+        failures.push({ label, error: outcome.error });
+        continue;
+      }
+      accepted.push({
+        kind: candidate.kind,
+        name: candidate.name,
+        label,
+        rationale: candidate.rationale,
+        content: outcome.content,
+      });
+    }
+
     if (accepted.length === 0) {
       throw new BadRequestException(
         `设计 AI 未能生成任何合规方案：${failures
@@ -1135,11 +1562,40 @@ export class DesignService {
     });
   }
 
-  async listTasks(status?: string) {
+  /**
+   * 任务列表。审核台每 3 秒轮询一次，所以这里刻意只返回界面需要的字段：
+   * `input` / `result` 是整行里最大的两列（AI 任务产物、预览键、门禁结论），
+   * 跟着每次轮询整批返回纯属浪费。
+   *
+   * `draftId` 过滤：候选任务走关系；AI 生成任务的 candidateId 为空，
+   * draftId 写在 input JSON 里（queueAiCandidates 的 canonicalJson），
+   * 因此按 `"draftId":"<uuid>"` 精确匹配。UUID 足够独特，不会误伤其他草稿。
+   */
+  async listTasks(options: { status?: string; draftId?: string } = {}) {
+    const where: Prisma.DesignTaskWhereInput = {};
+    if (options.status) where.status = options.status;
+    if (options.draftId) {
+      where.OR = [
+        { candidate: { draftId: options.draftId } },
+        {
+          candidateId: null,
+          input: { contains: `"draftId":${JSON.stringify(options.draftId)}` },
+        },
+      ];
+    }
     return this.prisma.designTask.findMany({
-      where: status ? { status } : undefined,
+      where,
       orderBy: { createdAt: 'desc' },
       take: 100,
+      select: {
+        id: true,
+        taskType: true,
+        status: true,
+        candidateId: true,
+        errorMessage: true,
+        retryCount: true,
+        createdAt: true,
+      },
     });
   }
 
@@ -1530,8 +1986,20 @@ export class DesignService {
     leaseToken: string;
     /** 返回 `{ value }` 表示通过；返回 `{ error }` 表示是模型能自己修的内容问题 */
     attempt: (content: JsonRecord) => Promise<{ value: T } | { error: string }>;
+    /**
+     * 结构性锁定：服务端权威字段（素材、schema、骨架类型、依赖）在首轮与每轮修复后
+     * 都要重新覆盖。不能只锁首轮——模型在修复时返回完整内容，顺手删掉 media 是
+     * 真实存在的失败模式，而 media 是可选字段，删掉后校验仍会通过。
+     */
+    lockContent?: (content: JsonRecord) => JsonRecord;
   }): Promise<{ value: T; content: JsonRecord } | { error: string }> {
-    let content = args.content;
+    // 模型输出先做结构归位：把 hover/active 之类的同级 variant 折进 states，
+    // 再做媒体/依赖锁定。放在这里是因为只有 AI 输出会走这个循环。
+    const lock = (value: JsonRecord) => {
+      const normalized = args.kind === 'component' ? normalizeAiComponentContent(value) : value;
+      return args.lockContent ? args.lockContent(normalized) : normalized;
+    };
+    let content = lock(args.content);
     let lastError = '模型返回的方案不符合规范';
     for (let round = 0; round <= AI_REPAIR_ATTEMPTS; round += 1) {
       const outcome = await args.attempt(content);
@@ -1549,7 +2017,7 @@ export class DesignService {
         })
         .catch(() => null);
       if (!repaired) break;
-      content = repaired;
+      content = lock(repaired);
     }
     return { error: lastError };
   }
@@ -1611,6 +2079,7 @@ export class DesignService {
     baseContent: JsonRecord,
     candidate: GeneratedDesignCandidate,
     context: { taskId: string; leaseToken: string },
+    lockContent?: (content: JsonRecord) => JsonRecord,
   ): Promise<{ content: JsonRecord } | { error: string }> {
     const outcome = await this.repairUntilValid<JsonRecord>({
       kind,
@@ -1618,6 +2087,7 @@ export class DesignService {
       content: candidate.content,
       taskId: context.taskId,
       leaseToken: context.leaseToken,
+      lockContent,
       attempt: async (content) => {
         let validated: JsonRecord;
         try {
@@ -1626,7 +2096,15 @@ export class DesignService {
           if (!(error instanceof BadRequestException)) throw error;
           return { error: error.message };
         }
-        const { validation } = await this.resolveAndEvaluate(kind, validated);
+        let validation: AssetValidation;
+        try {
+          ({ validation } = await this.resolveAndEvaluate(kind, validated));
+        } catch (error) {
+          // 依赖版本不存在/循环同样是模型能自己修的内容问题；不能让它直接
+          // 冒泡成整个生成任务失败，否则一个编造的 versionId 会吃掉整批方案。
+          if (!(error instanceof BadRequestException)) throw error;
+          return { error: error.message };
+        }
         if (validation.errors.length > 0) return { error: validation.errors.join('; ') };
         return { value: validated };
       },
@@ -1884,6 +2362,52 @@ function isAiComposeInput(value: JsonRecord): value is AiComposeInput {
     value.count > 0 &&
     isRecord(value.baseContent)
   );
+}
+function isAiAutoComposeInput(value: JsonRecord): value is AiAutoComposeInput {
+  return (
+    value.mode === 'auto' &&
+    typeof value.intent === 'string' &&
+    typeof value.count === 'number' &&
+    Number.isInteger(value.count) &&
+    value.count > 0 &&
+    isRecord(value.bases) &&
+    typeof value.themeDocumentId === 'string'
+  );
+}
+
+/**
+ * 素材组件的基底。
+ *
+ * 媒体区由服务端骨架渲染（figure + 封面 + 文案），模型负责画框的圆角、阴影、
+ * 比例、滤镜等声明；media 字段本身在任务处理阶段会被强制覆盖回这份基底。
+ */
+function minimalMediaComposeBase(media: MediaDescriptor): JsonRecord {
+  // 按目标画框高度反推最大宽度：竖图如果直接按 560px 宽出图会高到 700px+，
+  // 预览和卡片都会把底部文案裁掉。极端比例再夹到 0.5–2，避免出现 40px 宽的卡片。
+  const rawRatio =
+    media.width && media.height && media.width > 0 && media.height > 0
+      ? media.width / media.height
+      : 1.6;
+  const ratio = Number(Math.min(2, Math.max(0.5, rawRatio)).toFixed(3));
+  const maxWidth = Math.min(560, Math.round(400 * ratio));
+  return {
+    schemaVersion: 'aurum.component.v2',
+    componentType: 'media-showcase',
+    appliesTo: 'container',
+    media,
+    variants: {
+      default: {
+        declarations: {
+          'aspect-ratio': ratio,
+          'max-width': `${maxWidth}px`,
+          'border-radius': '16px',
+          'background-color': '#0f172a',
+          color: '#ffffff',
+          'box-shadow': '0 18px 50px rgba(15, 23, 42, 0.35)',
+        },
+      },
+    },
+  };
 }
 
 /**

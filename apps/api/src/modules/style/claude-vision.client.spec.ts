@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
 import type { AiSettingsService } from '../ai-settings/ai-settings.service';
+import type { AiUsageService } from '../ai-usage/ai-usage.service';
 
 const { createMock, AnthropicMock } = vi.hoisted(() => {
   const createMock = vi.fn();
@@ -28,7 +29,7 @@ const { createMock, AnthropicMock } = vi.hoisted(() => {
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: AnthropicMock }));
 
-import { ClaudeVisionClient } from './claude-vision.client';
+import { AiCallError, ClaudeVisionClient } from './claude-vision.client';
 
 /** 构造 client，apiKey 为空时表示未配置 */
 function makeClient(apiKey = 'test-key'): ClaudeVisionClient {
@@ -38,7 +39,8 @@ function makeClient(apiKey = 'test-key'): ClaudeVisionClient {
     activeProvider: apiKey ? { provider: 'anthropic', apiKey, model: 'claude-test' } : null,
     buildClient: () => ({ messages: { create: createMock } }),
   } as unknown as AiSettingsService;
-  return new ClaudeVisionClient(aiSettingsMock);
+  const usageMock = { record: vi.fn() } as unknown as AiUsageService;
+  return new ClaudeVisionClient(aiSettingsMock, usageMock);
 }
 
 const image = { base64: 'aGVsbG8=', mediaType: 'image/png' as const };
@@ -110,6 +112,41 @@ describe('ClaudeVisionClient', () => {
     expect(third.messages[0].content.at(-1).type).toBe('text');
   });
 
+  it('只缺 accent 不算「读不到图」：属模型抽风，交给 normalizeProfile 回退', async () => {
+    // primary/background 齐全 = 模型确实看到了图，只是漏了一个必填字段。
+    // 若这里抛 capability，用户会被告知"请更换支持视觉的模型"并白等 15 分钟退避，
+    // 而实际上归一化能把 accent 补成像素强调色、产出完全可用的档案。
+    const partial = {
+      colorPalette: {
+        primary: { hex: '#111111', role: '主色' },
+        background: { hex: '#ffffff', role: '背景' },
+        scale: ['#111111', '#ffffff'],
+      },
+    };
+    createMock.mockResolvedValue({
+      content: [{ type: 'tool_use', name: 'output_style_profile', input: partial }],
+    });
+    const client = makeClient();
+    const profile = await client.analyzeStyle(image, ['#ffffff'], 'prompt');
+    expect(profile.colorPalette.primary.hex).toBe('#111111');
+  });
+
+  it('色板三个关键色全缺才算读不到图', async () => {
+    createMock.mockResolvedValue({
+      content: [
+        {
+          type: 'tool_use',
+          name: 'output_style_profile',
+          input: { colorPalette: { scale: ['#111111'], mood: '无' } },
+        },
+      ],
+    });
+    const client = makeClient();
+    const error = await client.analyzeStyle(image, ['#ffffff'], 'prompt').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AiCallError);
+    expect((error as AiCallError).kind).toBe('capability');
+  });
+
   it('模型读不到图片（colorPalette 为 null）时给出可操作提示', async () => {
     createMock
       .mockRejectedValueOnce(new AnthropicMock.APIError('Upstream service returned an error', 502))
@@ -126,9 +163,12 @@ describe('ClaudeVisionClient', () => {
         ],
       });
     const client = makeClient();
-    await expect(client.analyzeStyle(image, ['#ffffff'], 'prompt')).rejects.toThrow(
-      '模型未能读取图片内容',
-    );
+    const error = await client.analyzeStyle(image, ['#ffffff'], 'prompt').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AiCallError);
+    expect((error as Error).message).toContain('模型未能读取图片内容');
+    // 归为 capability（配置/能力问题）而非 output：否则会跟着吃 1 分钟退避，
+    // 配错模型的用户每次分析都要白打两次完整视觉调用
+    expect((error as AiCallError).kind).toBe('capability');
   });
 
   it('全部降级路径失败且模型输出不可解析时，提示可能不支持图片', async () => {

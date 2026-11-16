@@ -16,9 +16,12 @@ describe('DesignReferenceService', () => {
     config: null,
   };
 
-  function createService(robots = 'User-agent: *\nAllow: /') {
+  function createService(
+    robots = 'User-agent: *\nAllow: /',
+    sourceOverride: Record<string, unknown> = source,
+  ) {
     const repository = {
-      findById: vi.fn().mockResolvedValue(source),
+      findById: vi.fn().mockResolvedValue(sourceOverride),
       findDesignReferenceTermsAcceptance: vi.fn(),
       createDesignReferenceTermsAcceptance: vi.fn(),
     };
@@ -44,7 +47,12 @@ describe('DesignReferenceService', () => {
       designReferenceQuota: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     };
     return {
-      service: new DesignReferenceService(repository as never, safeUrl as never, design as never, prisma as never),
+      service: new DesignReferenceService(
+        repository as never,
+        safeUrl as never,
+        design as never,
+        prisma as never,
+      ),
       safeUrl,
       design,
     };
@@ -95,6 +103,23 @@ describe('DesignReferenceService', () => {
     expect(safeUrl.fetchText).not.toHaveBeenCalled();
   });
 
+  it('rejects RSS sources instead of treating the feed URL as a page scope', async () => {
+    const { service, safeUrl } = createService(undefined, {
+      ...source,
+      sourceType: 'rss',
+      baseUrl: 'https://example.com/feed.xml',
+      allowedModes: 'link_only,metadata_only',
+    });
+
+    // Feed 地址不能当路径前缀，否则 /post/1 这类合法条目链接会被误判为越界；
+    // 设计参考需要真实的来源范围，因此直接给出明确的“RSS 不可作为参考来源”错误。
+    await expect(
+      service.createUrlReferenceDraft('document-1', 'https://example.com/post/1', source.id),
+    ).rejects.toThrow(/feed address/);
+    expect(safeUrl.fetchHtml).not.toHaveBeenCalled();
+    expect(safeUrl.fetchText).not.toHaveBeenCalled();
+  });
+
   it('requires explicit terms acceptance and puts reviewed sources into an approval state', async () => {
     const termsSource = {
       ...source,
@@ -117,7 +142,10 @@ describe('DesignReferenceService', () => {
         Promise.resolve(
           url === 'https://example.com/terms'
             ? { body: '<main>Terms v1</main>', url: new URL(url) }
-            : { body: '<title>Reference</title>', url: new URL('https://example.com/inspiration/page') },
+            : {
+                body: '<title>Reference</title>',
+                url: new URL('https://example.com/inspiration/page'),
+              },
         ),
       ),
     };

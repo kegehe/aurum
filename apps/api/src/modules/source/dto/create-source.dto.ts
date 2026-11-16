@@ -10,6 +10,7 @@ import {
   Max,
   MaxLength,
   Min,
+  MinLength,
 } from 'class-validator';
 import { SourceType } from '../../../common/constants/enums';
 
@@ -95,6 +96,13 @@ export class CreateSourceDto {
       'downloadDirectory must be a relative subdirectory of letters/digits/_/- separated by / without leading/trailing slash',
   })
   downloadDirectory?: string;
+
+  /** 同步下载的资源默认归入的资源库文件夹（Category.id）；缺省 = 不归档 */
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  downloadCategoryId?: string;
 
   @IsOptional()
   @Transform(({ value }) => {
